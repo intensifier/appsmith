@@ -45,19 +45,24 @@ services:
     ports:
       - "80:80"
       - "443:443"
-      - "9001:9001"
     volumes:
       - ./stacks:/appsmith-stacks
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
+    restart: unless-stopped
+  #   # Uncomment the lines below to enable auto-update
+  #   labels:
+  #     com.centurylinklabs.watchtower.enable: "true"
 
-  auto_update:
-    image: containrrr/watchtower:latest-dev
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    # Update check interval in seconds.
-    command: --interval 300 --label-enable --cleanup
+  # auto_update:
+  #   image: containrrr/watchtower
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   # Update check interval in seconds.
+  #   command: --schedule "0 0 * ? * *" --label-enable --cleanup
+  #   restart: unless-stopped
+
+
 ```
+>>Note: To enable auto-update for Appsmith, please uncomment all the commented lines in the docker-compose file.
 
 After saving this file, `cd` to the folder that contains this file and run the following command to start Appsmith:
 
@@ -90,13 +95,98 @@ To make Appsmith available on a custom domain, please update your domain's DNS r
 ## Custom SSL Certificate
 
 In our container, we support to generate a free SSL certificate If you have your owned certificate, please follow these steps to use it inside the container.
-- Firstly, please rename your certificate file as `fullchain.pem` and key file as `privkey.pem` 
+- Firstly, please rename your certificate file as `fullchain.pem` and key file as `privkey.pem`
 - Then, copy these files into the sub-directory `<mounting-directory>/ssl/` (*Note: Please change `<mounting-directory>` by the mounting volume directory in the `docker-compose.yml`. Default is `./stacks`*)
 - Restart the container using `docker restart appsmith`
 
 The container will check the certificate files in the folder `<mounting-directory>/ssl` and use them if they are existed.
 
 *Note: In case of the certificate files have different name from `fullchain.pem` and `privkey.pem`, it will be considered as missing custom certificate and auto-provisioning the certificate by Let's Encrypt*
+## Environment configuration format
+
+`/appsmith-stacks/configuration/docker.env` contains data, not a shell script.
+Use one `NAME=value` assignment per line. Empty values, single and double quotes,
+and concatenated quoted segments are supported. Single quotes preserve their
+contents literally. Outside single quotes, backslashes escape the next character
+(inside double quotes, only backslash, double quote, dollar sign, and backtick).
+Blank lines and full-line comments are ignored. Unquoted, unescaped trailing
+spaces and tabs are ignored and may be followed by an inline `#` comment.
+Quoted or escaped spaces remain part of the value, and `NAME=#abc` preserves
+`#abc`. Quote values containing spaces. Duplicate
+assignments use the last value. LF and CRLF line endings are accepted.
+
+Supported names start with `APPSMITH_`, `MONGO_`, `KEYCLOAK_`, or `OTEL_` and contain
+only letters, digits, and underscores. The prefixes remain case-sensitive.
+`OTEL_*` values reach every service; the Java server honors only the normalized
+trace endpoint and sampling probability from them.
+`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and their lowercase equivalents are supported,
+as are `NEW_RELIC_LICENSE_KEY`, `NEW_RELIC_APP_NAME`,
+`JGROUPS_DISCOVERY_PROTOCOL`, `FILESTORE_IP_ADDRESS`, `FILE_SHARE_NAME`, and `PORT`.
+Other names are rejected rather than silently ignored. Shell control variables such
+as `PATH`, `BASH_ENV`, and `LD_PRELOAD` cannot be set through this file.
+
+JVM-control variables are deployment-only: `APPSMITH_JAVA_ARGS`,
+`APPSMITH_JAVA_HEAP_ARG`, `JAVA_OPTS`, `JAVA_OPTS_APPEND`, `JAVA_TOOL_OPTIONS`,
+`JDK_JAVA_OPTIONS`, and `_JAVA_OPTIONS`. Assignments to these names in `docker.env`
+are ignored without evaluating their contents. Nonempty assignments produce a
+warning naming the variable, never its value:
+
+```text
+Ignoring APPSMITH_JAVA_ARGS in docker.env: JVM options must be configured through the container environment (Docker Compose or Helm).
+```
+
+Set JVM options through the container environment in Docker Compose or Helm.
+Deployment-supplied values, including explicitly empty values, are preserved in
+the private restart snapshot. Generated internal JVM options remain supported.
+
+Variable references such as `${PASSWORD}`, commands such as `$(command)`, backticks,
+and semicolons are never evaluated. Unescaped expressions that would require shell
+expansion (including inside double quotes) stop startup with a migration error.
+Supply fully resolved configuration values. Single-quote intentional literal
+expressions, for example `APPSMITH_ENCRYPTION_PASSWORD='literal$(text)'`.
+Malformed assignments, unsupported names, control characters, and unterminated
+quotes stop startup with the line number and, when recognizable, the variable
+name, without printing its value. Quoted multiline values in
+`docker.env` are not supported.
+
+External `APPSMITH_*`, `MONGO_*`, and `OTEL_*` environment variables override this file,
+including explicitly empty values. Their values are saved verbatim in a private
+JSON snapshot for service restarts; quotes, newlines, and non-UTF-8 bytes are preserved. Kubernetes
+Secrets and Vault values that are already resolved before container startup do
+not require shell evaluation.
+
+### Impact on existing instances
+
+Fresh installs and upgrades using generated defaults or Admin Settings values
+require no configuration changes. Before upgrading a customized installation,
+replace shell expressions in `docker.env` with their intended literal values and
+remove shell commands or unsupported variable names. Do not source a potentially
+compromised file to perform this conversion.
+Move any JVM-control assignments from `docker.env` to the container environment
+before upgrading, then recreate the container or roll out the pod. A service-only
+restart does not refresh deployment configuration.
+
+Preserve the effective encryption password and salt exactly. Changing either can
+make existing encrypted credentials unreadable. Obtain their resolved values from
+a trusted secret store or the running instance before upgrade; do not replace
+an expression with its literal text unless that was already the intended value.
+
+Backup and restore use the same parser to validate configuration and quote literal
+values. Restore validates before stopping services or restoring the database, and
+replaces the environment file atomically. Incompatible legacy backups must be
+corrected before restore. Serialized backups and restored configuration omit
+JVM-control assignments; configure those separately on the target deployment.
+Persisted configuration uses UTF-8 and cannot contain
+multiline values. Backup/restore reject multiline replacement values rather than
+changing them. Tabs are supported; other control characters are not. The external
+snapshot's byte preservation does not guarantee that individual application
+runtimes support non-UTF-8 credentials; use UTF-8 for portable configuration.
+
+The loader does not sanitize or rewrite the persistent file. Rolling back to an
+older image restores that image's shell evaluation behavior, so inspect the file
+before rollback. Removing configuration evaluation prevents stored commands from
+running through this path; it does not recover an already compromised instance.
+
 ## Instance Management Utilities
 
 The image includes an `appsmithctl` command to help with the management and maintenance of your instance. The following subsections describe what's available.
@@ -157,9 +247,9 @@ docker-compose exec appsmith-ce supervisorctl restart backend
 
 ## Supervisor
 
-The container runs multiple processes, including the Appsmith server, Nginx, MongoDB etc., inside a single Docker container. These processes are started and managed by [supervisord](http://supervisord.org/).
+The container runs multiple processes, including the Appsmith server, Caddy, MongoDB etc., inside a single Docker container. These processes are started and managed by [supervisord](http://supervisord.org/).
 
-Supervisord comes with a web interface for managing the various processes, available at <http://localhost:9001>, as well as a command line interface towards the same goal.
+Supervisord comes with a web interface for managing the various processes, available at <http://localhost/supervisor/>, as well as a command line interface towards the same goal.
 
 Here's a screenshot of the web interface listing all the processes managed:
 
@@ -167,7 +257,7 @@ Here's a screenshot of the web interface listing all the processes managed:
   <img src="https://raw.githubusercontent.com/appsmithorg/appsmith/release/deploy/docker/images/appsmith_supervisord_ui.png" width="80%">
 </p>
 
-The command line interface can also be used to perform operations like restarting the Appsmith server, or restarting Nginx etc. For example, the following command (run in the installation folder) can be used to get a status of all running processes:
+The command line interface can also be used to perform operations like restarting the Appsmith server, or restarting Caddy etc. For example, the following command (run in the installation folder) can be used to get a status of all running processes:
 
 ```sh
 docker-compose exec appsmith-ce supervisorctl status

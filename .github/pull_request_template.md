@@ -1,39 +1,39 @@
-> Pull Request Template
->
-> Use this template to quickly create a well written pull request. Delete all quotes before creating the pull request.
-
 ## Description
+> [!TIP]  
+> _Add a TL;DR when the description is longer than 500 words or extremely technical (helps the content, marketing, and DevRel team)._
+>
+> _Please also include relevant motivation and context. List any dependencies that are required for this change. Add links to Notion, Figma or any other documents that might be relevant to the PR._
 
-> Please include a summary of the changes and which issue has been fixed. Please also include relevant motivation
-> and context. List any dependencies that are required for this change.
 
-Fixes # (issue)
+Fixes #`Issue Number`  
+_or_  
+Fixes `Issue URL`
+> [!WARNING]  
+> _If no issue exists, please create an issue first, and check with the maintainers if the issue is valid._
 
-> if no issue exists, please create an issue and ask the maintainers about this first
+## Testing
 
-## Type of change
+> [!NOTE]
+> **How CI runs on fork PRs — no action needed from you.**
+> 1. **Workflow approval.** GitHub holds the first run on fork PRs until a maintainer approves it, so a pause before any check appears is expected.
+> 2. **Credential-free checks.** Once approved, format, lint, typecheck, unit tests, cyclic-dependency and compile-only build checks run without repository secrets. Only the checks relevant to what you changed (client / server / RTS) will run, and their logs are safe to debug against.
+> 3. **Maintainer-triggered checks.** Cypress, Playwright, Docker builds and deploy previews need secrets, so a maintainer starts them with `/approve-ci`, and `/build-deploy-preview` when hands-on testing is needed. Approval is pinned to one commit — pushing again requires fresh approval.
+>
+> The `awaiting-maintainer` / `awaiting-contributor` labels show whose turn it is. You do **not** need `ok-to-test` or any slash command. Full detail: [Pull request check states](https://github.com/appsmithorg/appsmith/blob/release/contributions/CodeContributionsGuidelines.md#pull-request-check-states).
 
-> Please delete options that are not relevant.
+Select the validation relevant to this change:
 
-- Bug fix (non-breaking change which fixes an issue)
-- New feature (non-breaking change which adds functionality)
-- Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- This change requires a documentation update
+- [ ] Client unit tests
+- [ ] Server unit tests
+- [ ] Cypress
+- [ ] Playwright
+- [ ] Deploy preview
+- [ ] Not applicable
 
-## How Has This Been Tested?
+Suggested Cypress tags or specs:
 
-> Please describe the tests that you ran to verify your changes. Provide instructions, so we can reproduce.
-> Please also list any relevant details for your test configuration.
 
-- Test A
-- Test B
-
-## Checklist:
-
-- [ ] My code follows the style guidelines of this project
-- [ ] I have performed a self-review of my own code
-- [ ] I have commented my code, particularly in hard-to-understand areas
-- [ ] I have made corresponding changes to the documentation
-- [ ] My changes generate no new warnings
-- [ ] I have added tests that prove my fix is effective or that my feature works
-- [ ] New and existing unit tests pass locally with my changes
+## Communication
+Should the DevRel and Marketing teams inform users about this change?
+- [ ] Yes
+- [ ] No

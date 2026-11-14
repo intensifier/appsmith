@@ -1,23 +1,31 @@
+import {
+  RUN_BEHAVIOR_VALUES,
+  RUN_BEHAVIOR_CONFIG_PROPERTY,
+} from "constants/AppsmithActionConstants/formConfig/PluginSettings";
+import { ActionRunBehaviour } from "PluginActionEditor/types/PluginActionTypes";
+
 export default [
   {
     sectionName: "",
     id: 1,
     children: [
       {
-        label: "Run API on Page load",
-        configProperty: "executeOnLoad",
-        controlType: "SWITCH",
-        info: "Will refresh data each time the page is loaded",
+        label: "Run behavior",
+        configProperty: RUN_BEHAVIOR_CONFIG_PROPERTY,
+        controlType: "DROP_DOWN",
+        initialValue: ActionRunBehaviour.MANUAL,
+        options: RUN_BEHAVIOR_VALUES,
       },
       {
-        label: "Request confirmation before running API",
+        label: "Request confirmation before running this API",
         configProperty: "confirmBeforeExecute",
         controlType: "SWITCH",
-        info: "Ask confirmation from the user each time before refreshing data",
+        tooltipText:
+          "Ask confirmation from the user each time before refreshing data",
       },
       {
         label: "API timeout (in milliseconds)",
-        info: "Maximum time after which the API will return",
+        subtitle: "Maximum time after which the API will return",
         configProperty: "actionConfiguration.timeoutInMillisecond",
         controlType: "INPUT_TEXT",
         dataType: "NUMBER",

@@ -7,14 +7,17 @@ export const getOriginalRowIndex = (
 ) => {
   const primaryKey =
     selectedRowIndex !== undefined &&
+    oldTableData &&
     oldTableData[selectedRowIndex] &&
     oldTableData[selectedRowIndex].__primaryKey__
       ? oldTableData[selectedRowIndex].__primaryKey__
       : null;
-  if (primaryKey) {
+
+  if (primaryKey && newTableData) {
     const selectedRow = newTableData.find(
       (item) => item.__primaryKey__ === primaryKey,
     );
+
     if (selectedRow) {
       return selectedRow.__originalIndex__ as number;
     }
@@ -29,6 +32,7 @@ export const selectRowIndex = (
   primaryColumnId: string | undefined,
 ) => {
   let selectedRowIndex = isNumber(defaultSelectedRow) ? defaultSelectedRow : -1;
+
   if (
     selectedRowIndexProp !== -1 &&
     selectedRowIndexProp !== undefined &&
@@ -39,10 +43,12 @@ export const selectRowIndex = (
       newTableData,
       selectedRowIndexProp,
     );
+
     if (rowIndex !== undefined) {
       selectedRowIndex = rowIndex;
     }
   }
+
   return selectedRowIndex;
 };
 
@@ -57,13 +63,15 @@ export const selectRowIndices = (
     Array.isArray(selectedRowIndicesProp) && primaryColumnId
       ? selectedRowIndicesProp
       : Array.isArray(defaultSelectedRow)
-      ? defaultSelectedRow
-      : [];
+        ? defaultSelectedRow
+        : [];
   const selectedRowIndices = rowIndices
     .map((index: number) => {
       const rowIndex = getOriginalRowIndex(oldTableData, newTableData, index);
+
       return rowIndex;
     })
     .filter((index) => index !== undefined);
+
   return selectedRowIndices;
 };

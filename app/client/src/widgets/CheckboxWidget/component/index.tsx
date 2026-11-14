@@ -1,108 +1,175 @@
 import React from "react";
 import styled from "styled-components";
-import { ComponentProps } from "widgets/BaseComponent";
-import { Alignment, Checkbox, Classes } from "@blueprintjs/core";
-import { AlignWidget } from "widgets/constants";
+import type { ComponentProps } from "widgets/BaseComponent";
+import { AlignWidgetTypes } from "WidgetProvider/types";
+import { Alignment, Classes } from "@blueprintjs/core";
 import { Colors } from "constants/Colors";
+import { LabelPosition } from "components/constants";
+import { FontStyleTypes } from "constants/WidgetConstants";
+import { Checkbox } from "./Checkbox";
+import LabelWithTooltip, {
+  LABEL_CONTAINER_CLASS,
+} from "widgets/components/LabelWithTooltip";
 
-type StyledCheckboxProps = {
-  rowSpace: number;
-  disabled?: boolean;
-  checked?: boolean;
-};
-
-type StyledCheckboxContainerProps = {
+interface StyledCheckboxContainerProps {
   isValid: boolean;
-};
+  noContainerPadding?: boolean;
+  labelPosition?: LabelPosition;
+  minHeight?: number;
+  $isFullWidth?: boolean;
+  alignWidget?: AlignWidgetTypes;
+}
+
+const DEFAULT_BORDER_RADIUS = "0";
+const DEFAULT_BACKGROUND_COLOR = Colors.GREEN_SOLID;
 
 const CheckboxContainer = styled.div<StyledCheckboxContainerProps>`
   && {
-    padding: 9px 12px;
     align-items: center;
     display: flex;
     height: 100%;
-    justify-content: flex-start;
-    width: 100%;
-    &.${Alignment.RIGHT} {
-      justify-content: flex-end;
+    justify-content: start;
+    width: ${({ $isFullWidth }) => ($isFullWidth ? "100%" : "auto")};
+
+    ${({ minHeight }) => `
+    ${minHeight ? `min-height: ${minHeight}px;` : ""}`};
+
+    .${Classes.CHECKBOX} {
+      width: 100%;
     }
 
-    & .bp3-control-indicator {
-      border: ${(props) =>
-        !props.isValid && `1px solid ${props.theme.colors.error} !important`};
+    .${LABEL_CONTAINER_CLASS} {
+      max-width: 100%;
+      flex: 1 1 auto;
+      flex-wrap: wrap;
+      justify-content: ${({ alignWidget }) =>
+        alignWidget === AlignWidgetTypes.RIGHT ? "flex-end" : "flex-start"};
+
+      label {
+        text-align: ${({ alignWidget }) =>
+          alignWidget === AlignWidgetTypes.RIGHT ? "right" : "left"};
+        white-space: normal;
+        overflow: auto;
+        text-overflow: unset;
+        word-break: break-word;
+        pointer-events: none;
+        margin-bottom: 0;
+      }
+      div {
+        margin-bottom: 0;
+      }
     }
   }
 `;
 
-export const StyledCheckbox = styled(Checkbox)<StyledCheckboxProps>`
-  height: ${({ rowSpace }) => rowSpace}px;
-  color: ${({ checked }) => (checked ? Colors.GREY_10 : Colors.GREY_9)};
+export const CheckboxLabel = styled.div<{
+  disabled?: boolean;
+  alignment: AlignWidgetTypes;
+  labelTextColor?: string;
+  labelTextSize?: string;
+  labelStyle?: string;
+  isDynamicHeightEnabled?: boolean;
+  isLabelInline?: boolean;
+}>`
+  width: 100%;
+  display: inline-block;
+  vertical-align: top;
+  text-align: ${({ alignment }) => alignment.toLowerCase()};
+  ${({ disabled, labelStyle, labelTextColor, labelTextSize }) => `
+  color: ${
+    disabled ? "var(--wds-color-text-disabled)" : labelTextColor || "inherit"
+  };
+  font-size: ${labelTextSize ?? "inherit"};
+  font-weight: ${labelStyle?.includes(FontStyleTypes.BOLD) ? "bold" : "normal"};
+  font-style: ${
+    labelStyle?.includes(FontStyleTypes.ITALIC) ? "italic" : "normal"
+  };
+  `}
 
-  &.bp3-control.bp3-checkbox .bp3-control-indicator {
-    border-radius: 0;
-    border: 1px solid ${Colors.GREY_3};
-    box-shadow: none;
-    outline: none !important;
-    background: transparent;
+  ${({ isDynamicHeightEnabled }) =>
+    isDynamicHeightEnabled ? "&& { word-break: break-all; }" : ""};
 
-    ${({ checked }) =>
-      checked
-        ? `
-        background-color: ${Colors.GREEN_SOLID} !important;
-        background-image: none;
-        box-shadow: none;
-        border: none !important;
-        &::before {
-          background-image: url("data:image/svg+xml,%3Csvg width='16' height='16' viewBox='0 0 14 14' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Crect width='14' height='14' /%3E%3Cpath d='M10.1039 3.5L11 4.40822L5.48269 10L2.5 6.97705L3.39613 6.06883L5.48269 8.18305L10.1039 3.5Z' fill='white'/%3E%3C/svg%3E%0A") !important;
-        }
-        `
-        : ``}
-    ${({ disabled }) => (disabled ? `opacity: 0.5;` : ``)}
-  }
+  ${({ isLabelInline }) =>
+    isLabelInline &&
+    `
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    word-wrap: normal;
+  `}
+`;
 
-  &:hover {
-    &.bp3-control.bp3-checkbox .bp3-control-indicator {
-      ${({ disabled }) =>
-        disabled ? "" : `border: 1px solid ${Colors.GREY_5}`};
-      ${({ checked }) =>
-        checked
-          ? `
-        background-image: linear-gradient(
-          0deg,
-          rgba(0, 0, 0, 0.2),
-          rgba(0, 0, 0, 0.2)
-        );
-        box-shadow: none;
-        `
-          : ""};
-    }
-  }
-
-  &.${Classes.CONTROL}.${Classes.DISABLED} {
-    color: ${Colors.GREY_8};
+export const StyledCheckbox = styled(Checkbox)`
+  &.bp3-control.bp3-align-right {
+    padding-right: 0px;
   }
 `;
 
 class CheckboxComponent extends React.Component<CheckboxComponentProps> {
+  static readonly defaultProps = {
+    isFullWidth: true,
+  };
   render() {
+    /**
+     * When the label position is left align checkbox to the right
+     * When the label position is right align checkbox to the left
+     */
     const checkboxAlignClass =
-      this.props.alignWidget === "RIGHT" ? Alignment.RIGHT : Alignment.LEFT;
+      this.props.labelPosition === LabelPosition.Right ? "left" : "right";
+
+    // If the prop isValid has a value true/false (it was explicitly passed to this component),
+    // it take priority over the internal logic to determine if the field is valid or not.
+    const isValid = (() => {
+      if (this.props.isValid !== undefined) {
+        return this.props.isValid;
+      }
+
+      return !(this.props.isRequired && !this.props.isChecked);
+    })();
 
     return (
       <CheckboxContainer
-        className={checkboxAlignClass}
-        isValid={!(this.props.isRequired && !this.props.isChecked)}
+        $isFullWidth={this.props.isFullWidth}
+        alignWidget={this.props.alignWidget}
+        isValid={isValid}
+        minHeight={this.props.minHeight}
+        noContainerPadding={this.props.noContainerPadding}
       >
         <StyledCheckbox
+          accentColor={this.props.accentColor || DEFAULT_BACKGROUND_COLOR}
           alignIndicator={checkboxAlignClass}
+          borderRadius={this.props.borderRadius || DEFAULT_BORDER_RADIUS}
           checked={this.props.isChecked}
           className={
             this.props.isLoading ? Classes.SKELETON : Classes.RUNNING_TEXT
           }
           disabled={this.props.isDisabled}
-          label={this.props.label}
+          hasError={!isValid}
+          inputRef={this.props.inputRef}
+          labelElement={
+            <LabelWithTooltip
+              alignment={
+                this.props.alignWidget === AlignWidgetTypes.RIGHT
+                  ? Alignment.RIGHT
+                  : Alignment.LEFT
+              }
+              className="t--checkbox-widget-label"
+              color={this.props.labelTextColor}
+              compact
+              disabled={this.props.isDisabled}
+              fontSize={this.props.labelTextSize}
+              fontStyle={this.props.labelStyle}
+              helpText={this.props.labelTooltip}
+              inline={this.props.isLabelInline}
+              isDynamicHeightEnabled={this.props.isDynamicHeightEnabled}
+              isRequired={!!this.props.label && this.props.isRequired}
+              loading={this.props.isLoading}
+              optionCount={1}
+              position={this.props.labelPosition}
+              text={this.props.label}
+            />
+          }
           onChange={this.onCheckChange}
-          rowSpace={this.props.rowSpace}
         />
       </CheckboxContainer>
     );
@@ -114,13 +181,28 @@ class CheckboxComponent extends React.Component<CheckboxComponentProps> {
 }
 
 export interface CheckboxComponentProps extends ComponentProps {
-  alignWidget?: AlignWidget;
+  alignWidget?: AlignWidgetTypes;
+  noContainerPadding?: boolean;
   isChecked: boolean;
   isLoading: boolean;
   isRequired?: boolean;
+  isValid?: boolean;
   label: string;
   onCheckChange: (isChecked: boolean) => void;
-  rowSpace: number;
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  inputRef?: (el: HTMLInputElement | null) => any;
+  accentColor: string;
+  borderRadius: string;
+  isDynamicHeightEnabled?: boolean;
+  labelPosition: LabelPosition;
+  labelTextColor?: string;
+  labelTextSize?: string;
+  labelStyle?: string;
+  isLabelInline?: boolean;
+  minHeight?: number;
+  isFullWidth?: boolean;
+  labelTooltip?: string;
 }
 
 export default CheckboxComponent;

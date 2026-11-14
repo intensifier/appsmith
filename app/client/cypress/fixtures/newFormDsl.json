@@ -35,6 +35,7 @@
         "bottomRow": 20,
         "snapColumns": 16,
         "orientation": "VERTICAL",
+        "parentId": "0",
         "children": [
           {
             "backgroundColor": "transparent",
@@ -51,14 +52,34 @@
             "bottomRow": 532,
             "snapColumns": 16,
             "orientation": "VERTICAL",
+            "parentId": "jaftzrmtin",
             "children": [
+              {
+                "widgetName": "Text1",
+                "rightColumn": 3,
+                "widgetId": "4d8d2eh4xg",
+                "dynamicPropertyPathList": [],
+                "topRow": 0,
+                "bottomRow": 1,
+                "parentRowSpace": 38,
+                "isVisible": true,
+                "type": "TEXT_WIDGET",
+                "dynamicBindingPathList": [],
+                "shouldScroll": true,
+                "parentId": "e3tq9qwta6",
+                "isLoading": false,
+                "parentColumnSpace": 71.75,
+                "leftColumn": 1,
+                "text": "Test text",
+                "textStyle": "HEADING"
+              },
               {
                 "isVisible": true,
                 "inputType": "TEXT",
                 "label": "",
                 "iconAlign": "left",
                 "widgetName": "Input1",
-                "type": "INPUT_WIDGET",
+                "type": "INPUT_WIDGET_V2",
                 "isLoading": false,
                 "parentColumnSpace": 71.75,
                 "parentRowSpace": 38,
@@ -73,9 +94,12 @@
                 "isVisible": true,
                 "label": "",
                 "selectionType": "SINGLE_SELECT",
-                "options": "",
+                "sourceData": "",
+                "optionLabel": "label",
+                "optionValue": "value",
+                "dynamicPropertyPathList": [{"key": "sourceData"}],
                 "widgetName": "Dropdown1",
-                "type": "DROP_DOWN_WIDGET",
+                "type": "SELECT_WIDGET",
                 "isLoading": false,
                 "parentColumnSpace": 71.75,
                 "parentRowSpace": 38,
@@ -97,16 +121,25 @@
                 "rightColumn": 15,
                 "isVisible": true,
                 "label": "",
-                "type": "MULTI_SELECT_WIDGET",
-                "parentId": "zizrooqfps",
+                "type": "MULTI_SELECT_WIDGET_V2",
+                "parentId": "e3tq9qwta6",
                 "isLoading": false,
                 "defaultOptionValue": [
-                  "First",
-                  "Seventh"
+                  {
+                    "label": "Hashirama Senju",
+                    "value": "First"
+                  },
+                  {
+                    "label": "Naruto Uzumaki",
+                    "value": "Seventh"
+                  }
                 ],
                 "parentColumnSpace": 71.75,
                 "leftColumn": 10,
-                "options": [
+                "optionLable": "label",
+                "optionValue": "value",
+                "dynamicPropertyPathList": [{"key": "sourceData"}],
+                "sourceData": [
                   {
                     "label": "Hashirama Senju",
                     "value": "First"
@@ -253,8 +286,8 @@
                 "parentRowSpace": 38,
                 "leftColumn": 10,
                 "rightColumn": 14,
-                "topRow": 11,
-                "bottomRow": 12,
+                "topRow": 17,
+                "bottomRow": 18,
                 "parentId": "e3tq9qwta6",
                 "widgetId": "ca22py6vlv"
               },
@@ -305,7 +338,7 @@
                 "rightColumn": 18,
                 "topRow": 9,
                 "bottomRow": 17,
-                "parentId": "kipfh779n5",
+                "parentId": "e3tq9qwta6",
                 "widgetId": "zbzrlbiose"
               },
               {
@@ -321,18 +354,18 @@
                 "parentColumnSpace": 6.6856445312499995,
                 "leftColumn": 2,
                 "options": [
-                    {
-                        "label": "Blue",
-                        "value": "BLUE"
-                    },
-                    {
-                        "label": "Green",
-                        "value": "GREEN"
-                    },
-                    {
-                        "label": "Red",
-                        "value": "RED"
-                    }
+                  {
+                    "label": "Blue",
+                    "value": "BLUE"
+                  },
+                  {
+                    "label": "Green",
+                    "value": "GREEN"
+                  },
+                  {
+                    "label": "Red",
+                    "value": "RED"
+                  }
                 ],
                 "isDisabled": false,
                 "key": "vrhzyvir7s",
@@ -342,7 +375,7 @@
                 "widgetId": "egtjazr1wh",
                 "isVisible": true,
                 "version": 1,
-                "parentId": "xbbqrz2ncf",
+                "parentId": "e3tq9qwta6",
                 "renderMode": "CANVAS",
                 "isLoading": false,
                 "isInline": true

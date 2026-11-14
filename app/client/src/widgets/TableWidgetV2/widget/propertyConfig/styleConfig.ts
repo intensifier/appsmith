@@ -1,0 +1,372 @@
+import { ValidationTypes } from "constants/WidgetValidation";
+import { AutocompleteDataType } from "utils/autocomplete/AutocompleteDataType";
+import { headerFontWeightValidation } from "../../component/headerFontWeight";
+import { updateColumnStyles } from "../propertyUtils";
+
+export default [
+  {
+    sectionName: "General",
+    children: [
+      {
+        propertyName: "compactMode",
+        helpText: "Selects row height",
+        label: "Default row height",
+        controlType: "ICON_TABS",
+        fullWidth: true,
+        defaultValue: "DEFAULT",
+        isBindProperty: true,
+        isTriggerProperty: false,
+        options: [
+          {
+            label: "Short",
+            value: "SHORT",
+          },
+          {
+            label: "Default",
+            value: "DEFAULT",
+          },
+          {
+            label: "Tall",
+            value: "TALL",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    sectionName: "Text formatting",
+    children: [
+      {
+        propertyName: "textSize",
+        label: "Text size",
+        helpText: "Controls the size of text in the column",
+        controlType: "DROP_DOWN",
+        updateHook: updateColumnStyles,
+        dependencies: ["primaryColumns"],
+        options: [
+          {
+            label: "S",
+            value: "0.875rem",
+            subText: "0.875rem",
+          },
+          {
+            label: "M",
+            value: "1rem",
+            subText: "1rem",
+          },
+          {
+            label: "L",
+            value: "1.25rem",
+            subText: "1.25rem",
+          },
+          {
+            label: "XL",
+            value: "1.875rem",
+            subText: "1.875rem",
+          },
+        ],
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "fontStyle",
+        label: "Emphasis",
+        helpText: "Controls the style of the text in the column",
+        controlType: "BUTTON_GROUP",
+        updateHook: updateColumnStyles,
+        dependencies: ["primaryColumns"],
+        options: [
+          {
+            icon: "text-bold",
+            value: "BOLD",
+          },
+          {
+            icon: "text-italic",
+            value: "ITALIC",
+          },
+        ],
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "horizontalAlignment",
+        label: "Text align",
+        helpText: "Sets the horizontal alignment of the content in the column",
+        controlType: "ICON_TABS",
+        fullWidth: true,
+        updateHook: updateColumnStyles,
+        dependencies: ["primaryColumns"],
+        options: [
+          {
+            startIcon: "align-left",
+            value: "LEFT",
+          },
+          {
+            startIcon: "align-center",
+            value: "CENTER",
+          },
+          {
+            startIcon: "align-right",
+            value: "RIGHT",
+          },
+        ],
+        defaultValue: "LEFT",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: {
+          type: ValidationTypes.TEXT,
+          params: {
+            allowedValues: ["LEFT", "CENTER", "RIGHT"],
+          },
+        },
+      },
+      {
+        propertyName: "verticalAlignment",
+        label: "Vertical alignment",
+        helpText: "Sets the vertical alignment of the content in the column",
+        controlType: "ICON_TABS",
+        fullWidth: true,
+        updateHook: updateColumnStyles,
+        dependencies: ["primaryColumns"],
+        options: [
+          {
+            startIcon: "vertical-align-top",
+            value: "TOP",
+          },
+          {
+            startIcon: "vertical-align-middle",
+            value: "CENTER",
+          },
+          {
+            startIcon: "vertical-align-bottom",
+            value: "BOTTOM",
+          },
+        ],
+        defaultValue: "CENTER",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: {
+          type: ValidationTypes.TEXT,
+          params: {
+            allowedValues: ["TOP", "CENTER", "BOTTOM"],
+          },
+        },
+      },
+    ],
+  },
+  {
+    sectionName: "Color",
+    children: [
+      {
+        propertyName: "cellBackground",
+        label: "Cell background color",
+        helpText: "Changes the background color of the cell",
+        controlType: "COLOR_PICKER",
+        updateHook: updateColumnStyles,
+        dependencies: ["primaryColumns"],
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "headerRowColor",
+        label: "Header row color",
+        helpText: "Changes the background color of the header row",
+        controlType: "COLOR_PICKER",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "headerTextColor",
+        label: "Header text color",
+        helpText: "Changes the text color of the header row",
+        controlType: "COLOR_PICKER",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "headerFontWeight",
+        label: "Header font weight",
+        helpText: "Sets the font weight of the column headers",
+        helperText:
+          "Enter a number from 1 to 1000. If the app font has no file for that weight, the browser uses the closest one it has. Invalid values use 700.",
+        placeholderText: "700",
+        controlType: "DROP_DOWN",
+        defaultValue: "700",
+        options: [
+          {
+            label: "Light",
+            value: "300",
+            subText: "300",
+          },
+          {
+            label: "Regular",
+            value: "400",
+            subText: "400",
+          },
+          {
+            label: "Bold",
+            value: "700",
+            subText: "700",
+          },
+        ],
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: {
+          type: ValidationTypes.FUNCTION,
+          params: {
+            fnString: headerFontWeightValidation.toString(),
+            expected: {
+              type: "number (1 to 1000) | light | normal | regular | medium | semibold | semi-bold | bold",
+              example: "700",
+              autocompleteDataType: AutocompleteDataType.NUMBER,
+            },
+          },
+        },
+      },
+      {
+        propertyName: "headerFontStyle",
+        label: "Header emphasis",
+        helpText: "Italicizes or underlines the column headers",
+        controlType: "BUTTON_GROUP",
+        options: [
+          {
+            icon: "text-italic",
+            value: "ITALIC",
+          },
+          {
+            icon: "text-underline",
+            value: "UNDERLINE",
+          },
+        ],
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "oddRowColor",
+        label: "Odd row color",
+        helpText: "Changes the background color of odd rows",
+        controlType: "COLOR_PICKER",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "evenRowColor",
+        label: "Even row color",
+        helpText: "Changes the background color of even rows",
+        controlType: "COLOR_PICKER",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "accentColor",
+        label: "Accent color",
+        controlType: "COLOR_PICKER",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+        invisible: true,
+      },
+      {
+        propertyName: "textColor",
+        label: "Text color",
+        helpText: "Controls the color of text in the column",
+        controlType: "COLOR_PICKER",
+        updateHook: updateColumnStyles,
+        dependencies: ["primaryColumns"],
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+    ],
+  },
+  {
+    sectionName: "Border and shadow",
+    children: [
+      {
+        propertyName: "variant",
+        helpText: "Selects the variant",
+        label: "Cell borders",
+        controlType: "DROP_DOWN",
+        defaultValue: "DEFAULT",
+        isBindProperty: true,
+        isTriggerProperty: false,
+        options: [
+          {
+            label: "Default",
+            value: "DEFAULT",
+          },
+          {
+            label: "No borders",
+            value: "VARIANT2",
+          },
+          {
+            label: "Horizonal borders only",
+            value: "VARIANT3",
+          },
+        ],
+      },
+      {
+        propertyName: "borderRadius",
+        label: "Border radius",
+        helpText: "Rounds the corners of the icon button's outer border edge",
+        controlType: "BORDER_RADIUS_OPTIONS",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        propertyName: "boxShadow",
+        label: "Box shadow",
+        helpText:
+          "Enables you to cast a drop shadow from the frame of the widget",
+        controlType: "BOX_SHADOW_OPTIONS",
+        isJSConvertible: true,
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        helpText: "Use a html color name, HEX, RGB or RGBA value",
+        placeholderText: "#FFFFFF / Gray / rgb(255, 99, 71)",
+        propertyName: "borderColor",
+        label: "Border color",
+        controlType: "COLOR_PICKER",
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.TEXT },
+      },
+      {
+        helpText: "Enter value for border width",
+        propertyName: "borderWidth",
+        label: "Border width",
+        placeholderText: "Enter value in px",
+        controlType: "INPUT_TEXT",
+        isBindProperty: true,
+        isTriggerProperty: false,
+        validation: { type: ValidationTypes.NUMBER },
+      },
+    ],
+  },
+];

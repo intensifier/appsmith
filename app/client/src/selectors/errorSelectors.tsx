@@ -1,9 +1,9 @@
-import { AppState } from "reducers";
+import type { DefaultRootState } from "react-redux";
 
-export const getSafeCrash = (state: AppState) => {
+export const getSafeCrash = (state: DefaultRootState) => {
   return state.ui.errors.safeCrash;
 };
 
-export const getSafeCrashCode = (state: AppState) => {
+export const getSafeCrashCode = (state: DefaultRootState) => {
   return state.ui.errors.safeCrashCode;
 };

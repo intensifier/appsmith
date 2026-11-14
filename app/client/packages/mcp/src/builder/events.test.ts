@@ -1,0 +1,1260 @@
+import { applyWidgetPatch } from "./editPatch.js";
+import {
+  applyEvent,
+  compileEventBinding,
+  eventActionKinds,
+  eventReferences,
+  widgetExists,
+  wireEventSpecSchema,
+} from "./events.js";
+import type { WidgetNode } from "./layout.js";
+
+function page(children: WidgetNode[]): WidgetNode {
+  return {
+    widgetId: "0",
+    widgetName: "MainContainer",
+    type: "CANVAS_WIDGET",
+    topRow: 0,
+    bottomRow: 380,
+    leftColumn: 0,
+    rightColumn: 640,
+    children,
+  };
+}
+
+function widget(
+  overrides: Partial<WidgetNode> & { widgetId: string },
+): WidgetNode {
+  return {
+    widgetName: overrides.widgetId,
+    type: "BUTTON_WIDGET",
+    topRow: 0,
+    bottomRow: 4,
+    leftColumn: 0,
+    rightColumn: 16,
+    ...overrides,
+  };
+}
+
+describe("APP-16324 F11: navigate with URL parameters", () => {
+  // Security review: navigateTo treats a target that is not a page as a URL. "1572395042" + "?x=1.55" passes its URL
+  // check (the dot comes from the param) and https:// makes it the IP 93.184.216.34, an open redirect.
+  it("refuses a navigate target that reads as an IP address", () => {
+    for (const navigate of ["1572395042", "0x5db8d822"]) {
+      expect(
+        wireEventSpecSchema.safeParse({
+          widget: "Go",
+          event: "onClick",
+          action: { navigate, params: { x: { literal: 1.55 } } },
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("refuses an Object.prototype name as a table column parameter", () => {
+    for (const column of ["constructor", "__proto__", "prototype"]) {
+      expect(
+        wireEventSpecSchema.safeParse({
+          widget: "Go",
+          event: "onClick",
+          action: {
+            navigate: "Details",
+            params: { id: { table: "Table1", column } },
+          },
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  // Oracle: Home's "Details" button opens Ticket Details with ?id= set to the selected row's zid.
+  it("passes the selected row's column as a query parameter", () => {
+    const action = wireEventSpecSchema.parse({
+      widget: "DetailsButton",
+      event: "onClick",
+      action: {
+        navigate: "Ticket Details",
+        params: { id: { table: "Table1", column: "zid" } },
+      },
+    }).action;
+
+    expect(compileEventBinding(action)).toBe(
+      `{{ navigateTo('Ticket Details', { id: Table1.selectedRow?.["zid"] }, 'SAME_WINDOW') }}`,
+    );
+  });
+
+  it("emits literal and widget-property parameters in order", () => {
+    const action = wireEventSpecSchema.parse({
+      widget: "Go",
+      event: "onClick",
+      action: {
+        navigate: "Search",
+        params: {
+          q: { widget: "SearchInput", property: "text" },
+          page: { literal: 2 },
+          archived: { literal: false },
+          tab: { literal: "open" },
+          col: { table: "Orders", column: "order id" },
+        },
+      },
+    }).action;
+
+    expect(compileEventBinding(action)).toBe(
+      `{{ navigateTo('Search', { q: SearchInput.text, page: 2, archived: false, tab: "open", col: Orders.selectedRow?.["order id"] }, 'SAME_WINDOW') }}`,
+    );
+  });
+
+  it("keeps a run follow-up navigate with parameters", () => {
+    const action = wireEventSpecSchema.parse({
+      widget: "Save",
+      event: "onClick",
+      action: {
+        run: "SaveTicket",
+        onSuccess: [
+          {
+            navigate: "Ticket Details",
+            params: { id: { widget: "IdInput", property: "text" } },
+          },
+        ],
+      },
+    }).action;
+
+    expect(compileEventBinding(action)).toContain(
+      "navigateTo('Ticket Details', { id: IdInput.text }, 'SAME_WINDOW')",
+    );
+  });
+
+  it("reports parameter widgets and tables to the dangling-reference guard", () => {
+    const action = wireEventSpecSchema.parse({
+      widget: "Go",
+      event: "onClick",
+      action: {
+        navigate: "Search",
+        params: {
+          q: { widget: "SearchInput", property: "text" },
+          id: { table: "Table1", column: "zid" },
+        },
+      },
+    }).action;
+
+    expect(eventReferences(action)).toEqual([
+      { kind: "page", name: "Search" },
+      { kind: "widget", name: "SearchInput" },
+      { kind: "widget", name: "Table1", table: true },
+    ]);
+  });
+
+  it.each([
+    ["a key that is not an identifier", { "my-id": { literal: 1 } }],
+    // Parsed from JSON, as a tool call arrives: an object literal's __proto__ would set the prototype, not a key.
+    ["a prototype key", JSON.parse('{"__proto__": {"literal": 1}}')],
+    ["a constructor key", { constructor: { literal: 1 } }],
+    ["a literal with a single quote", { id: { literal: "a'); evil(); ('" } }],
+    // The brace rule rejects these first; the cases below reach the binding-syntax check on its own.
+    ["a literal with a binding pair", { id: { literal: "{{evil()}}" } }],
+    ["a column with a binding pair", { id: { table: "T", column: "}}{{x" } }],
+    ["a literal with a backtick", { id: { literal: "a`b" } }],
+    ["a literal with ${", { id: { literal: "a${b" } }],
+    ["a literal with U+2028", { id: { literal: "a b" } }],
+    ["a column with a backtick", { id: { table: "T", column: "a`b" } }],
+    ["a column with a single quote", { id: { table: "T", column: "it's" } }],
+    // Appsmith splits a binding by counting braces even inside strings, so the handler would never run.
+    ["a literal with an unbalanced brace", { id: { literal: "x}" } }],
+    ["a column with a brace", { id: { table: "T", column: "{a" } }],
+    ["a widget property with a call", { id: { widget: "W", property: "a()" } }],
+    ["a null literal", { id: { literal: null } }],
+    ["an unknown value shape", { id: { query: "Q" } }],
+    [
+      "more than 10 parameters",
+      Object.fromEntries(
+        Array.from({ length: 11 }, (_, i) => [`p${i}`, { literal: i }]),
+      ),
+    ],
+  ])("rejects %s", (_label, params) => {
+    const result = wireEventSpecSchema.safeParse({
+      widget: "Go",
+      event: "onClick",
+      action: { navigate: "Search", params },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts exactly 10 parameters", () => {
+    expect(
+      wireEventSpecSchema.safeParse({
+        widget: "Go",
+        event: "onClick",
+        action: {
+          navigate: "Search",
+          params: Object.fromEntries(
+            Array.from({ length: 10 }, (_, i) => [`p${i}`, { literal: i }]),
+          ),
+        },
+      }).success,
+    ).toBe(true);
+  });
+
+  it('JSON-encodes " and \\ in a literal so they stay inside the string', () => {
+    const action = wireEventSpecSchema.parse({
+      widget: "Go",
+      event: "onClick",
+      action: {
+        navigate: "Search",
+        params: { q: { literal: 'say "hi" \\ there' } },
+      },
+    }).action;
+    const binding = compileEventBinding(action);
+    const objectText = /navigateTo\('Search', (\{.*\}), 'SAME_WINDOW'\)/.exec(
+      binding,
+    )?.[1];
+
+    expect(binding).toBe(
+      `{{ navigateTo('Search', { q: "say \\"hi\\" \\\\ there" }, 'SAME_WINDOW') }}`,
+    );
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    expect(new Function(`return (${objectText});`)()).toEqual({
+      q: 'say "hi" \\ there',
+    });
+  });
+
+  it("keeps a navigate without params unchanged", () => {
+    expect(compileEventBinding({ navigate: "Details Page" })).toBe(
+      "{{ navigateTo('Details Page', {}, 'SAME_WINDOW') }}",
+    );
+  });
+});
+
+describe("compileEventBinding — closed vocabulary", () => {
+  it("emits the correct binding for each action kind", () => {
+    expect(compileEventBinding({ run: "insertRow" })).toBe(
+      "{{ insertRow.run() }}",
+    );
+    expect(compileEventBinding({ navigate: "Details Page" })).toBe(
+      "{{ navigateTo('Details Page', {}, 'SAME_WINDOW') }}",
+    );
+    expect(compileEventBinding({ showModal: "EditModal" })).toBe(
+      "{{ showModal('EditModal') }}",
+    );
+    expect(compileEventBinding({ closeModal: "EditModal" })).toBe(
+      "{{ closeModal('EditModal') }}",
+    );
+    expect(compileEventBinding({ showAlert: "Saved!", style: "success" })).toBe(
+      "{{ showAlert('Saved!', 'success') }}",
+    );
+    // Alert style defaults to info.
+    expect(compileEventBinding({ showAlert: "Heads up" })).toBe(
+      "{{ showAlert('Heads up', 'info') }}",
+    );
+    // Reset a single widget, and several at once (a Clear button).
+    expect(compileEventBinding({ reset: "ZipInput" })).toBe(
+      "{{ resetWidget('ZipInput', true) }}",
+    );
+    expect(compileEventBinding({ reset: ["ZipInput", "Results"] })).toBe(
+      "{{ resetWidget('ZipInput', true); resetWidget('Results', true) }}",
+    );
+  });
+
+  it("validates and references every widget in a reset action", () => {
+    expect(
+      wireEventSpecSchema.safeParse({
+        widget: "ClearButton",
+        event: "onClick",
+        action: { reset: ["ZipInput", "Results"] },
+      }).success,
+    ).toBe(true);
+    // Injection in a reset target is rejected — both the array form and the single-string form.
+    expect(
+      wireEventSpecSchema.safeParse({
+        widget: "ClearButton",
+        event: "onClick",
+        action: { reset: ["ZipInput'); evil("] },
+      }).success,
+    ).toBe(false);
+    expect(
+      wireEventSpecSchema.safeParse({
+        widget: "ClearButton",
+        event: "onClick",
+        action: { reset: "ZipInput'); evil(" },
+      }).success,
+    ).toBe(false);
+    expect(eventReferences({ reset: ["ZipInput", "Results"] })).toEqual([
+      { kind: "widget", name: "ZipInput" },
+      { kind: "widget", name: "Results" },
+    ]);
+  });
+
+  it("compiles the canonical submit -> refresh -> close -> alert chain", () => {
+    expect(
+      compileEventBinding({
+        run: "insertUser",
+        onSuccess: [
+          { run: "getUsers" },
+          { closeModal: "AddUserModal" },
+          { showAlert: "Saved", style: "success" },
+        ],
+        onError: [{ showAlert: "Save failed", style: "error" }],
+      }),
+    ).toBe(
+      "{{ insertUser.run().then(() => { getUsers.run(); closeModal('AddUserModal'); showAlert('Saved', 'success'); }).catch(() => { showAlert('Save failed', 'error'); }) }}",
+    );
+  });
+
+  it("compiles reset as an onSuccess follow-up of a run chain", () => {
+    expect(
+      compileEventBinding({
+        run: "deleteRow",
+        onSuccess: [{ run: "getRows" }, { reset: ["ZipInput", "Results"] }],
+      }),
+    ).toBe(
+      "{{ deleteRow.run().then(() => { getRows.run(); resetWidget('ZipInput', true); resetWidget('Results', true); }) }}",
+    );
+    // And it round-trips through eventReferences (primary query + reset widgets).
+    expect(
+      eventReferences({
+        run: "deleteRow",
+        onSuccess: [{ reset: "ZipInput" }],
+      }),
+    ).toEqual([
+      { kind: "query", name: "deleteRow" },
+      { kind: "widget", name: "ZipInput" },
+    ]);
+  });
+
+  it("compiles onSuccess without onError (and vice versa)", () => {
+    expect(
+      compileEventBinding({ run: "save", onSuccess: [{ run: "reload" }] }),
+    ).toBe("{{ save.run().then(() => { reload.run(); }) }}");
+    expect(
+      compileEventBinding({
+        run: "save",
+        onError: [{ showAlert: "Failed", style: "error" }],
+      }),
+    ).toBe("{{ save.run().catch(() => { showAlert('Failed', 'error'); }) }}");
+  });
+});
+
+describe("call — invoke a restricted JS-object function", () => {
+  it("emits Object.function() from two validated identifiers, as a primary and as a follow-up", () => {
+    expect(
+      compileEventBinding({
+        call: { object: "BannerAdmin", function: "save" },
+      }),
+    ).toBe("{{ BannerAdmin.save() }}");
+    expect(
+      compileEventBinding({
+        run: "SaveBanner",
+        onSuccess: [
+          { call: { object: "BannerAdmin", function: "refresh" } },
+          { closeModal: "EditModal" },
+        ],
+      }),
+    ).toBe(
+      "{{ SaveBanner.run().then(() => { BannerAdmin.refresh(); closeModal('EditModal'); }) }}",
+    );
+    expect(
+      eventReferences({ call: { object: "BannerAdmin", function: "save" } }),
+    ).toEqual([{ kind: "jsFunction", name: "BannerAdmin", member: "save" }]);
+    expect(
+      eventActionKinds({ call: { object: "BannerAdmin", function: "save" } }),
+    ).toEqual(["call"]);
+  });
+
+  it("passes scalar literals and widget-property refs as arguments, JSON-encoded / validated", () => {
+    expect(
+      compileEventBinding({
+        call: {
+          object: "BannerAdmin",
+          function: "splitLines",
+          args: [
+            { widget: "inpInstanceAllow", property: "text" },
+            'x"y',
+            3,
+            true,
+            null,
+          ],
+        },
+      }),
+    ).toBe(
+      '{{ BannerAdmin.splitLines(inpInstanceAllow.text, "x\\"y", 3, true, null) }}',
+    );
+    expect(
+      eventReferences({
+        call: {
+          object: "BannerAdmin",
+          function: "save",
+          args: [{ widget: "Form1", property: "data" }],
+        },
+      }),
+    ).toEqual([
+      { kind: "jsFunction", name: "BannerAdmin", member: "save" },
+      { kind: "widget", name: "Form1" },
+    ]);
+
+    for (const args of [
+      ["{{ evil }}"],
+      [{ widget: "W", property: "a[0]" }],
+      [{ widget: "W" }],
+      ["`x`"],
+      ["x}"],
+      ["{x"],
+      Array(6).fill(1),
+    ]) {
+      expect(
+        wireEventSpecSchema.safeParse({
+          widget: "Btn",
+          event: "onClick",
+          action: { call: { object: "O", function: "f", args } },
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  it("rejects anything that is not a plain identifier pair — no arguments, chains, or expressions", () => {
+    for (const call of [
+      { object: "BannerAdmin.save", function: "x" },
+      { object: "BannerAdmin", function: "save()" },
+      { object: "BannerAdmin", function: "save('a')" },
+      { object: "window", function: "location.href" },
+      { object: "{{evil}}", function: "save" },
+      { object: "Banner Admin", function: "save" },
+      { object: "1Banner", function: "save" },
+      { object: "BannerAdmin" },
+      { object: "BannerAdmin", function: "save", args: "not-a-list" },
+      { object: "BannerAdmin", function: "save", args: [{ raw: "1+1" }] },
+      // An expression argument is a grammar tree: raw JavaScript is not one of its shapes.
+      {
+        object: "BannerAdmin",
+        function: "save",
+        args: [{ expr: { js: "1+1" } }],
+      },
+    ]) {
+      expect(
+        wireEventSpecSchema.safeParse({
+          widget: "Btn",
+          event: "onClick",
+          action: { call },
+        }).success,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("wireEventSpecSchema — rejects anything unsafe", () => {
+  const bad: unknown[] = [
+    { widget: "Btn", event: "onClick", action: { run: "a; DROP" } },
+    { widget: "Btn", event: "onClick", action: { run: "{{evil}}" } },
+    {
+      widget: "Btn",
+      event: "onClick",
+      action: { navigate: "Page');evil()//" },
+    },
+    { widget: "Btn", event: "onClick", action: { showModal: "a'b" } },
+    { widget: "Btn", event: "onBogus", action: { run: "q" } },
+    { widget: "Btn", event: "onClick", action: { run: "q", navigate: "P" } },
+    { widget: "Btn", event: "onClick", action: {} },
+    // Alert messages exclude quotes/backticks/braces — nothing can escape the single-quoted argument.
+    { widget: "Btn", event: "onClick", action: { showAlert: "it's done" } },
+    { widget: "Btn", event: "onClick", action: { showAlert: "x'); evil(" } },
+    { widget: "Btn", event: "onClick", action: { showAlert: "{{evil}}" } },
+    // Follow-ups are validated with the same closed vocabulary and cannot nest further chains.
+    {
+      widget: "Btn",
+      event: "onClick",
+      action: { run: "q", onSuccess: [{ run: "a; DROP" }] },
+    },
+    {
+      widget: "Btn",
+      event: "onClick",
+      action: { run: "q", onSuccess: [{ run: "a", onSuccess: [] }] },
+    },
+    {
+      widget: "Btn",
+      event: "onClick",
+      action: { run: "q", onError: [{ showAlert: "bad`tick" }] },
+    },
+    // Chains only hang off run — a navigate cannot have callbacks.
+    {
+      widget: "Btn",
+      event: "onClick",
+      action: { navigate: "P", onSuccess: [{ run: "q" }] },
+    },
+  ];
+
+  it.each(bad.map((b, i) => [i, b] as const))("rejects case %#", (_i, spec) => {
+    expect(wireEventSpecSchema.safeParse(spec).success).toBe(false);
+  });
+
+  it("accepts a valid spec", () => {
+    expect(
+      wireEventSpecSchema.safeParse({
+        widget: "SaveButton",
+        event: "onClick",
+        action: { run: "insertRow" },
+      }).success,
+    ).toBe(true);
+  });
+
+  it("accepts a chained run with onSuccess/onError follow-ups", () => {
+    expect(
+      wireEventSpecSchema.safeParse({
+        widget: "SaveButton",
+        event: "onClick",
+        action: {
+          run: "insertUser",
+          onSuccess: [
+            { run: "getUsers" },
+            { closeModal: "AddUserModal" },
+            { showAlert: "Saved", style: "success" },
+          ],
+          onError: [{ showAlert: "Save failed", style: "error" }],
+        },
+      }).success,
+    ).toBe(true);
+  });
+});
+
+describe("applyEvent", () => {
+  it("sets the trigger binding and registers the trigger path without mutating input", () => {
+    const dsl = page([widget({ widgetId: "Save", widgetName: "Save" })]);
+    const { binding, dsl: next } = applyEvent(dsl, {
+      widget: "Save",
+      event: "onClick",
+      action: { run: "insertRow" },
+    });
+    const button = (next.children as WidgetNode[])[0];
+
+    expect(button.onClick).toBe("{{ insertRow.run() }}");
+    expect(button.dynamicTriggerPathList).toEqual([{ key: "onClick" }]);
+    expect(binding).toBe("{{ insertRow.run() }}");
+    // Input DSL is untouched.
+    expect((dsl.children as WidgetNode[])[0].onClick).toBeUndefined();
+  });
+
+  it("does not duplicate an already-registered trigger path", () => {
+    const dsl = page([
+      widget({
+        widgetId: "Save",
+        widgetName: "Save",
+        dynamicTriggerPathList: [{ key: "onClick" }],
+      }),
+    ]);
+    const { dsl: next } = applyEvent(dsl, {
+      widget: "Save",
+      event: "onClick",
+      action: { run: "q" },
+    });
+
+    expect((next.children as WidgetNode[])[0].dynamicTriggerPathList).toEqual([
+      { key: "onClick" },
+    ]);
+  });
+
+  it("rejects an unknown widget", () => {
+    expect(() =>
+      applyEvent(page([]), {
+        widget: "Missing",
+        event: "onClick",
+        action: { run: "q" },
+      }),
+    ).toThrow(/was not found/);
+  });
+
+  it("rejects an event that is invalid for the widget type", () => {
+    const dsl = page([
+      widget({ widgetId: "T", widgetName: "T", type: "TABLE_WIDGET_V2" }),
+    ]);
+
+    expect(() =>
+      applyEvent(dsl, { widget: "T", event: "onClick", action: { run: "q" } }),
+    ).toThrow(/not supported/);
+  });
+
+  it("schema rejects event names outside the closed vocabulary", () => {
+    // Pins the closed enum: a regression to z.string() would silently accept arbitrary property names.
+    expect(
+      wireEventSpecSchema.safeParse({
+        widget: "Save",
+        event: "onBlur",
+        action: { run: "q" },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("supports change/submit events on select, input, checkbox, switch, and datepicker", () => {
+    const dsl = page([
+      widget({ widgetId: "S", widgetName: "S", type: "SELECT_WIDGET" }),
+      widget({ widgetId: "I", widgetName: "I", type: "INPUT_WIDGET_V2" }),
+      widget({ widgetId: "C", widgetName: "C", type: "CHECKBOX_WIDGET" }),
+      widget({ widgetId: "W", widgetName: "W", type: "SWITCH_WIDGET" }),
+      widget({ widgetId: "D", widgetName: "D", type: "DATE_PICKER_WIDGET2" }),
+    ]);
+    const cases = [
+      { widget: "S", event: "onOptionChange" },
+      { widget: "I", event: "onSubmit" },
+      { widget: "C", event: "onCheckChange" },
+      { widget: "W", event: "onChange" },
+      { widget: "D", event: "onDateSelected" },
+    ] as const;
+
+    for (const testCase of cases) {
+      const { dsl: next } = applyEvent(dsl, {
+        widget: testCase.widget,
+        event: testCase.event,
+        action: { run: "refresh" },
+      });
+      const node = (next.children as WidgetNode[]).find(
+        (child) => child.widgetName === testCase.widget,
+      )!;
+
+      expect(node[testCase.event]).toBe("{{ refresh.run() }}");
+      expect(node.dynamicTriggerPathList).toEqual([{ key: testCase.event }]);
+    }
+
+    // Cross-type misuse still rejects: a select does not take onSubmit.
+    expect(() =>
+      applyEvent(dsl, { widget: "S", event: "onSubmit", action: { run: "q" } }),
+    ).toThrow(/not supported/);
+  });
+
+  it("supports table selection, modal close, and tab change events", () => {
+    const dsl = page([
+      widget({ widgetId: "T", widgetName: "T", type: "TABLE_WIDGET_V2" }),
+      widget({ widgetId: "M", widgetName: "M", type: "MODAL_WIDGET" }),
+      widget({ widgetId: "Tabs", widgetName: "Tabs", type: "TABS_WIDGET" }),
+    ]);
+
+    expect(
+      (
+        applyEvent(dsl, {
+          widget: "T",
+          event: "onRowSelected",
+          action: { run: "loadRow" },
+        }).dsl.children as WidgetNode[]
+      )[0].onRowSelected,
+    ).toBe("{{ loadRow.run() }}");
+    expect(
+      (
+        applyEvent(dsl, {
+          widget: "M",
+          event: "onClose",
+          action: { run: "cleanup" },
+        }).dsl.children as WidgetNode[]
+      )[1].onClose,
+    ).toBe("{{ cleanup.run() }}");
+  });
+});
+
+describe("M5 store accumulation — appendToStore / clearStoreKey / statement lists", () => {
+  function accepts(action: unknown): boolean {
+    return wireEventSpecSchema.safeParse({
+      widget: "Btn",
+      event: "onClick",
+      action,
+    }).success;
+  }
+
+  it("compiles a plain appendToStore ([].concat flattening, persist=false)", () => {
+    expect(
+      compileEventBinding({
+        appendToStore: { key: "zipResults", query: "LookupZip" },
+      }),
+    ).toBe(
+      "{{ storeValue('zipResults', [].concat(appsmith.store.zipResults ?? [], LookupZip.data ?? []), false) }}",
+    );
+  });
+
+  it("compiles appendToStore with a dotted response field", () => {
+    expect(
+      compileEventBinding({
+        appendToStore: { key: "rows", query: "LookupZip", field: "places" },
+      }),
+    ).toBe(
+      "{{ storeValue('rows', [].concat(appsmith.store.rows ?? [], LookupZip.data?.places ?? []), false) }}",
+    );
+  });
+
+  it("compiles a fields projection (space-keyed + numeric-index paths) into ONE bracket-access row", () => {
+    expect(
+      compileEventBinding({
+        appendToStore: {
+          key: "zipResults",
+          query: "LookupZip",
+          fields: [
+            { as: "zip", path: ["post code"] },
+            { as: "city", path: ["places", 0, "place name"] },
+            { as: "state", path: ["places", 0, "state"] },
+          ],
+        },
+      }),
+    ).toBe(
+      "{{ storeValue('zipResults', [].concat(appsmith.store.zipResults ?? [], " +
+        '{ zip: LookupZip.data?.["post code"], city: LookupZip.data?.["places"]?.[0]?.["place name"], state: LookupZip.data?.["places"]?.[0]?.["state"] }' +
+        " ?? []), false) }}",
+    );
+  });
+
+  it("JSON.stringify-escapes hostile path elements (quotes/backslashes cannot escape the literal)", () => {
+    expect(
+      compileEventBinding({
+        appendToStore: {
+          key: "k",
+          query: "q",
+          fields: [{ as: "a", path: ['x"] , evil ["y'] }],
+        },
+      }),
+    ).toBe(
+      "{{ storeValue('k', [].concat(appsmith.store.k ?? [], " +
+        '{ a: q.data?.["x\\"] , evil [\\"y"] }' +
+        " ?? []), false) }}",
+    );
+  });
+
+  it("compiles clearStoreKey (one key emptied, never the whole store)", () => {
+    expect(compileEventBinding({ clearStoreKey: { key: "zipResults" } })).toBe(
+      "{{ storeValue('zipResults', [], false) }}",
+    );
+  });
+
+  it("compiles a statement-list primary joined with ';' (the Clear button)", () => {
+    expect(
+      compileEventBinding([
+        { clearStoreKey: { key: "zipResults" } },
+        { reset: "ZipInput" },
+      ]),
+    ).toBe(
+      "{{ storeValue('zipResults', [], false); resetWidget('ZipInput', true) }}",
+    );
+  });
+
+  it("compiles a statement list whose run keeps its onSuccess chain", () => {
+    expect(
+      compileEventBinding([
+        { showAlert: "Looking up" },
+        {
+          run: "LookupZip",
+          onSuccess: [
+            { appendToStore: { key: "zipResults", query: "LookupZip" } },
+          ],
+        },
+      ]),
+    ).toBe(
+      "{{ showAlert('Looking up', 'info'); LookupZip.run().then(() => { storeValue('zipResults', [].concat(appsmith.store.zipResults ?? [], LookupZip.data ?? []), false); }) }}",
+    );
+  });
+
+  it("accepts the new verbs as primary and as onSuccess/onError follow-ups", () => {
+    expect(
+      accepts({ appendToStore: { key: "zipResults", query: "LookupZip" } }),
+    ).toBe(true);
+    expect(accepts({ clearStoreKey: { key: "zipResults" } })).toBe(true);
+    expect(
+      accepts({
+        run: "LookupZip",
+        onSuccess: [
+          {
+            appendToStore: {
+              key: "zipResults",
+              query: "LookupZip",
+              fields: [{ as: "zip", path: ["post code"] }],
+            },
+          },
+        ],
+        onError: [{ clearStoreKey: { key: "zipResults" } }],
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects prototype-polluting, digit-leading, and malformed store keys", () => {
+    for (const badKey of [
+      "__proto__",
+      "constructor",
+      "prototype",
+      "hasOwnProperty",
+      "1zipResults",
+      "zip-results",
+      "zip results",
+      "a".repeat(65),
+      "",
+    ]) {
+      expect(
+        accepts({ appendToStore: { key: badKey, query: "LookupZip" } }),
+      ).toBe(false);
+      expect(accepts({ clearStoreKey: { key: badKey } })).toBe(false);
+      // The same denylist guards `as` — an unquoted object-literal key where __proto__ would pollute the row.
+      expect(
+        accepts({
+          appendToStore: {
+            key: "ok",
+            query: "q",
+            fields: [{ as: badKey, path: ["x"] }],
+          },
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("rejects field+fields together, oversized projections, and binding syntax in a path element", () => {
+    expect(
+      accepts({
+        appendToStore: {
+          key: "k",
+          query: "q",
+          field: "places",
+          fields: [{ as: "a", path: ["x"] }],
+        },
+      }),
+    ).toBe(false);
+    // > 20 fields.
+    expect(
+      accepts({
+        appendToStore: {
+          key: "k",
+          query: "q",
+          fields: Array.from({ length: 21 }, (_, i) => ({
+            as: `f${i}`,
+            path: ["x"],
+          })),
+        },
+      }),
+    ).toBe(false);
+    // > 5 path elements.
+    expect(
+      accepts({
+        appendToStore: {
+          key: "k",
+          query: "q",
+          fields: [{ as: "a", path: ["a", "b", "c", "d", "e", "f"] }],
+        },
+      }),
+    ).toBe(false);
+
+    // M6: single quotes are rejected outright — a path element like "closeModal('EditModal')" would survive
+    // JSON.stringify intact and poison later text scans of the persisted binding (a stacking edge misread as a
+    // wizard transition, skipping the modal depth gate).
+    expect(
+      accepts({
+        appendToStore: {
+          key: "k",
+          query: "q",
+          fields: [{ as: "a", path: ["closeModal('EditModal')"] }],
+        },
+      }),
+    ).toBe(false);
+    expect(
+      accepts({
+        appendToStore: {
+          key: "k",
+          query: "q",
+          fields: [{ as: "a", path: ["post code"] }],
+        },
+      }),
+    ).toBe(true);
+
+    // A path element that could terminate the outer {{ }} or open an expression is rejected outright, even though
+    // JSON.stringify would escape quotes — the mustache splitter is not JS-aware.
+    for (const badElement of ["a}}b", "a{{b", "a${b}", "a`b"]) {
+      expect(
+        accepts({
+          appendToStore: {
+            key: "k",
+            query: "q",
+            fields: [{ as: "a", path: [badElement] }],
+          },
+        }),
+      ).toBe(false);
+    }
+
+    // Negative / fractional array indexes are rejected.
+    expect(
+      accepts({
+        appendToStore: {
+          key: "k",
+          query: "q",
+          fields: [{ as: "a", path: [-1] }],
+        },
+      }),
+    ).toBe(false);
+    expect(
+      accepts({
+        appendToStore: {
+          key: "k",
+          query: "q",
+          fields: [{ as: "a", path: [1.5] }],
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("bounds statement lists to 2–5 entries with at most one run", () => {
+    // A single-entry list is not a list; use the plain form.
+    expect(accepts([{ clearStoreKey: { key: "k" } }])).toBe(false);
+    expect(
+      accepts([{ clearStoreKey: { key: "k" } }, { reset: "ZipInput" }]),
+    ).toBe(true);
+    // Two runs would emit two independent promise chains — rejected.
+    expect(accepts([{ run: "a" }, { run: "b" }])).toBe(false);
+    // > 5 statements.
+    expect(
+      accepts(
+        Array.from({ length: 6 }, () => ({ clearStoreKey: { key: "k" } })),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects a sibling appendToStore of a query the same list runs (stale-read footgun)", () => {
+    // run() is async: the sibling append would execute before it resolves and read the PREVIOUS response.
+    expect(
+      accepts([
+        { run: "LookupZip" },
+        { appendToStore: { key: "zipResults", query: "LookupZip" } },
+      ]),
+    ).toBe(false);
+    // The correct shape — append inside the run's onSuccess — stays valid.
+    expect(
+      accepts([
+        {
+          run: "LookupZip",
+          onSuccess: [
+            { appendToStore: { key: "zipResults", query: "LookupZip" } },
+          ],
+        },
+        { reset: "ZipInput" },
+      ]),
+    ).toBe(true);
+    // Appending a DIFFERENT query's (existing) response alongside a run is allowed.
+    expect(
+      accepts([
+        { run: "LookupZip" },
+        { appendToStore: { key: "zipResults", query: "Other" } },
+      ]),
+    ).toBe(true);
+  });
+
+  it("routes appendToStore's query through eventReferences (dangling guard) across lists and chains", () => {
+    expect(
+      eventReferences({
+        appendToStore: { key: "zipResults", query: "LookupZip" },
+      }),
+    ).toEqual([{ kind: "query", name: "LookupZip" }]);
+    // clearStoreKey references nothing.
+    expect(eventReferences({ clearStoreKey: { key: "zipResults" } })).toEqual(
+      [],
+    );
+    expect(
+      eventReferences([
+        { clearStoreKey: { key: "zipResults" } },
+        { reset: "ZipInput" },
+        {
+          run: "LookupZip",
+          onSuccess: [{ appendToStore: { key: "zipResults", query: "Other" } }],
+        },
+      ]),
+    ).toEqual([
+      { kind: "widget", name: "ZipInput" },
+      { kind: "query", name: "LookupZip" },
+      { kind: "query", name: "Other" },
+    ]);
+  });
+
+  it("reports deduped statement verb kinds for telemetry", () => {
+    expect(
+      eventActionKinds({
+        run: "LookupZip",
+        onSuccess: [
+          { appendToStore: { key: "zipResults", query: "LookupZip" } },
+        ],
+      }),
+    ).toEqual(["run", "appendToStore"]);
+    expect(
+      eventActionKinds([
+        { clearStoreKey: { key: "zipResults" } },
+        { reset: "ZipInput" },
+        { reset: "Other" },
+      ]),
+    ).toEqual(["clearStoreKey", "reset"]);
+    expect(eventActionKinds({ showAlert: "Done" })).toEqual(["showAlert"]);
+  });
+
+  it("applyEvent writes a statement-list binding and registers the trigger path", () => {
+    const dsl = page([widget({ widgetId: "Clear", widgetName: "Clear" })]);
+    const { binding, dsl: next } = applyEvent(dsl, {
+      widget: "Clear",
+      event: "onClick",
+      action: [{ clearStoreKey: { key: "zipResults" } }, { reset: "ZipInput" }],
+    });
+
+    expect(binding).toBe(
+      "{{ storeValue('zipResults', [], false); resetWidget('ZipInput', true) }}",
+    );
+    expect((next.children as WidgetNode[])[0].dynamicTriggerPathList).toEqual([
+      { key: "onClick" },
+    ]);
+  });
+});
+
+describe("eventReferences / widgetExists", () => {
+  it("returns the referenced entity for validation", () => {
+    expect(eventReferences({ run: "q" })).toEqual([
+      { kind: "query", name: "q" },
+    ]);
+    expect(eventReferences({ navigate: "Home" })).toEqual([
+      { kind: "page", name: "Home" },
+    ]);
+    expect(eventReferences({ showModal: "M" })).toEqual([
+      { kind: "widget", name: "M" },
+    ]);
+    // showAlert references nothing.
+    expect(eventReferences({ showAlert: "Done" })).toEqual([]);
+  });
+
+  it("collects every reference across a chain (primary + follow-ups)", () => {
+    expect(
+      eventReferences({
+        run: "insertUser",
+        onSuccess: [
+          { run: "getUsers" },
+          { closeModal: "AddUserModal" },
+          { showAlert: "Saved" },
+        ],
+        onError: [{ navigate: "Errors" }],
+      }),
+    ).toEqual([
+      { kind: "query", name: "insertUser" },
+      { kind: "query", name: "getUsers" },
+      { kind: "widget", name: "AddUserModal" },
+      { kind: "page", name: "Errors" },
+    ]);
+  });
+
+  it("finds nested widgets by name", () => {
+    const dsl = page([
+      {
+        ...widget({ widgetId: "C", widgetName: "C", type: "CANVAS_WIDGET" }),
+        children: [
+          widget({
+            widgetId: "M",
+            widgetName: "EditModal",
+            type: "MODAL_WIDGET",
+          }),
+        ],
+      },
+    ]);
+
+    expect(widgetExists(dsl, "EditModal")).toBe(true);
+    expect(widgetExists(dsl, "Nope")).toBe(false);
+  });
+});
+
+describe("APP-16381: change events, expression arguments and table column clicks", () => {
+  const parse = (spec: unknown) => wireEventSpecSchema.parse(spec);
+
+  it("wires radio and checkbox-group selection changes and multiselect option changes", () => {
+    for (const [type, event] of [
+      ["RADIO_GROUP_WIDGET", "onSelectionChange"],
+      ["CHECKBOX_GROUP_WIDGET", "onSelectionChange"],
+      ["MULTI_SELECT_WIDGET_V2", "onOptionChange"],
+    ] as const) {
+      const dsl = page([widget({ widgetId: "Ctl", type })]);
+      const { binding, dsl: next } = applyEvent(
+        dsl,
+        parse({ widget: "Ctl", event, action: { reset: "NewEnd" } }),
+      );
+
+      expect(binding).toBe("{{ resetWidget('NewEnd', true) }}");
+      expect(next.children?.[0][event]).toBe(binding);
+      expect(next.children?.[0].dynamicTriggerPathList).toEqual([
+        { key: event },
+      ]);
+    }
+
+    expect(() =>
+      applyEvent(
+        page([widget({ widgetId: "Ctl", type: "SELECT_WIDGET" })]),
+        parse({
+          widget: "Ctl",
+          event: "onSelectionChange",
+          action: { reset: "X" },
+        }),
+      ),
+    ).toThrow(/not supported on SELECT_WIDGET/);
+  });
+
+  it("passes an expression argument to a JS function, and reports what it reads", () => {
+    const spec = parse({
+      widget: "Btn",
+      event: "onClick",
+      action: {
+        call: {
+          object: "Licenses",
+          function: "extend",
+          args: [
+            {
+              expr: {
+                fn: "addYears",
+                args: [
+                  { table: "Tbl", column: "end date", row: "triggered" },
+                  1,
+                ],
+              },
+            },
+            { expr: { query: "GetLicense", field: "id" } },
+            { expr: { user: "email" } },
+          ],
+        },
+      },
+    });
+    const binding = compileEventBinding(spec.action);
+
+    expect(binding).toMatch(/^\{\{ Licenses\.extend\(/);
+    expect(binding).toContain('Tbl.triggeredRow["end date"]');
+    expect(binding).toContain("GetLicense.data?.id");
+    expect(binding).toContain("appsmith.user.email");
+    expect(eventReferences(spec.action)).toEqual([
+      { kind: "jsFunction", name: "Licenses", member: "extend" },
+      { kind: "widget", name: "Tbl", table: true },
+      { kind: "query", name: "GetLicense", readOnly: true },
+    ]);
+  });
+
+  it("encodes a single quote in a literal argument, and refuses one in an expression or a call or brace inside one", () => {
+    const binding = compileEventBinding(
+      parse({
+        widget: "Btn",
+        event: "onClick",
+        action: { call: { object: "O", function: "f", args: ["O'Brien"] } },
+      }).action,
+    );
+
+    // Valid JS for the same string, with no quote character in the stored text for the modal-graph scan to misread.
+    expect(binding).toBe('{{ O.f("O\\u0027Brien") }}');
+    expect(new Function("return " + binding.slice(7, -4))()).toBe("O'Brien");
+
+    for (const arg of [
+      { expr: { fn: "concat", args: ["it's", "x"] } },
+      { expr: { fn: "concat", args: ["{", "x"] } },
+      { expr: { call: "save" } },
+    ]) {
+      expect(
+        wireEventSpecSchema.safeParse({
+          widget: "Btn",
+          event: "onClick",
+          action: { call: { object: "O", function: "f", args: [arg] } },
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  function tableWith(columns: Record<string, unknown>): WidgetNode {
+    return page([
+      widget({
+        widgetId: "Tbl",
+        type: "TABLE_WIDGET_V2",
+        primaryColumns: columns,
+      }),
+    ]);
+  }
+
+  it("wires a button column's onClick and registers the nested trigger path", () => {
+    const dsl = tableWith({
+      extend: { id: "extend", columnType: "button" },
+      name: { id: "name", columnType: "text" },
+    });
+    const { binding, dsl: next } = applyEvent(
+      dsl,
+      parse({
+        widget: "Tbl",
+        column: "extend",
+        event: "onClick",
+        action: { showModal: "ExtendModal" },
+      }),
+    );
+    const table = next.children?.[0] as WidgetNode & {
+      primaryColumns: Record<string, Record<string, unknown>>;
+    };
+
+    expect(table.primaryColumns.extend.onClick).toBe(binding);
+    expect(table.onClick).toBeUndefined();
+    expect(table.dynamicTriggerPathList).toEqual([
+      { key: "primaryColumns.extend.onClick" },
+    ]);
+    // The caller's DSL is unchanged.
+    expect(
+      (dsl.children?.[0].primaryColumns as Record<string, object>).extend,
+    ).not.toHaveProperty("onClick");
+  });
+
+  it("refuses a column wiring on a non-button column, a missing column, another event or another widget", () => {
+    const dsl = tableWith({ name: { columnType: "text" } });
+    const wire = (over: Record<string, unknown>, target = dsl) =>
+      applyEvent(
+        target,
+        parse({
+          widget: "Tbl",
+          column: "name",
+          event: "onClick",
+          action: { showModal: "M" },
+          ...over,
+        }),
+      );
+
+    expect(() => wire({})).toThrow(/only button and iconButton columns/);
+    expect(() => wire({ column: "missing" })).toThrow(
+      /column "missing" was not found/,
+    );
+    expect(() => wire({ event: "onRowSelected" })).toThrow(
+      /wired with event "onClick"/,
+    );
+    expect(() =>
+      wire({}, page([widget({ widgetId: "Tbl", type: "BUTTON_WIDGET" })])),
+    ).toThrow(/can only be wired on a TABLE_WIDGET_V2/);
+    expect(
+      wireEventSpecSchema.safeParse({
+        widget: "Tbl",
+        column: "__proto__",
+        event: "onClick",
+        action: { showModal: "M" },
+      }).success,
+    ).toBe(false);
+  });
+});
+
+it("wires a button column whose sanitized numeric key grows to 65 characters", () => {
+  const key = "1".repeat(64);
+  const id = `_${key}`;
+  const dsl = applyWidgetPatch(
+    page([
+      widget({
+        widgetId: "t",
+        widgetName: "Licenses",
+        type: "TABLE_WIDGET_V2",
+      }),
+    ]),
+    {
+      operations: [
+        {
+          kind: "addColumn",
+          name: "Licenses",
+          column: { key, type: "button", buttonLabel: "Save" },
+        },
+      ],
+    },
+  ).dsl;
+  const wired = applyEvent(
+    dsl,
+    wireEventSpecSchema.parse({
+      widget: "Licenses",
+      column: id,
+      event: "onClick",
+      action: { showAlert: "Saved" },
+    }),
+  );
+
+  expect(
+    (
+      wired.dsl.children![0].primaryColumns as Record<
+        string,
+        { onClick: string }
+      >
+    )[id].onClick,
+  ).toContain("showAlert");
+});

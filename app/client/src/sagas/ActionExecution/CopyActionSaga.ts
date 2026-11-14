@@ -1,20 +1,35 @@
 import copy from "copy-to-clipboard";
 import AppsmithConsole from "utils/AppsmithConsole";
-import { CopyToClipboardDescription } from "entities/DataTree/actionTriggers";
-import { TriggerMeta } from "sagas/ActionExecution/ActionExecutionSagas";
-import { TriggerFailureError } from "sagas/ActionExecution/errorUtils";
+import { ActionValidationError } from "sagas/ActionExecution/errorUtils";
+import { getType, Types } from "utils/TypeHelpers";
+import type { TCopyToClipboardDescription } from "workers/Evaluation/fns/copyToClipboard";
+import type { SourceEntity } from "entities/AppsmithConsole";
 
 export default function copySaga(
-  payload: CopyToClipboardDescription["payload"],
-  triggerMeta: TriggerMeta,
+  action: TCopyToClipboardDescription,
+  source?: SourceEntity,
 ) {
+  const { payload } = action;
+
   if (typeof payload.data !== "string") {
-    throw new TriggerFailureError("Value to copy is not a string", triggerMeta);
+    throw new ActionValidationError(
+      "COPY_TO_CLIPBOARD",
+      "data",
+      Types.STRING,
+      getType(payload.data),
+    );
   }
+
   const result = copy(payload.data, payload.options);
+
   if (result) {
     AppsmithConsole.info({
-      text: `copyToClipboard('${payload.data}') was triggered`,
+      source,
+      text: `copyToClipboard triggered`,
+      state: {
+        data: payload.data,
+        options: payload.options,
+      },
     });
   }
 }

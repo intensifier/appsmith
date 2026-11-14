@@ -1,20 +1,24 @@
+import type { PropsWithChildren } from "react";
 import React from "react";
-import { ComponentProps } from "widgets/BaseComponent";
+import styled, { createGlobalStyle } from "styled-components";
+import type { ComponentProps } from "widgets/BaseComponent";
+import type { Alignment } from "@blueprintjs/core";
 import { MenuItem, Button, ControlGroup, Classes } from "@blueprintjs/core";
-import { DropdownOption } from "../constants";
-import { Select, IItemRendererProps } from "@blueprintjs/select";
+import type { DropdownOption } from "../constants";
+import type { IItemRendererProps } from "@blueprintjs/select";
+import { Select } from "@blueprintjs/select";
 import _ from "lodash";
-import "../../../../node_modules/@blueprintjs/select/lib/css/blueprint-select.css";
-import styled, {
-  createGlobalStyle,
-  BlueprintCSSTransform,
-} from "constants/DefaultTheme";
+import "@blueprintjs/select/lib/css/blueprint-select.css";
+import { BlueprintCSSTransform } from "constants/DefaultTheme";
 import { Colors } from "constants/Colors";
-import { TextSize } from "constants/WidgetConstants";
-import { StyledLabel, TextLabelWrapper } from "./index.styled";
+import type { TextSize } from "constants/WidgetConstants";
 import Fuse from "fuse.js";
 import { WidgetContainerDiff } from "widgets/WidgetUtils";
-import Icon from "components/ads/Icon";
+import type { LabelPosition } from "components/constants";
+import { Icon } from "@design-system/widgets-old";
+import LabelWithTooltip, {
+  labelLayoutStyles,
+} from "widgets/components/LabelWithTooltip";
 
 const FUSE_OPTIONS = {
   shouldSort: true,
@@ -25,11 +29,14 @@ const FUSE_OPTIONS = {
   keys: ["label", "value"],
 };
 
-const SingleDropDown = Select.ofType<DropdownOption>();
-const StyledSingleDropDown = styled(SingleDropDown)<{
+type StyledSingleDropDownProps = PropsWithChildren<{
   isSelected: boolean;
   isValid: boolean;
-}>`
+  hasError?: boolean;
+}>;
+
+const SingleDropDown = Select.ofType<DropdownOption>();
+const StyledSingleDropDown = styled(SingleDropDown)<StyledSingleDropDownProps>`
   div {
     flex: 1 1 auto;
   }
@@ -52,7 +59,7 @@ const StyledSingleDropDown = styled(SingleDropDown)<{
     min-height: 36px;
     padding-left: 12px;
     border: 1.2px solid
-      ${(props) => (props.isValid ? Colors.GREY_3 : Colors.DANGER_SOLID)};
+      ${(props) => (props.hasError ? Colors.DANGER_SOLID : Colors.GREY_3)};
     ${(props) =>
       props.isValid
         ? `
@@ -70,7 +77,7 @@ const StyledSingleDropDown = styled(SingleDropDown)<{
   &&&&& .${Classes.POPOVER_OPEN} .${Classes.BUTTON} {
     outline: 0;
     ${(props) =>
-      props.isValid
+      !props.hasError
         ? `
         border: 1.2px solid ${Colors.GREEN_SOLID};
         box-shadow: 0px 0px 0px 2px ${Colors.GREEN_SOLID_HOVER};
@@ -101,7 +108,10 @@ const StyledSingleDropDown = styled(SingleDropDown)<{
   }
 `;
 
-const StyledControlGroup = styled(ControlGroup)`
+const StyledControlGroup = styled(ControlGroup)<{
+  compactMode: boolean;
+  labelPosition?: LabelPosition;
+}>`
   &&& > {
     span {
       height: 100%;
@@ -138,13 +148,14 @@ ${({ dropDownWidth, id, parentWidth }) => `
   }
 `}
   .select-popover-wrapper {
-    width: auto;    
+    width: auto;
     box-shadow: 0 6px 20px 0px rgba(0, 0, 0, 0.15) !important;
     border-radius: 0;
     background: white;
 
     & .${Classes.INPUT_GROUP} {
       padding: 12px 12px 8px 12px;
+      min-width: 180px;
 
       & > .${Classes.ICON} {
         &:first-child {
@@ -213,16 +224,12 @@ ${({ dropDownWidth, id, parentWidth }) => `
   }
 `;
 
-const DropdownContainer = styled.div<{ compactMode: boolean }>`
+const DropdownContainer = styled.div<{
+  compactMode: boolean;
+  labelPosition?: LabelPosition;
+}>`
   ${BlueprintCSSTransform}
-  display: flex;
-  flex-direction: ${(props) => (props.compactMode ? "row" : "column")};
-  align-items: ${(props) => (props.compactMode ? "center" : "left")};
-
-  label.select-label {
-    margin-bottom: ${(props) => (props.compactMode ? "0px" : "5px")};
-    margin-right: ${(props) => (props.compactMode ? "10px" : "0px")};
-  }
+  ${labelLayoutStyles}
 `;
 const DEBOUNCE_TIMEOUT = 800;
 
@@ -233,10 +240,11 @@ class DropDownComponent extends React.Component<
   DropDownComponentProps,
   DropDownComponentState
 > {
-  state = {
+  state: DropDownComponentState = {
     // used to show focused item for keyboard up down key interection
     activeItemIndex: -1,
   };
+
   componentDidMount = () => {
     // set default selectedIndex as focused index
     this.setState({ activeItemIndex: this.props.selectedIndex });
@@ -255,22 +263,27 @@ class DropDownComponent extends React.Component<
       "label",
       activeItem?.label,
     ]);
+
     this.setState({ activeItemIndex });
   };
+
   render() {
     const id = _.uniqueId();
     const {
       compactMode,
       disabled,
       isLoading,
+      labelAlignment,
+      labelPosition,
       labelStyle,
       labelText,
       labelTextColor,
       labelTextSize,
+      labelWidth,
     } = this.props;
     // active focused item
     const activeItem = !_.isEmpty(this.props.options)
-      ? this.props.options[this.state.activeItemIndex]
+      ? this.props.options[this.state.activeItemIndex || -1]
       : undefined;
     // get selected option label from selectedIndex
     const selectedOption =
@@ -283,36 +296,44 @@ class DropDownComponent extends React.Component<
     const value = selectedOption
       ? selectedOption
       : this.props.placeholder || "-- Select --";
+
     return (
-      <DropdownContainer compactMode={compactMode}>
+      <DropdownContainer
+        compactMode={compactMode}
+        data-testid="select-container"
+        labelPosition={labelPosition}
+      >
         <DropdownStyles
           dropDownWidth={this.props.dropDownWidth}
           id={id}
           parentWidth={this.props.width - WidgetContainerDiff}
         />
         {labelText && (
-          <TextLabelWrapper compactMode={compactMode}>
-            <StyledLabel
-              $compactMode={compactMode}
-              $disabled={!!disabled}
-              $labelStyle={labelStyle}
-              $labelText={labelText}
-              $labelTextColor={labelTextColor}
-              $labelTextSize={labelTextSize}
-              className={`select-label ${
-                isLoading ? Classes.SKELETON : Classes.TEXT_OVERFLOW_ELLIPSIS
-              }`}
-            >
-              {labelText}
-            </StyledLabel>
-          </TextLabelWrapper>
+          <LabelWithTooltip
+            alignment={labelAlignment}
+            className={`select-label`}
+            color={labelTextColor}
+            compact={compactMode}
+            disabled={disabled}
+            fontSize={labelTextSize}
+            fontStyle={labelStyle}
+            loading={isLoading}
+            position={labelPosition}
+            text={labelText}
+            width={labelWidth}
+          />
         )}
-        <StyledControlGroup fill>
+        <StyledControlGroup
+          compactMode={compactMode}
+          fill
+          labelPosition={labelPosition}
+        >
           <StyledSingleDropDown
             activeItem={activeItem}
             className={isLoading ? Classes.SKELETON : ""}
             disabled={disabled}
             filterable={this.props.isFilterable}
+            hasError={this.props.hasError}
             isSelected={
               !_.isEmpty(this.props.options) &&
               this.props.selectedIndex !== undefined &&
@@ -365,6 +386,7 @@ class DropDownComponent extends React.Component<
 
   itemListPredicate(query: string, items: DropdownOption[]) {
     const fuse = new Fuse(items, FUSE_OPTIONS);
+
     return query ? fuse.search(query) : items;
   }
 
@@ -376,6 +398,7 @@ class DropDownComponent extends React.Component<
     const optionIndex = _.findIndex(this.props.options, (option) => {
       return option.value === selectedOption.value;
     });
+
     return optionIndex === this.props.selectedIndex;
   };
   serverSideSearch = _.debounce((filterValue: string) => {
@@ -389,9 +412,11 @@ class DropDownComponent extends React.Component<
     if (!itemProps.modifiers.matchesPredicate) {
       return null;
     }
+
     const isSelected: boolean = this.isOptionSelected(option);
     // For tabbable menuItems
     const isFocused = itemProps.modifiers.active;
+
     return (
       <MenuItem
         active={isSelected}
@@ -409,10 +434,13 @@ export interface DropDownComponentProps extends ComponentProps {
   disabled?: boolean;
   onOptionSelected: (optionSelected: DropdownOption) => void;
   placeholder?: string;
-  labelText?: string;
+  labelAlignment?: Alignment;
+  labelPosition?: LabelPosition;
+  labelText: string;
   labelTextColor?: string;
   labelTextSize?: TextSize;
   labelStyle?: string;
+  labelWidth?: number;
   compactMode: boolean;
   selectedIndex?: number;
   options: DropdownOption[];
@@ -423,7 +451,11 @@ export interface DropDownComponentProps extends ComponentProps {
   dropDownWidth: number;
   height: number;
   serverSideFiltering: boolean;
+  hasError?: boolean;
   onFilterChange: (text: string) => void;
+  borderRadius: string;
+  boxShadow?: string;
+  accentColor: string;
 }
 
 export default DropDownComponent;

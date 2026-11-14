@@ -1,131 +1,85 @@
-import React, { useCallback, useEffect, useState } from "react";
-import BaseControl, { ControlProps } from "./BaseControl";
-import {
-  StyledPropertyPaneButton,
-  StyledDragIcon,
-  StyledDeleteIcon,
-  StyledEditIcon,
-  StyledOptionControlInputGroup,
-} from "./StyledControls";
-import styled from "constants/DefaultTheme";
+import React from "react";
+import type { ControlProps } from "./BaseControl";
+import BaseControl from "./BaseControl";
 import { generateReactKey } from "utils/generators";
-import { DroppableComponent } from "components/ads/DraggableListComponent";
-import { getNextEntityName } from "utils/AppsmithUtils";
-import _, { debounce } from "lodash";
-import { Category, Size } from "components/ads/Button";
-import { Colors } from "constants/Colors";
+import orderBy from "lodash/orderBy";
+import isString from "lodash/isString";
+import isUndefined from "lodash/isUndefined";
+import { Button, Flex } from "@appsmith/ads";
+import { ButtonPlacementTypes } from "components/constants";
+import { DraggableListControl } from "pages/Editor/PropertyPane/DraggableListControl";
+import { DraggableListCard } from "components/propertyControls/DraggableListCard";
+import {
+  createMessage,
+  BUTTON_WIDGET_DEFAULT_LABEL,
+} from "ee/constants/messages";
 
-const StyledPropertyPaneButtonWrapper = styled.div`
-  display: flex;
-  width: 100%;
-  justify-content: center;
-  margin-top: 10px;
-`;
-
-const ButtonWrapper = styled.div`
-  display: flex;
-  justify-content: flex-start;
-  align-items: center;
-`;
-
-const ButtonListWrapper = styled.div`
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-`;
-
-const AddNewButton = styled(StyledPropertyPaneButton)`
-  justify-content: center;
-  flex-grow: 1;
-`;
-
-type RenderComponentProps = {
-  index: number;
-  item: {
-    label: string;
-    isVisible?: boolean;
-  };
-  deleteOption: (index: number) => void;
-  updateOption: (index: number, value: string) => void;
-  toggleVisibility?: (index: number) => void;
-  onEdit?: (props: any) => void;
-};
-
-function GroupButtonComponent(props: RenderComponentProps) {
-  const { deleteOption, index, item, updateOption } = props;
-
-  const [value, setValue] = useState(item.label);
-  const [isEditing, setEditing] = useState(false);
-
-  useEffect(() => {
-    if (!isEditing && item && item.label) setValue(item.label);
-  }, [item?.label, isEditing]);
-
-  const debouncedUpdate = debounce(updateOption, 1000);
-  const onChange = useCallback(
-    (index: number, value: string) => {
-      setValue(value);
-      debouncedUpdate(index, value);
-    },
-    [updateOption],
-  );
-  const handleChange = useCallback(() => props.onEdit && props.onEdit(index), [
-    index,
-  ]);
-
-  const onFocus = () => setEditing(true);
-  const onBlur = () => setEditing(false);
-
-  return (
-    <ButtonWrapper>
-      <StyledDragIcon height={20} width={20} />
-      <StyledOptionControlInputGroup
-        dataType="text"
-        onBlur={onBlur}
-        onChange={(value: string) => {
-          onChange(index, value);
-        }}
-        onFocus={onFocus}
-        placeholder="Button label"
-        value={value}
-      />
-      <StyledDeleteIcon
-        className="t--delete-tab-btn"
-        height={20}
-        marginRight={12}
-        onClick={() => {
-          deleteOption(index);
-        }}
-        width={20}
-      />
-      <StyledEditIcon
-        className="t--edit-column-btn"
-        height={20}
-        onClick={handleChange}
-        width={20}
-      />
-    </ButtonWrapper>
-  );
+interface State {
+  focusedIndex: number | null;
 }
 
-class ButtonListControl extends BaseControl<ControlProps> {
+interface MenuItem {
+  id: string;
+  label: string;
+  isDisabled: boolean;
+  isVisible: boolean;
+  widgetId: string;
+  itemType: "SEPARATOR" | "BUTTON";
+}
+
+class ButtonListControl extends BaseControl<
+  ControlProps & { allowSeparators?: boolean; allowSpatialGrouping?: boolean },
+  State
+> {
+  constructor(props: ControlProps) {
+    super(props);
+
+    this.state = {
+      focusedIndex: null,
+    };
+  }
+
+  componentDidUpdate(prevProps: ControlProps): void {
+    //on adding a new column last column should get focused
+    if (
+      Object.keys(prevProps.propertyValue).length + 1 ===
+      Object.keys(this.props.propertyValue).length
+    ) {
+      this.updateFocus(Object.keys(this.props.propertyValue).length - 1, true);
+    }
+  }
+
+  getMenuItems = () => {
+    const menuItems: MenuItem[] =
+      isString(this.props.propertyValue) ||
+      isUndefined(this.props.propertyValue)
+        ? []
+        : Object.values(this.props.propertyValue);
+
+    return orderBy(menuItems, ["index"], ["asc"]);
+  };
+
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   updateItems = (items: Array<Record<string, any>>) => {
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const menuItems = items.reduce((obj: any, each: any, index: number) => {
       obj[each.id] = {
         ...each,
         index,
       };
+
       return obj;
     }, {});
+
     this.updateProperty(this.props.propertyName, menuItems);
   };
 
   onEdit = (index: number) => {
-    const menuItems: Array<{
-      id: string;
-      label: string;
-    }> = Object.values(this.props.propertyValue);
+    const menuItems = this.getMenuItems();
     const targetMenuItem = menuItems[index];
+
     this.props.openNextPanel({
       index,
       ...targetMenuItem,
@@ -134,47 +88,62 @@ class ButtonListControl extends BaseControl<ControlProps> {
   };
 
   render() {
-    const menuItems: Array<{
-      id: string;
-      label: string;
-    }> = _.isString(this.props.propertyValue)
-      ? []
-      : Object.values(this.props.propertyValue);
+    const hasSeparator = this.getMenuItems().some(
+      (item: MenuItem) => item.itemType === "SEPARATOR",
+    );
+
     return (
-      <ButtonListWrapper>
-        <DroppableComponent
+      <div className="flex flex-col gap-1">
+        <DraggableListControl
           deleteOption={this.deleteOption}
+          fixedHeight={370}
+          focusedIndex={this.state.focusedIndex}
           itemHeight={45}
-          items={menuItems}
+          items={this.getMenuItems()}
           onEdit={this.onEdit}
-          renderComponent={GroupButtonComponent}
+          propertyPath={this.props.dataTreePath}
+          // TODO: Fix this the next time the file is edited
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          renderComponent={(props: any) =>
+            DraggableListCard({
+              ...props,
+              isDelete: true,
+              placeholder: "Button label",
+            })
+          }
           toggleVisibility={this.toggleVisibility}
+          updateFocus={this.updateFocus}
           updateItems={this.updateItems}
           updateOption={this.updateOption}
         />
-        <StyledPropertyPaneButtonWrapper>
-          <AddNewButton
-            category={Category.tertiary}
-            icon="plus"
-            onClick={this.addOption}
-            size={Size.medium}
-            tag="button"
-            text="Add new Button"
-            type="button"
-          />
-        </StyledPropertyPaneButtonWrapper>
-      </ButtonListWrapper>
+
+        <Flex gap="spaces-3" justifyContent="end">
+          {(this.props.allowSeparators ||
+            (this.props.allowSpatialGrouping && !hasSeparator)) && (
+            <Button
+              className="self-end"
+              kind="tertiary"
+              onClick={() => this.addOption({ isSeparator: true })}
+              size="sm"
+            >
+              Add separator
+            </Button>
+          )}
+          <Button
+            className="self-end"
+            kind="secondary"
+            onClick={() => this.addOption({ isSeparator: false })}
+            size="sm"
+          >
+            Add button
+          </Button>
+        </Flex>
+      </div>
     );
   }
 
   toggleVisibility = (index: number) => {
-    const menuItems: Array<{
-      id: string;
-      label: string;
-      isDisabled: boolean;
-      isVisible: boolean;
-      widgetId: string;
-    }> = this.props.propertyValue.slice();
+    const menuItems = this.getMenuItems();
     const isVisible = menuItems[index].isVisible === true ? false : true;
     const updatedMenuItems = menuItems.map((item, itemIndex) => {
       if (index === itemIndex) {
@@ -183,64 +152,153 @@ class ButtonListControl extends BaseControl<ControlProps> {
           isVisible: isVisible,
         };
       }
+
       return item;
     });
+
     this.updateProperty(this.props.propertyName, updatedMenuItems);
   };
 
   deleteOption = (index: number) => {
-    const menuItemsArray: any = Object.values(this.props.propertyValue);
-    const itemId = menuItemsArray[index].id;
-    if (menuItemsArray && menuItemsArray.length === 1) return;
+    const menuItemsArray = this.getMenuItems();
+
+    if (menuItemsArray.length === 1) return;
+
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const updatedArray = menuItemsArray.filter((eachItem: any, i: number) => {
       return i !== index;
     });
     const updatedObj = updatedArray.reduce(
+      // TODO: Fix this the next time the file is edited
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (obj: any, each: any, index: number) => {
         obj[each.id] = {
           ...each,
           index,
         };
+
         return obj;
       },
       {},
     );
-    this.deleteProperties([`${this.props.propertyName}.${itemId}.isVisible`]);
+
     this.updateProperty(this.props.propertyName, updatedObj);
   };
 
   updateOption = (index: number, updatedLabel: string) => {
-    const menuItemsArray: any = Object.values(this.props.propertyValue);
+    const menuItemsArray = this.getMenuItems();
     const itemId = menuItemsArray[index].id;
+
     this.updateProperty(
       `${this.props.propertyName}.${itemId}.label`,
       updatedLabel,
     );
   };
 
-  addOption = () => {
+  addOption = ({ isSeparator }: { isSeparator?: boolean }) => {
     let groupButtons = this.props.propertyValue;
-    const groupButtonsArray = Object.values(groupButtons);
+    const groupButtonsArray = this.getMenuItems();
     const newGroupButtonId = generateReactKey({ prefix: "groupButton" });
-    const newGroupButtonLabel = getNextEntityName(
-      "Group Button ",
-      groupButtonsArray.map((groupButton: any) => groupButton.label),
-    );
+
     groupButtons = {
       ...groupButtons,
       [newGroupButtonId]: {
         id: newGroupButtonId,
-        label: newGroupButtonLabel,
-        menuItems: {},
-        buttonType: "SIMPLE",
-        buttonColor: Colors.GREEN,
+        index: groupButtonsArray.length,
+        label: isSeparator
+          ? "Separator"
+          : createMessage(BUTTON_WIDGET_DEFAULT_LABEL),
         widgetId: generateReactKey(),
         isDisabled: false,
+        itemType: isSeparator ? "SEPARATOR" : "BUTTON",
+        isSeparator,
         isVisible: true,
+        variant: "filled",
       },
     };
 
+    if (this.props.widgetProperties.type === "BUTTON_GROUP_WIDGET") {
+      /**c
+       * These properties are required for "BUTTON_GROUP_WIDGET" but not for
+       * "WDS_TOOLBAR_BUTTONS_GROUP_WIDGET"
+       */
+      const optionalButtonGroupItemProperties = {
+        menuItems: {},
+        buttonType: "SIMPLE",
+        placement: ButtonPlacementTypes.CENTER,
+        buttonColor:
+          this.props.widgetProperties.childStylesheet.button.buttonColor,
+      };
+
+      groupButtons[newGroupButtonId] = {
+        ...groupButtons[newGroupButtonId],
+        ...optionalButtonGroupItemProperties,
+      };
+    }
+
+    if (this.props.widgetProperties.type === "CARD_WIDGET") {
+      /**
+       * Card footer actions declare `buttonVariant`/`buttonColor` (see
+       * CardFooterAction) and have no separator support, so strip the
+       * base extras (`itemType`, `isSeparator`, `variant`) to keep the
+       * persisted DSL aligned with the declared interface. This control
+       * only reads `itemType` for separator handling, which the Card
+       * panel does not enable. New actions pick up the themed button
+       * color from the widget's childStylesheet (same idea as the
+       * BUTTON_GROUP_WIDGET branch above).
+       */
+      const cardFooterAction = { ...groupButtons[newGroupButtonId] };
+
+      delete cardFooterAction.itemType;
+      delete cardFooterAction.isSeparator;
+      delete cardFooterAction.variant;
+
+      groupButtons[newGroupButtonId] = {
+        ...cardFooterAction,
+        buttonVariant: "SECONDARY",
+        buttonColor:
+          this.props.widgetProperties.childStylesheet?.footerAction
+            ?.buttonColor,
+      };
+    }
+
+    if (this.props.widgetProperties.type === "WDS_INLINE_BUTTONS_WIDGET") {
+      // if buttonVariant and buttonColor values ar present in session storage, then we should use those values
+      const buttonVariantSessionValue = sessionStorage.getItem(
+        "WDS_INLINE_BUTTONS_WIDGET.buttonVariant",
+      );
+      const buttonColorSessionValue = sessionStorage.getItem(
+        "WDS_INLINE_BUTTONS_WIDGET.buttonColor",
+      );
+
+      groupButtons[newGroupButtonId] = {
+        ...groupButtons[newGroupButtonId],
+        buttonVariant: buttonVariantSessionValue || "filled",
+        buttonColor: buttonColorSessionValue || "accent",
+      };
+
+      // if the widget is a WDS_INLINE_BUTTONS_WIDGET, and button already have filled button variant in groupButtons,
+      // then we should add a secondary button ( outlined button ) instead of simple button
+      const filledButtonVariant = groupButtonsArray.find(
+        // TODO: Fix this the next time the file is edited
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (groupButton: any) => groupButton.buttonVariant === "filled",
+      );
+
+      if (filledButtonVariant) {
+        groupButtons[newGroupButtonId] = {
+          ...groupButtons[newGroupButtonId],
+          buttonVariant: buttonVariantSessionValue || "outlined",
+        };
+      }
+    }
+
     this.updateProperty(this.props.propertyName, groupButtons);
+  };
+
+  updateFocus = (index: number, isFocused: boolean) => {
+    this.setState({ focusedIndex: isFocused ? index : null });
   };
 
   static getControlType() {

@@ -1,33 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
-
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
+        xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
 
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.appsmith</groupId>
+        <artifactId>appsmith-plugins</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
     <groupId>com.external.plugins</groupId>
     <artifactId>amazons3Plugin</artifactId>
     <version>1.0-SNAPSHOT</version>
 
     <name>amazons3Plugin</name>
 
-    <properties>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <java.version>11</java.version>
-        <maven.compiler.source>${java.version}</maven.compiler.source>
-        <maven.compiler.target>${java.version}</maven.compiler.target>
-        <plugin.id>amazons3-plugin</plugin.id>
-        <plugin.class>com.external.plugins.AmazonS3Plugin</plugin.class>
-        <plugin.version>1.0-SNAPSHOT</plugin.version>
-        <plugin.provider>tech@appsmith.com</plugin.provider>
-        <plugin.dependencies/>
-    </properties>
-
     <dependencyManagement>
         <dependencies>
             <dependency>
-                <groupId>com.amazonaws</groupId>
-                <artifactId>aws-java-sdk-bom</artifactId>
-                <version>1.11.327</version>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>2.55.9</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -35,86 +27,114 @@
     </dependencyManagement>
 
     <dependencies>
-
+        <!-- The plugin builds its S3 client with an explicit ApacheHttpClient (apache-client, next), so the
+             SDK's default HTTP client runtimes (apache5-client, netty-nio-client) are excluded.
+             slf4j-api is provided by the server. -->
         <dependency>
-            <groupId>org.pf4j</groupId>
-            <artifactId>pf4j-spring</artifactId>
-            <version>0.7.0</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>com.appsmith</groupId>
-            <artifactId>interfaces</artifactId>
-            <version>1.0-SNAPSHOT</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.projectlombok</groupId>
-            <artifactId>lombok</artifactId>
-            <version>1.18.8</version>
-            <scope>provided</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>com.amazonaws</groupId>
-            <artifactId>aws-java-sdk-s3</artifactId>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
             <exclusions>
                 <exclusion>
-                    <groupId>com.fasterxml.jackson.core</groupId>
-                    <artifactId>*</artifactId>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>apache5-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>netty-nio-client</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>apache-client</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
                 </exclusion>
             </exclusions>
         </dependency>
 
         <!-- Test Dependencies -->
-        <dependency>
-            <groupId>junit</groupId>
-            <artifactId>junit</artifactId>
-            <version>4.13.1</version>
-            <scope>test</scope>
-        </dependency>
 
-        <dependency>
-            <groupId>io.projectreactor</groupId>
-            <artifactId>reactor-test</artifactId>
-            <version>3.2.11.RELEASE</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.mockito</groupId>
-            <artifactId>mockito-core</artifactId>
-            <version>3.1.0</version>
-            <scope>test</scope>
-        </dependency>
     </dependencies>
 
     <build>
         <plugins>
             <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.2.4</version>
-                <configuration>
-                    <minimizeJar>false</minimizeJar>
-                    <transformers>
-                    <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                        <manifestEntries>
-                            <Plugin-Id>${plugin.id}</Plugin-Id>
-                            <Plugin-Class>${plugin.class}</Plugin-Class>
-                            <Plugin-Version>${plugin.version}</Plugin-Version>
-                            <Plugin-Provider>${plugin.provider}</Plugin-Provider>
-                        </manifestEntries>
-                    </transformer>
-                    </transformers>
-                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>build-helper-maven-plugin</artifactId>
                 <executions>
+                    <!-- A port for HTTP_PROXY to point at in the http-proxy-environment test execution. The test
+                         opens no listener on it, so a request sent to that proxy never reaches the S3 server. -->
                     <execution>
-                        <phase>package</phase>
+                        <id>reserve-http-proxy-environment-port</id>
                         <goals>
-                            <goal>shade</goal>
+                            <goal>reserve-network-port</goal>
                         </goals>
+                        <phase>process-test-classes</phase>
+                        <configuration>
+                            <portNames>
+                                <portName>s3.httpProxyEnvironment.port</portName>
+                            </portNames>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <executions>
+                    <!-- A JVM without proxy environment variables, so the tests' requests to local servers are not sent
+                         to a proxy the machine is configured with. -->
+                    <execution>
+                        <id>default-test</id>
+                        <configuration>
+                            <excludes>
+                                <exclude>**/*$*</exclude>
+                                <exclude>**/AmazonS3PluginHttpProxyEnvironmentTest.java</exclude>
+                            </excludes>
+                            <excludedEnvironmentVariables>
+                                <excludedEnvironmentVariable>HTTPS_PROXY</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>https_proxy</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>HTTP_PROXY</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>http_proxy</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>NO_PROXY</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>no_proxy</excludedEnvironmentVariable>
+                            </excludedEnvironmentVariables>
+                        </configuration>
+                    </execution>
+                    <!-- A JVM whose environment has HTTP_PROXY and no https proxy settings. The test pinned here
+                         overrides -Dtest, so this execution runs only that test. -->
+                    <execution>
+                        <id>http-proxy-environment</id>
+                        <goals>
+                            <goal>test</goal>
+                        </goals>
+                        <phase>test</phase>
+                        <configuration>
+                            <test>AmazonS3PluginHttpProxyEnvironmentTest</test>
+                            <environmentVariables>
+                                <HTTP_PROXY>http://127.0.0.1:${s3.httpProxyEnvironment.port}</HTTP_PROXY>
+                            </environmentVariables>
+                            <excludedEnvironmentVariables>
+                                <excludedEnvironmentVariable>HTTPS_PROXY</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>https_proxy</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>http_proxy</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>NO_PROXY</excludedEnvironmentVariable>
+                                <excludedEnvironmentVariable>no_proxy</excludedEnvironmentVariable>
+                            </excludedEnvironmentVariables>
+                            <systemPropertyVariables>
+                                <s3.httpProxyEnvironment.port>${s3.httpProxyEnvironment.port}</s3.httpProxyEnvironment.port>
+                            </systemPropertyVariables>
+                        </configuration>
                     </execution>
                 </executions>
             </plugin>
@@ -123,10 +143,10 @@
                 <executions>
                     <execution>
                         <id>copy-dependencies</id>
-                        <phase>package</phase>
                         <goals>
                             <goal>copy-dependencies</goal>
                         </goals>
+                        <phase>package</phase>
                         <configuration>
                             <includeScope>runtime</includeScope>
                             <outputDirectory>${project.build.directory}/lib</outputDirectory>

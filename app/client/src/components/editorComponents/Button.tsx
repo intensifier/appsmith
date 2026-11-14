@@ -1,19 +1,20 @@
 import React from "react";
-import {
-  Intent,
-  BlueprintButtonIntentsCSS,
-  Skin,
-} from "constants/DefaultTheme";
+import type { Intent, Skin } from "constants/DefaultTheme";
+import { BlueprintButtonIntentsCSS } from "constants/DefaultTheme";
 import styled, { css } from "styled-components";
-import {
-  AnchorButton as BlueprintAnchorButton,
-  Button as BlueprintButton,
+import type {
   Intent as BlueprintIntent,
   IconName,
   MaybeElement,
   IButtonProps,
+  IAnchorButtonProps,
 } from "@blueprintjs/core";
-import { Direction, Directions } from "utils/helpers";
+import {
+  AnchorButton as BlueprintAnchorButton,
+  Button as BlueprintButton,
+} from "@blueprintjs/core";
+import type { Direction } from "utils/helpers";
+import { Directions } from "utils/helpers";
 import { omit } from "lodash";
 
 const outline = css`
@@ -29,8 +30,11 @@ const buttonStyles = css<Partial<ButtonProps>>`
     border-radius: 0;
     background: ${(props) =>
       props.filled || props.outline ? "inherit" : "transparent"};
-
+    border-radius: ${({ borderRadius }) => borderRadius};
+    box-shadow: ${({ boxShadow }) => `${boxShadow}`} !important;
     width: ${(props) => (props.fluid ? "100%" : "auto")};
+    height: 100%;
+    padding: 0 10px;
   }
   &&&&&& {
     &.bp3-button span {
@@ -46,21 +50,29 @@ const buttonStyles = css<Partial<ButtonProps>>`
         props.skin === undefined
           ? "center"
           : props.iconAlignment === Directions.RIGHT
-          ? "space-between"
-          : "flex-start"};
+            ? "space-between"
+            : "flex-start"};
     }
   }
   ${(props) => (props.outline ? outline : "")}
 `;
 const StyledButton = styled((props: IButtonProps & Partial<ButtonProps>) => (
   <BlueprintButton
-    {...omit(props, ["iconAlignment", "fluid", "filled", "outline"])}
+    {...omit(props, [
+      "borderRadius",
+      "boxShadow",
+      "boxShadowColor",
+      "iconAlignment",
+      "fluid",
+      "filled",
+      "outline",
+    ])}
   />
 ))`
   ${buttonStyles}
 `;
 const StyledAnchorButton = styled(
-  (props: IButtonProps & Partial<ButtonProps>) => (
+  (props: IAnchorButtonProps & Partial<ButtonProps>) => (
     <BlueprintAnchorButton
       {...omit(props, ["iconAlignment", "fluid", "filled", "outline"])}
     />
@@ -69,12 +81,12 @@ const StyledAnchorButton = styled(
   ${buttonStyles}
 `;
 
-export type ButtonProps = {
+export interface ButtonProps {
   outline?: boolean;
   filled?: boolean;
   intent?: Intent;
   text?: string;
-  onClick?: () => void;
+  onClick?: (e?: React.MouseEvent<HTMLElement>) => void;
   href?: string;
   icon?: string | MaybeElement;
   iconAlignment?: Direction;
@@ -86,7 +98,10 @@ export type ButtonProps = {
   fluid?: boolean;
   skin?: Skin;
   target?: string;
-};
+  borderRadius?: string;
+  boxShadow?: string;
+  boxShadowColor?: string;
+}
 
 export const Button = (props: ButtonProps) => {
   const icon: IconName | undefined =
@@ -116,6 +131,7 @@ export const Button = (props: ButtonProps) => {
     skin: props.skin,
     iconAlignment: props.iconAlignment ? props.iconAlignment : undefined,
   };
+
   if (props.href) {
     return (
       <StyledAnchorButton
@@ -129,6 +145,9 @@ export const Button = (props: ButtonProps) => {
   } else
     return (
       <StyledButton
+        borderRadius={props.borderRadius}
+        boxShadow={props.boxShadow}
+        boxShadowColor={props.boxShadowColor}
         icon={icon}
         rightIcon={rightIcon}
         {...baseProps}

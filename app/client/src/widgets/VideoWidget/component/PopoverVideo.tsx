@@ -5,13 +5,28 @@ import {
   PopoverPosition,
 } from "@blueprintjs/core";
 import { Colors } from "constants/Colors";
-import VideoComponent, { VideoComponentProps } from "./";
-import styled, { AnyStyledComponent } from "styled-components";
+import type { VideoComponentProps } from "./";
+import VideoComponent from "./";
+import styled from "styled-components";
 import { ControlIcons } from "icons/ControlIcons";
-const PlayIcon = styled(ControlIcons.PLAY_VIDEO as AnyStyledComponent)`
+
+/**
+ * Play control size for table video cells (PopoverVideo is only used from
+ * tables). 27px matches the Button / Icon Button / Menu Button in-cell size
+ * and fits the DEFAULT/TALL 28px content budget.
+ * @see https://github.com/appsmithorg/appsmith/issues/37014
+ */
+export const TABLE_VIDEO_PLAY_ICON_SIZE = 27;
+
+const PlayIcon = styled(ControlIcons.PLAY_VIDEO)`
   position: relative;
-  top: 10px;
   cursor: pointer;
+
+  img {
+    height: ${TABLE_VIDEO_PLAY_ICON_SIZE}px !important;
+    width: ${TABLE_VIDEO_PLAY_ICON_SIZE}px !important;
+  }
+
   &:hover {
     svg {
       path {
@@ -21,9 +36,9 @@ const PlayIcon = styled(ControlIcons.PLAY_VIDEO as AnyStyledComponent)`
   }
 `;
 
-const PlayerWrapper = styled.div`	import React, { Ref } from "react";
-  width: 600px;	
-  height: 400px;	
+const PlayerWrapper = styled.div`
+  width: 600px;
+  height: 400px;
 `;
 
 function PopoverVideo(props: VideoComponentProps) {
@@ -52,9 +67,14 @@ function PopoverVideo(props: VideoComponentProps) {
         position={PopoverPosition.AUTO}
         usePortal
       >
-        <PlayIcon />
+        <PlayIcon className="play-icon" />
         <PlayerWrapper>
-          <VideoComponent url={props.url} />
+          <VideoComponent
+            backgroundColor={props.backgroundColor}
+            borderRadius={props.borderRadius}
+            boxShadow={props.boxShadow}
+            url={props.url}
+          />
         </PlayerWrapper>
       </Popover>
     </div>

@@ -1,7 +1,13 @@
 import { Alignment } from "@blueprintjs/core";
-import { ColumnProperties } from "../component/Constants";
-import { TableWidgetProps } from "../constants";
+import type { ColumnProperties } from "../component/Constants";
+import type { TableWidgetProps } from "../constants";
+import { Colors } from "constants/Colors";
 import { get } from "lodash";
+import {
+  combineDynamicBindings,
+  getDynamicBindings,
+} from "utils/DynamicBindingUtils";
+import { IconNames } from "@blueprintjs/icons";
 
 export enum ColumnTypes {
   TEXT = "text",
@@ -18,14 +24,18 @@ export enum ColumnTypes {
 export function defaultSelectedRowValidation(
   value: unknown,
   props: TableWidgetProps,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   _: any,
 ) {
   if (props) {
     if (props.multiRowSelection) {
       if (_.isString(value)) {
         const trimmed = (value as string).trim();
+
         try {
           const parsedArray = JSON.parse(trimmed);
+
           if (Array.isArray(parsedArray)) {
             const sanitized = parsedArray.filter((entry) => {
               return (
@@ -33,6 +43,7 @@ export function defaultSelectedRowValidation(
                 parseInt(entry, 10) > -1
               );
             });
+
             return { isValid: true, parsed: sanitized };
           } else {
             throw Error("Not a stringified array");
@@ -41,6 +52,7 @@ export function defaultSelectedRowValidation(
           // If cannot be parsed as an array
           const arrayEntries = trimmed.split(",");
           const result: number[] = [];
+
           arrayEntries.forEach((entry: string) => {
             if (
               Number.isInteger(parseInt(entry, 10)) &&
@@ -49,20 +61,25 @@ export function defaultSelectedRowValidation(
               if (!_.isNil(entry)) result.push(parseInt(entry, 10));
             }
           });
+
           return { isValid: true, parsed: result };
         }
       }
+
       if (Array.isArray(value)) {
         const sanitized = value.filter((entry) => {
           return (
             Number.isInteger(parseInt(entry, 10)) && parseInt(entry, 10) > -1
           );
         });
+
         return { isValid: true, parsed: sanitized };
       }
+
       if (Number.isInteger(value) && (value as number) > -1) {
         return { isValid: true, parsed: [value] };
       }
+
       return {
         isValid: false,
         parsed: [],
@@ -71,6 +88,14 @@ export function defaultSelectedRowValidation(
     } else {
       try {
         const _value: string = value as string;
+
+        if (_value === "") {
+          return {
+            isValid: true,
+            parsed: undefined,
+          };
+        }
+
         if (Number.isInteger(parseInt(_value, 10)) && parseInt(_value, 10) > -1)
           return { isValid: true, parsed: parseInt(_value, 10) };
 
@@ -86,6 +111,7 @@ export function defaultSelectedRowValidation(
       }
     }
   }
+
   return {
     isValid: true,
     parsed: value,
@@ -95,6 +121,8 @@ export function defaultSelectedRowValidation(
 export function totalRecordsCountValidation(
   value: unknown,
   props: TableWidgetProps,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   _?: any,
 ) {
   if (_.isNil(value) || value === "") {
@@ -104,6 +132,7 @@ export function totalRecordsCountValidation(
       message: "",
     };
   }
+
   if (!Number.isFinite(value) && !_.isString(value)) {
     return {
       isValid: false,
@@ -111,6 +140,7 @@ export function totalRecordsCountValidation(
       message: "This value must be a number",
     };
   }
+
   if (_.isString(value) && !/^\d+\.?\d*$/.test(value as string)) {
     return {
       isValid: false,
@@ -118,6 +148,7 @@ export function totalRecordsCountValidation(
       message: "This value must be a number",
     };
   }
+
   return {
     isValid: true,
     parsed: Number(value),
@@ -128,6 +159,8 @@ export function totalRecordsCountValidation(
 export function uniqueColumnNameValidation(
   value: unknown,
   props: TableWidgetProps,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   _?: any,
 ) {
   const tableColumns = _.map(value, "label");
@@ -135,6 +168,7 @@ export function uniqueColumnNameValidation(
     (val: string, index: number, arr: string[]) => arr.indexOf(val) !== index,
   );
   const hasError = !!duplicates.length;
+
   if (value && hasError) {
     return {
       isValid: false,
@@ -142,6 +176,7 @@ export function uniqueColumnNameValidation(
       messages: ["Column names should be unique."],
     };
   }
+
   return {
     isValid: true,
     parsed: value,
@@ -153,15 +188,22 @@ export function uniqueColumnNameValidation(
 export const updateColumnStyles = (
   props: TableWidgetProps,
   propertyPath: string,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   propertyValue: any,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Array<{ propertyPath: string; propertyValue: any }> | undefined => {
-  const { primaryColumns, derivedColumns = {} } = props;
+  const { derivedColumns = {}, primaryColumns } = props;
   const propertiesToUpdate: Array<{
     propertyPath: string;
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     propertyValue: any;
   }> = [];
   const tokens = propertyPath.split("."); // horizontalAlignment/textStyle
   const currentStyleName = tokens[0];
+
   // TODO: Figure out how propertyPaths will work when a nested property control is updating another property
   if (primaryColumns && currentStyleName) {
     // The style being updated currently
@@ -180,6 +222,7 @@ export const updateColumnStyles = (
           propertyValue: propertyValue,
         });
       }
+
       // Is this a dynamic binding property?
       const notADynamicBinding =
         !props.dynamicBindingPathList ||
@@ -194,12 +237,51 @@ export const updateColumnStyles = (
         });
       }
     });
+
     if (propertiesToUpdate.length > 0) return propertiesToUpdate;
   }
+
   return;
 };
+
+// Select default Icon Name if column type is Icon button
+export function updateIconNameHook(
+  props: TableWidgetProps,
+  propertyPath: string,
+  propertyValue: string,
+) {
+  const property = getBasePropertyPath(propertyPath);
+  let propertiesToUpdate = [{ propertyPath, propertyValue }];
+  const updateDerivedColumnsHookArr = updateDerivedColumnsHook(
+    props,
+    propertyPath,
+    propertyValue,
+  );
+
+  if (updateDerivedColumnsHookArr) {
+    propertiesToUpdate = [
+      ...updateDerivedColumnsHookArr,
+      ...propertiesToUpdate,
+    ];
+  }
+
+  if (propertyValue === "iconButton") {
+    propertiesToUpdate.push({
+      propertyPath: `${property}.iconName`,
+      propertyValue: IconNames.ADD,
+    });
+  } else {
+    propertiesToUpdate.push({
+      propertyPath: `${property}.iconName`,
+      propertyValue: "",
+    });
+  }
+
+  return propertiesToUpdate;
+}
+
 // Select default Icon Alignment when an icon is chosen
-export function updateIconAlignment(
+export function updateIconAlignmentHook(
   props: TableWidgetProps,
   propertyPath: string,
   propertyValue: string,
@@ -212,6 +294,7 @@ export function updateIconAlignment(
     propertyPath,
     propertyValue,
   );
+
   if (updateDerivedColumnsHookArr) {
     propertiesToUpdate = [
       ...updateDerivedColumnsHookArr,
@@ -234,62 +317,130 @@ export function updateIconAlignment(
 // For example, when we add a new column or update a derived column's name
 // The propertyPath will be of the type `primaryColumns.columnId`
 // Handling BindingProperty of derived columns
+const addColumnRegex = /^primaryColumns\.\w+$/; // primaryColumns.customColumn1
+const updateColumnRegex = /^primaryColumns\.(\w+)\.(.*)$/; // primaryColumns.customColumn1.computedValue
+
 export const updateDerivedColumnsHook = (
   props: TableWidgetProps,
   propertyPath: string,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   propertyValue: any,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Array<{ propertyPath: string; propertyValue: any }> | undefined => {
-  let propertiesToUpdate: Array<{
-    propertyPath: string;
-    propertyValue: any;
-  }> = [];
-  if (props && propertyValue) {
-    // If we're adding a column, we need to add it to the `derivedColumns` property as well
-    if (/^primaryColumns\.\w+$/.test(propertyPath)) {
-      const newId = propertyValue.id;
-      if (newId) {
-        propertiesToUpdate = [
-          {
-            propertyPath: `derivedColumns.${newId}`,
-            propertyValue,
-          },
-        ];
-      }
+  if (propertyValue && addColumnRegex.test(propertyPath)) {
+    if (propertyValue.id) {
+      const propertiesToUpdate = [];
 
+      // sets default value for some properties
+      propertyValue.labelColor = Colors.WHITE;
+      propertiesToUpdate.push({
+        propertyPath: `derivedColumns.${propertyValue.id}`,
+        propertyValue,
+      });
       const oldColumnOrder = props.columnOrder || [];
       const newColumnOrder = [...oldColumnOrder, propertyValue.id];
+
       propertiesToUpdate.push({
         propertyPath: "columnOrder",
         propertyValue: newColumnOrder,
       });
-    }
-    // If we're updating a columns' name, we need to update the `derivedColumns` property as well.
-    const regex = /^primaryColumns\.(\w+)\.(.*)$/;
-    if (regex.test(propertyPath)) {
-      const matches = propertyPath.match(regex);
-      if (matches && matches.length === 3) {
-        // updated to use column keys
-        const columnId = matches[1];
-        const columnProperty = matches[2];
-        const primaryColumn = props.primaryColumns[columnId];
-        const isDerived = primaryColumn ? primaryColumn.isDerived : false;
 
-        const { derivedColumns = {} } = props;
-
-        if (isDerived && derivedColumns && derivedColumns[columnId]) {
-          propertiesToUpdate = [
-            {
-              propertyPath: `derivedColumns.${columnId}.${columnProperty}`,
-              propertyValue: propertyValue,
-            },
-          ];
-        }
-      }
+      return propertiesToUpdate;
     }
-    if (propertiesToUpdate.length > 0) return propertiesToUpdate;
   }
-  return;
+
+  const matches = propertyPath.match(updateColumnRegex);
+
+  if (matches && matches.length === 3) {
+    const propertiesToUpdate = [];
+    const columnId = matches[1];
+    const columnProperty = matches[2];
+    const { derivedColumns = {} } = props;
+
+    // only change derived properties of custom columns
+    if (derivedColumns[columnId]) {
+      propertiesToUpdate.push({
+        propertyPath: `derivedColumns.${columnId}.${columnProperty}`,
+        propertyValue: propertyValue,
+      });
+    }
+
+    updateThemeStylesheetsInColumns(
+      props,
+      propertyValue,
+      columnId,
+      columnProperty,
+      propertiesToUpdate,
+    );
+
+    return propertiesToUpdate.length > 0 ? propertiesToUpdate : undefined;
+  }
 };
+
+/**
+ * updates theme stylesheets
+ *
+ * @param props
+ * @param propertyPath
+ * @param propertyValue
+ */
+function updateThemeStylesheetsInColumns(
+  props: TableWidgetProps,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  propertyValue: any,
+  columnId: string,
+  columnProperty: string,
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  propertiesToUpdate: Array<{ propertyPath: string; propertyValue: any }>,
+) {
+  if (columnProperty === "columnType") {
+    const oldColumnType = props.columnType;
+    const newColumnType = propertyValue;
+
+    const propertiesToRemove = Object.keys(
+      props.childStylesheet[oldColumnType] || {},
+    );
+
+    const propertiesToAdd = Object.keys(
+      props.childStylesheet[newColumnType] || {},
+    );
+
+    propertiesToRemove.forEach((propertyKey) => {
+      propertiesToUpdate.push({
+        propertyPath: `derivedColumns.${columnId}.${propertyKey}`,
+        propertyValue: undefined,
+      });
+
+      propertiesToUpdate.push({
+        propertyPath: `primaryColumns.${columnId}.${propertyKey}`,
+        propertyValue: undefined,
+      });
+    });
+
+    propertiesToAdd.forEach((propertyKey) => {
+      const { jsSnippets, stringSegments } = getDynamicBindings(
+        props.childStylesheet[newColumnType][propertyKey],
+      );
+
+      const js = combineDynamicBindings(jsSnippets, stringSegments);
+
+      propertiesToUpdate.push({
+        propertyPath: `derivedColumns.${columnId}.${propertyKey}`,
+        propertyValue: `{{${props.widgetName}.sanitizedTableData.map((currentRow) => ( ${js}))}}`,
+      });
+
+      propertiesToUpdate.push({
+        propertyPath: `primaryColumns.${columnId}.${propertyKey}`,
+        propertyValue: `{{${props.widgetName}.sanitizedTableData.map((currentRow) => ( ${js}))}}`,
+      });
+    });
+  }
+}
+
 // Gets the base property path excluding the current property.
 // For example, for  `primaryColumns[5].computedValue` it will return
 // `primaryColumns[5]`
@@ -299,9 +450,11 @@ export const getBasePropertyPath = (
   try {
     const propertyPathRegex = /^(.*)\.\w+$/g;
     const matches = [...propertyPath.matchAll(propertyPathRegex)][0];
+
     if (matches && Array.isArray(matches) && matches.length === 2) {
       return matches[1];
     }
+
     return;
   } catch (e) {
     return;
@@ -312,12 +465,58 @@ export const getBasePropertyPath = (
 export const hideByColumnType = (
   props: TableWidgetProps,
   propertyPath: string,
-  columnTypes: ColumnTypes[],
+  columnTypes: Set<ColumnTypes>,
   shouldUsePropertyPath?: boolean,
 ) => {
   const baseProperty = shouldUsePropertyPath
     ? propertyPath
     : getBasePropertyPath(propertyPath);
   const columnType = get(props, `${baseProperty}.columnType`, "");
-  return !columnTypes.includes(columnType);
+
+  return !columnTypes.has(columnType);
+};
+
+/**
+ * A function for updateHook to remove the boxShadowColor property post migration.
+ * @param props
+ * @param propertyPath
+ * @param propertyValue
+ */
+export const removeBoxShadowColorProp = (
+  props: TableWidgetProps,
+  propertyPath: string,
+) => {
+  const boxShadowColorPath = replacePropertyName(
+    propertyPath,
+    "boxShadowColor",
+  );
+
+  return [
+    {
+      propertyPath: boxShadowColorPath,
+      propertyValue: undefined,
+    },
+  ];
+};
+
+/**
+ * This function will replace the property present at the end of the propertyPath with the targetPropertyName.
+ * e.g.
+ * propertyPath = primaryColumns.action.boxShadow
+ * Running this function will give the new propertyPath like below:
+ * propertyPath = primaryColumns.action.boxShadowColor
+ *
+ * @param propertyPath The property path inside a widget
+ * @param targetPropertyName Target property name
+ * @returns New property path with target property name at the end.
+ */
+export const replacePropertyName = (
+  propertyPath: string,
+  targetPropertyName: string,
+) => {
+  const path = propertyPath.split(".");
+
+  path.pop();
+
+  return `${path.join(".")}.${targetPropertyName}`;
 };

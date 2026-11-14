@@ -1,113 +1,96 @@
-import React from "react";
-import { Link, useLocation } from "react-router-dom";
-import { connect } from "react-redux";
+import React, { useEffect } from "react";
+import { connect, useDispatch } from "react-redux";
 import { getCurrentUser } from "selectors/usersSelectors";
-import styled, { css } from "styled-components";
+import styled from "styled-components";
 import StyledHeader from "components/designSystems/appsmith/StyledHeader";
-import { ReactComponent as AppsmithLogo } from "assets/svg/appsmith_logo_primary.svg";
-import { AppState } from "reducers";
-import { User, ANONYMOUS_USERNAME } from "constants/userConstants";
-import { AUTH_LOGIN_URL, APPLICATIONS_URL } from "constants/routes";
-import Button from "components/editorComponents/Button";
-import history from "utils/history";
-import ProfileDropdown from "./ProfileDropdown";
-import Bell from "notifications/Bell";
+import type { DefaultRootState } from "react-redux";
+import type { User } from "constants/userConstants";
+import { useIsMobileDevice } from "utils/hooks/useDeviceDetect";
+import { getTemplateNotificationSeenAction } from "actions/templateActions";
+import { Banner } from "ee/utils/licenseHelpers";
+import BaseUrlMissingBanner from "components/editorComponents/BaseUrlMissingBanner";
+import bootPylon from "utils/bootPylon";
+import EntitySearchBar from "pages/common/SearchBar/EntitySearchBar";
+import {
+  DESKTOP_BANNER_OFFSET,
+  MOBILE_BANNER_OFFSET,
+} from "pages/common/bannerOffsets";
+import { useIsBannerVisible } from "pages/common/useIsBannerVisible";
 
 const StyledPageHeader = styled(StyledHeader)<{
   hideShadow?: boolean;
+  isMobile?: boolean;
   showSeparator?: boolean;
+  isBannerVisible?: boolean;
 }>`
-  background: white;
+  justify-content: space-between;
+  background: var(--ads-v2-color-bg);
   height: 48px;
-  color: white;
-  flex-direction: row;
+  color: var(--ads-v2-color-bg);
   position: fixed;
   top: 0;
-  z-index: 10;
-  box-shadow: ${(props) =>
-    props.hideShadow ? `none` : `0px 4px 4px rgba(0, 0, 0, 0.05)`};
-  ${(props) => props.showSeparator && sideBorder}
+  z-index: var(--ads-v2-z-index-9);
+  border-bottom: 1px solid var(--ads-v2-color-border);
+  ${({ isMobile }) =>
+    isMobile &&
+    `
+    padding: 0 12px;
+    padding-left: 10px;
+    `};
+  ${({ isBannerVisible, isMobile }) =>
+    isBannerVisible
+      ? isMobile
+        ? `top: ${MOBILE_BANNER_OFFSET}px;`
+        : `top: ${DESKTOP_BANNER_OFFSET}px;`
+      : ""};
 `;
 
-const HeaderSection = styled.div`
-  display: flex;
-  flex: 1;
-  align-items: center;
-
-  .t--appsmith-logo {
-    svg {
-      max-width: 110px;
-      width: 110px;
-    }
-  }
-`;
-
-const sideBorder = css`
-  &:after {
-    content: "";
-    position: absolute;
-    left: ${(props) => props.theme.homePage.sidebar}px;
-    width: 1px;
-    height: 100%;
-    background-color: #ededed;
-  }
-`;
-
-const StyledDropDownContainer = styled.div``;
-
-type PageHeaderProps = {
+interface PageHeaderProps {
   user?: User;
   hideShadow?: boolean;
   showSeparator?: boolean;
-};
+  hideEditProfileLink?: boolean;
+}
 
 export function PageHeader(props: PageHeaderProps) {
   const { user } = props;
-  const location = useLocation();
-  const queryParams = new URLSearchParams(location.search);
-  let loginUrl = AUTH_LOGIN_URL;
-  if (queryParams.has("redirectUrl")) {
-    loginUrl += `?redirectUrl
-    =${queryParams.get("redirectUrl")}`;
-  }
+  const dispatch = useDispatch();
+
+  const isMobile = useIsMobileDevice();
+
+  useEffect(() => {
+    dispatch(getTemplateNotificationSeenAction());
+  }, []);
+
+  useEffect(() => {
+    bootPylon(user);
+  }, [user?.email]);
+
+  // APP-16059 / GHSA-j9gf-vw2f-9hrw — single source of truth for whether a
+  // top-of-screen banner is visible (the license/trial banner on the home and
+  // /license routes, or the global base-url-missing admin banner). When it is,
+  // the fixed page header is pushed down by DESKTOP_BANNER_OFFSET /
+  // MOBILE_BANNER_OFFSET instead of painting over the banner at top: 0.
+  const isAnyBannerVisible = useIsBannerVisible();
 
   return (
-    <StyledPageHeader
-      hideShadow={props.hideShadow || false}
-      showSeparator={props.showSeparator || false}
-    >
-      <HeaderSection>
-        <Link className="t--appsmith-logo" to={APPLICATIONS_URL}>
-          <AppsmithLogo />
-        </Link>
-      </HeaderSection>
-      {user && (
-        <>
-          {user.username !== ANONYMOUS_USERNAME && <Bell />}
-          <StyledDropDownContainer>
-            {user.username === ANONYMOUS_USERNAME ? (
-              <Button
-                filled
-                intent={"primary"}
-                onClick={() => history.push(loginUrl)}
-                size="small"
-                text="Sign In"
-              />
-            ) : (
-              <ProfileDropdown
-                name={user.name}
-                photoId={user?.photoId}
-                userName={user.username}
-              />
-            )}
-          </StyledDropDownContainer>
-        </>
-      )}
-    </StyledPageHeader>
+    <>
+      <Banner />
+      <BaseUrlMissingBanner />
+      <StyledPageHeader
+        data-testid="t--appsmith-page-header"
+        hideShadow={props.hideShadow || false}
+        isBannerVisible={isAnyBannerVisible}
+        isMobile={isMobile}
+        showSeparator={props.showSeparator || false}
+      >
+        <EntitySearchBar user={user} />
+      </StyledPageHeader>
+    </>
   );
 }
 
-const mapStateToProps = (state: AppState) => ({
+const mapStateToProps = (state: DefaultRootState) => ({
   user: getCurrentUser(state),
   hideShadow: state.ui.theme.hideHeaderShadow,
   showSeparator: state.ui.theme.showHeaderSeparator,

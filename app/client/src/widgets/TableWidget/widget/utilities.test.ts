@@ -31,6 +31,7 @@ describe("getOriginalRowIndex", () => {
       selectedRowIndex,
     );
     const expected = undefined;
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -61,6 +62,7 @@ describe("getOriginalRowIndex", () => {
       selectedRowIndex,
     );
     const expected = undefined;
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -113,6 +115,25 @@ describe("getOriginalRowIndex", () => {
     ];
     const result = getOriginalRowIndex(oldTableData, newTableData, undefined);
     const expected = undefined;
+
+    expect(result).toStrictEqual(expected);
+  });
+
+  it("With no data", () => {
+    const oldTableData = undefined;
+    const newTableData = undefined;
+    const selectedRowIndex = 1;
+    const result = getOriginalRowIndex(
+      // TODO: Fix this the next time the file is edited
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      oldTableData as any as Array<Record<string, unknown>>,
+      // TODO: Fix this the next time the file is edited
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      newTableData as any as Array<Record<string, unknown>>,
+      selectedRowIndex,
+    );
+    const expected = undefined;
+
     expect(result).toStrictEqual(expected);
   });
 });
@@ -174,6 +195,7 @@ describe("selectRowIndex", () => {
       selectedRowIndexProp,
       "step",
     );
+
     expect(result).toStrictEqual(0);
   });
 });
@@ -234,6 +256,7 @@ describe("selectRowIndices", () => {
       [],
       undefined,
     );
+
     expect(result).toEqual([0]);
   });
 });

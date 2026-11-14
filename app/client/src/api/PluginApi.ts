@@ -1,59 +1,102 @@
 import Api from "api/Api";
-import { AxiosPromise } from "axios";
-import { GenericApiResponse } from "api/ApiResponses";
-import { PluginType } from "entities/Action";
-import { DependencyMap } from "utils/DynamicBindingUtils";
-
-export type PluginId = string;
-export type PluginPackageName = string;
-export type GenerateCRUDEnabledPluginMap = Record<PluginId, PluginPackageName>;
-
-export enum UIComponentTypes {
-  DbEditorForm = "DbEditorForm",
-  UQIDbEditorForm = "UQIDbEditorForm",
-  ApiEditorForm = "ApiEditorForm",
-  RapidApiEditorForm = "RapidApiEditorForm",
-  JsEditorForm = "JsEditorForm",
-}
-
-export enum DatasourceComponentTypes {
-  RestAPIDatasourceForm = "RestAPIDatasourceForm",
-  AutoForm = "AutoForm",
-}
-export interface Plugin {
-  id: string;
-  name: string;
-  type: PluginType;
-  packageName: string;
-  iconLocation?: string;
-  uiComponent: UIComponentTypes;
-  datasourceComponent: DatasourceComponentTypes;
-  allowUserDatasources?: boolean;
-  templates: Record<string, string>;
-  responseType?: "TABLE" | "JSON";
-  documentationLink?: string;
-  generateCRUDPageComponent?: string;
-}
+import type { AxiosPromise } from "axios";
+import type { ApiResponse } from "api/ApiResponses";
+import type { DependencyMap } from "utils/DynamicBindingUtils";
+import { FILE_UPLOAD_TRIGGER_TIMEOUT_MS } from "ee/constants/ApiConstants";
+import type {
+  DefaultPlugin,
+  Plugin,
+  UpcomingIntegration,
+} from "entities/Plugin";
+import { objectKeys } from "@appsmith/utils";
 
 export interface PluginFormPayload {
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   form: any[];
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   editor: any[];
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   setting: any[];
   dependencies: DependencyMap;
+  formButton: string[];
 }
 
 class PluginsApi extends Api {
   static url = "v1/plugins";
-  static fetchPlugins(
-    orgId: string,
-  ): AxiosPromise<GenericApiResponse<Plugin[]>> {
-    return Api.get(PluginsApi.url, { organizationId: orgId });
+  static defaultDynamicTriggerURL(datasourceId: string): string {
+    return `/v1/datasources/${datasourceId}/trigger`;
+  }
+  static dynamicTriggerURLForInternalPlugins(pluginId: string): string {
+    return `/${PluginsApi.url}/${pluginId}/trigger`;
+  }
+  static async fetchPlugins(
+    workspaceId: string,
+  ): Promise<AxiosPromise<ApiResponse<Plugin[]>>> {
+    return Api.get(PluginsApi.url, { workspaceId: workspaceId });
   }
 
-  static fetchFormConfig(
+  static async fetchFormConfig(
     id: string,
-  ): AxiosPromise<GenericApiResponse<PluginFormPayload>> {
+  ): Promise<AxiosPromise<ApiResponse<PluginFormPayload>>> {
     return Api.get(PluginsApi.url + `/${id}/form`);
+  }
+
+  // Definition to fetch the dynamic data via the URL passed in the config
+  static async fetchDynamicFormValues(
+    url: string,
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    body: Record<string, any>,
+  ): Promise<AxiosPromise<ApiResponse>> {
+    return Api.post(url, body);
+  }
+
+  static async fetchDefaultPlugins(): Promise<
+    AxiosPromise<ApiResponse<DefaultPlugin[]>>
+  > {
+    return Api.get(PluginsApi.url + `/default/icons`);
+  }
+
+  static async fetchUpcomingIntegrations(): Promise<
+    AxiosPromise<ApiResponse<UpcomingIntegration[]>>
+  > {
+    return Api.get(PluginsApi.url + "/upcoming-integrations");
+  }
+
+  static async uploadFiles(
+    pluginId: string,
+    files: File[],
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    params?: Record<string, any>,
+  ): Promise<AxiosPromise<ApiResponse>> {
+    const url = this.dynamicTriggerURLForInternalPlugins(pluginId);
+    const formData = new FormData();
+
+    files.forEach((file) => {
+      formData.append("files", file);
+    });
+
+    if (params) {
+      objectKeys(params).forEach((key) => {
+        formData.append(key, params[key]);
+      });
+    }
+
+    return Api.post(
+      url,
+      formData,
+      {},
+      {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+        timeout: FILE_UPLOAD_TRIGGER_TIMEOUT_MS,
+      },
+    );
   }
 }
 

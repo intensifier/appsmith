@@ -1,12 +1,14 @@
 /// <reference types="cypress" />
-
 const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
 const chalk = require("chalk");
 const cypressLogToOutput = require("cypress-log-to-output");
-const { isFileExist } = require("cy-verify-downloads");
-
+const installLogsPrinter = require("cypress-terminal-report/src/installLogsPrinter");
+const { tagify } = require("cypress-tags");
+const { cypressHooks } = require("../scripts/cypress-hooks");
+const { dynamicSplit } = require("../scripts/cypress-split-dynamic");
+const { staticSplit } = require("../scripts/cypress-split-static");
 // ***********************************************************
 // This example plugins/index.js can be used to load plugins
 //
@@ -23,23 +25,27 @@ const { isFileExist } = require("cy-verify-downloads");
 /**
  * @type {Cypress.PluginConfig}
  */
-module.exports = (on, config) => {
-  // Todo: maybe raise a PR instead of overwriting `on("before:browser:launch", ...)` twice.
+
+module.exports = async (on, config) => {
   cypressLogToOutput.install(on, (type, event) => {
     if (event.level === "error" || event.type === "error") {
       return true;
     }
     return false;
   });
-};
 
-module.exports = (on, config) => {
-  on("task", {
-    isFileExist,
-  });
+  const logsPrinterOptions = {
+    outputRoot: config.projectRoot + "/cypress/",
+    outputTarget: {
+      "cypress-logs|json": "json",
+    },
+    specRoot: "cypress/e2e",
+    printLogsToFile: "onFail",
+  };
+  installLogsPrinter(on, logsPrinterOptions);
 
-  // `on` is used to hook into various events Cypress emits
-  // `config` is the resolved Cypress config
+  on("file:preprocessor", tagify(config));
+
   on("before:browser:launch", (browser = {}, launchOptions) => {
     /*
         Uncomment below to get console log printed in cypress output
@@ -49,12 +55,31 @@ module.exports = (on, config) => {
       browser,
       launchOptions.args,
     );
-    if (browser.name === "chrome") {
+    if (browser.name === "chrome" || browser.name === "chromium") {
+      const video = path.join(
+        "cypress",
+        "fixtures",
+        "Videos",
+        "webCamVideo.y4m",
+      );
       launchOptions.args.push("--disable-dev-shm-usage");
+      launchOptions.args.push("--window-size=1400,1100");
+      launchOptions.args.push("--use-fake-ui-for-media-stream");
+      launchOptions.args.push("--use-fake-device-for-media-stream");
+      //Stream default video source for camera & code scanner
+      launchOptions.args.push(`--use-file-for-fake-video-capture=${video}`);
       return launchOptions;
     }
 
-    return launchOptions;
+    if (browser.name === "electron") {
+      // && browser.isHeadless) {
+      launchOptions.preferences.fullscreen = true;
+      launchOptions.preferences.darkTheme = true;
+      launchOptions.preferences.width = 1400;
+      launchOptions.preferences.height = 1100;
+      launchOptions.preferences.resizable = false;
+      return launchOptions;
+    }
   });
 
   /**
@@ -123,7 +148,89 @@ module.exports = (on, config) => {
       console.log(message);
       return null;
     },
+
+    /*
+    Change video source for for camera & code scanner
+    */
+    changeVideoSource(videoSource) {
+      console.log("TASK - Changing video source to", videoSource);
+      const webcamPath = path.join(
+        "cypress",
+        "fixtures",
+        "Videos",
+        "webCamVideo.y4m",
+      );
+      const defaultVideoPath = path.join(
+        "cypress",
+        "fixtures",
+        "Videos",
+        videoSource,
+      );
+
+      const video = fs.readFileSync(defaultVideoPath);
+
+      fs.writeFile(webcamPath, video);
+
+      return null;
+    },
+
+    /*
+   Reset video source to default
+   */
+    resetVideoSource() {
+      console.log("TASK - Resetting video source");
+      const webcamPath = path.join(
+        "cypress",
+        "fixtures",
+        "Videos",
+        "webCamVideo.y4m",
+      );
+      const defaultVideoPath = path.join(
+        "cypress",
+        "fixtures",
+        "Videos",
+        "defaultVideo.y4m",
+      );
+
+      const video = fs.readFileSync(defaultVideoPath);
+
+      fs.writeFile(webcamPath, video);
+
+      return null;
+    },
   });
+
+  console.log("Type of 'config.specPattern':", typeof config.specPattern);
+  /**
+   * Cypress grep plug return specPattern as object and with absolute path
+   */
+  if (typeof config.specPattern == "object") {
+    config.specPattern = config.specPattern.map((spec) => {
+      return spec.replace(process.cwd() + "/", "");
+    });
+  }
+  console.log("config.specPattern:", config.specPattern);
+
+  if (process.env["RUNID"]) {
+    // cypress-repeat-pro sets cypress_repeat_k on every run. On a retry it
+    // passes the failed specs as --spec, and the plugin's specPattern
+    // constrains that list. Recomputing the split here would use weights
+    // that moved since the first run, so the retry's slice can omit the very
+    // spec being retried and Cypress finds nothing to run. Keep the full
+    // pattern and let --spec select; the first run's matrix rows already
+    // exist for the hooks to update.
+    if (Number(config.env.cypress_repeat_k) > 1) {
+      console.log(
+        "Repeat run; skipping spec allocation and running the specs Cypress was given.",
+      );
+    } else {
+      config =
+        process.env["CYPRESS_STATIC_ALLOCATION"] == "true"
+          ? await new staticSplit().splitSpecs(config)
+          : await new dynamicSplit().splitSpecs(config);
+    }
+    cypressHooks(on, config);
+  }
 
   return config;
 };

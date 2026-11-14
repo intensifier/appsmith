@@ -1,0 +1,152 @@
+name: Quality checks
+
+on:
+  pull_request:
+    branches: [release, master, pg]
+
+jobs:
+  path-filter:
+    # Internal PRs only: several downstream jobs need larger runners and
+    # secrets that GitHub does not provide to fork PRs, so they would queue
+    # forever or fail. Fork PRs run external-pr-validation.yml instead.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      ci-scripts: ${{ steps.filter.outputs.ci-scripts }}
+      server: ${{ steps.filter.outputs.server }}
+      client: ${{ steps.filter.outputs.client == 'true' && steps.filter.outputs.not-cypress-manual == 'true' }}
+    steps:
+      # Check out merge commit with the base branch in case this workflow is invoked via pull request
+      - name: Checkout the merged commit from PR and base branch
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          filters: |
+            ci-scripts:
+              - '.github/workflows/scripts/**/*.js'
+            server:
+              - 'app/server/**'
+            client:
+              - 'app/client/**'
+            not-cypress-manual:
+              - '!app/client/cypress/manual_TestSuite/**'
+
+  ci-scripts-tests:
+    name: ci-scripts-tests
+    needs: path-filter
+    if: needs.path-filter.outputs.ci-scripts == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the merged commit from PR and base branch
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+
+      - name: Run the workflow script unit tests
+        run: find .github/workflows/scripts -name '*.test.js' -exec node --test {} +
+
+  server-spotless:
+    name: server-spotless
+    needs: path-filter
+    if: needs.path-filter.outputs.server == 'true'
+    uses: ./.github/workflows/server-spotless.yml
+    secrets: inherit
+    with:
+      pr: ${{ github.event.pull_request.number }}
+
+  server-unit-tests:
+    name: server-unit-tests
+    needs: path-filter
+    if: needs.path-filter.outputs.server == 'true'
+    uses: ./.github/workflows/server-build.yml
+    secrets: inherit
+    with:
+      pr: ${{ github.event.pull_request.number }}
+      is-pg-build: ${{ github.event.pull_request.base.ref == 'pg' || github.event.pull_request.head.ref == 'pg' }}
+
+  client-build:
+    name: client-build
+    needs: path-filter
+    if: needs.path-filter.outputs.client == 'true'
+    uses: ./.github/workflows/client-build.yml
+    secrets: inherit
+    with:
+      pr: ${{ github.event.pull_request.number }}
+
+  client-prettier:
+    name: client-prettier
+    needs: path-filter
+    if: needs.path-filter.outputs.client == 'true'
+    uses: ./.github/workflows/client-prettier.yml
+    secrets: inherit
+    with:
+      pr: ${{ github.event.pull_request.number }}
+
+  client-unit-tests:
+    name: client-unit-tests
+    needs: path-filter
+    if: needs.path-filter.outputs.client == 'true'
+    uses: ./.github/workflows/client-unit-tests.yml
+    secrets: inherit
+    with:
+      pr: ${{ github.event.pull_request.number }}
+
+  client-lint:
+    name: client-lint
+    needs: path-filter
+    if: needs.path-filter.outputs.client == 'true'
+    uses: ./.github/workflows/client-lint.yml
+    secrets: inherit
+    with:
+      pr: ${{ github.event.pull_request.number }}
+
+  client-check-cyclic-deps:
+    name: client-check-cyclic-deps
+    needs: path-filter
+    if: needs.path-filter.outputs.client == 'true'
+    uses: ./.github/workflows/ci-client-cyclic-deps-check.yml
+    secrets: inherit
+    with:
+      pr: ${{ github.event.pull_request.number }}
+
+  qc-result:
+    name: qc-result
+    needs:
+      [
+        path-filter,
+        ci-scripts-tests,
+        server-spotless,
+        server-unit-tests,
+        client-build,
+        client-prettier,
+        client-unit-tests,
+        client-lint,
+        client-check-cyclic-deps,
+      ]
+    # Skip (rather than pass) on fork PRs so the required check reflects that
+    # these jobs did not run; external PRs are validated by
+    # external-pr-validation.yml until a maintainer runs /approve-ci.
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Return status for quality checks
+        env:
+          # Every job in `needs`, as {name: {result, outputs}}. `path-filter` must
+          # succeed, or every check it gates is skipped for the wrong reason. A
+          # job skipped by its path filter reads `skipped` and does not fail the
+          # gate; a failed or cancelled job does.
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          if jq -e '.["path-filter"].result != "success" or any(.[]; .result == "failure" or .result == "cancelled")' <<< "$JOB_RESULTS" > /dev/null; then
+            echo "Quality checks failed"
+            jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$JOB_RESULTS"
+            exit 1
+          fi
+          echo "Quality checks successful"

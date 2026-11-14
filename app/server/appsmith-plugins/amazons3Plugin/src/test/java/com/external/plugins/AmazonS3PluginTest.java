@@ -1,44 +1,69 @@
 package com.external.plugins;
 
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.AmazonS3ClientBuilder;
-import com.amazonaws.services.s3.model.Bucket;
-import com.amazonaws.services.s3.model.ObjectListing;
-import com.amazonaws.services.s3.model.S3Object;
-import com.amazonaws.services.s3.model.S3ObjectInputStream;
-import com.amazonaws.services.s3.model.S3ObjectSummary;
-import com.amazonaws.util.Base64;
+import com.appsmith.external.datatypes.ClientDataType;
 import com.appsmith.external.dtos.ExecuteActionDTO;
 import com.appsmith.external.exceptions.pluginExceptions.AppsmithPluginError;
 import com.appsmith.external.exceptions.pluginExceptions.StaleConnectionException;
+import com.appsmith.external.helpers.PluginUtils;
 import com.appsmith.external.models.ActionConfiguration;
 import com.appsmith.external.models.ActionExecutionResult;
 import com.appsmith.external.models.DBAuth;
 import com.appsmith.external.models.DatasourceConfiguration;
+import com.appsmith.external.models.DatasourceStructure.Template;
+import com.appsmith.external.models.DatasourceTestResult;
 import com.appsmith.external.models.Endpoint;
 import com.appsmith.external.models.Param;
 import com.appsmith.external.models.Property;
 import com.appsmith.external.models.RequestParamDTO;
+import com.external.plugins.constants.AmazonS3Action;
+import com.external.plugins.exceptions.S3ErrorMessages;
+import com.external.plugins.exceptions.S3PluginError;
+import com.external.utils.S3Connection;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import lombok.extern.slf4j.Slf4j;
-import org.junit.Assert;
-import org.junit.BeforeClass;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.mockito.InjectMocks;
+import org.mockito.Mockito;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.core.ResponseBytes;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.Bucket;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectResponse;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectsResponse;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.ListBucketsResponse;
+import software.amazon.awssdk.services.s3.model.ListObjectsRequest;
+import software.amazon.awssdk.services.s3.model.ListObjectsResponse;
+import software.amazon.awssdk.services.s3.model.S3Exception;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
-import java.io.ByteArrayInputStream;
-import java.io.InputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static com.appsmith.external.constants.ActionConstants.ACTION_CONFIGURATION_PATH;
-import static com.appsmith.external.helpers.PluginUtils.setValueSafelyInFormData;
-import static com.external.plugins.AmazonS3Plugin.SMART_SUBSTITUTION;
+import static com.appsmith.external.helpers.PluginUtils.STRING_TYPE;
+import static com.appsmith.external.helpers.PluginUtils.setDataValueSafelyInFormData;
+import static com.external.plugins.constants.FieldName.BODY;
 import static com.external.plugins.constants.FieldName.BUCKET;
 import static com.external.plugins.constants.FieldName.COMMAND;
 import static com.external.plugins.constants.FieldName.CREATE_DATATYPE;
@@ -47,19 +72,41 @@ import static com.external.plugins.constants.FieldName.LIST_EXPIRY;
 import static com.external.plugins.constants.FieldName.LIST_PREFIX;
 import static com.external.plugins.constants.FieldName.LIST_SIGNED_URL;
 import static com.external.plugins.constants.FieldName.LIST_UNSIGNED_URL;
-import static com.external.plugins.constants.FieldName.READ_USING_BASE64_ENCODING;
-import static com.external.utils.DatasourceUtils.getS3ClientBuilder;
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
+import static com.external.plugins.constants.FieldName.LIST_WHERE;
+import static com.external.plugins.constants.FieldName.PATH;
+import static com.external.plugins.constants.FieldName.READ_DATATYPE;
+import static com.external.plugins.constants.FieldName.READ_EXPIRY;
+import static com.external.plugins.constants.FieldName.SMART_SUBSTITUTION;
+import static com.external.plugins.constants.S3PluginConstants.DEFAULT_FILE_NAME;
+import static com.external.plugins.constants.S3PluginConstants.DEFAULT_URL_EXPIRY_IN_MINUTES;
+import static com.external.plugins.constants.S3PluginConstants.GOOGLE_CLOUD_SERVICE_PROVIDER;
+import static com.external.plugins.constants.S3PluginConstants.NO;
+import static com.external.plugins.constants.S3PluginConstants.YES;
+import static com.external.utils.DatasourceUtils.getS3ConnectionSettings;
+import static com.external.utils.TemplateUtils.CREATE_FILE_TEMPLATE_NAME;
+import static com.external.utils.TemplateUtils.CREATE_MULTIPLE_FILES_TEMPLATE_NAME;
+import static com.external.utils.TemplateUtils.DEFAULT_DIR;
+import static com.external.utils.TemplateUtils.DELETE_FILE_TEMPLATE_NAME;
+import static com.external.utils.TemplateUtils.DELETE_MULTIPLE_FILES_TEMPLATE_NAME;
+import static com.external.utils.TemplateUtils.FILE_PICKER_DATA_EXPRESSION;
+import static com.external.utils.TemplateUtils.FILE_PICKER_MULTIPLE_FILES_DATA_EXPRESSION;
+import static com.external.utils.TemplateUtils.LIST_FILES_TEMPLATE_NAME;
+import static com.external.utils.TemplateUtils.LIST_OF_FILES_STRING;
+import static com.external.utils.TemplateUtils.READ_FILE_TEMPLATE_NAME;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
+import static org.springframework.util.CollectionUtils.isEmpty;
 
 @Slf4j
 public class AmazonS3PluginTest {
@@ -68,11 +115,14 @@ public class AmazonS3PluginTest {
     private static String region;
     private static String serviceProvider;
 
-    @BeforeClass
+    @InjectMocks
+    private AmazonS3Plugin amazonS3Plugin;
+
+    @BeforeAll
     public static void setUp() {
-        accessKey   = "access_key";
-        secretKey   = "secret_key";
-        region      = "ap-south-1";
+        accessKey = "access_key";
+        secretKey = "secret_key";
+        region = "ap-south-1";
         serviceProvider = "amazon-s3";
     }
 
@@ -98,7 +148,7 @@ public class AmazonS3PluginTest {
         DBAuth authDTOWithEmptyAccessKey = new DBAuth();
         authDTOWithEmptyAccessKey.setAuthType(DBAuth.Type.USERNAME_PASSWORD);
         authDTOWithEmptyAccessKey.setPassword(secretKey);
-        /* Do not configure Access Key */
+        /* Do not configure Access key */
 
         DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
         datasourceConfiguration.setAuthentication(authDTOWithEmptyAccessKey);
@@ -112,7 +162,7 @@ public class AmazonS3PluginTest {
                     assertNotEquals(0, res.size());
 
                     List<String> errorList = new ArrayList<>(res);
-                    assertTrue(errorList.get(0).contains("Mandatory parameter 'Access Key' is empty"));
+                    assertTrue(errorList.get(0).contains("Mandatory parameter 'Access key' is empty"));
                 })
                 .verifyComplete();
     }
@@ -122,7 +172,7 @@ public class AmazonS3PluginTest {
         DBAuth authDTOWithEmptyAccessKey = new DBAuth();
         authDTOWithEmptyAccessKey.setAuthType(DBAuth.Type.USERNAME_PASSWORD);
         authDTOWithEmptyAccessKey.setUsername(accessKey);
-        /* Do not configure Secret Key */
+        /* Do not configure Secret key */
 
         DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
         datasourceConfiguration.setAuthentication(authDTOWithEmptyAccessKey);
@@ -133,10 +183,12 @@ public class AmazonS3PluginTest {
         StepVerifier.create(pluginExecutorMono)
                 .assertNext(executor -> {
                     Set<String> res = executor.validateDatasource(datasourceConfiguration);
-                    Assert.assertNotEquals(0, res.size());
+                    assertNotEquals(0, res.size());
 
                     List<String> errorList = new ArrayList<>(res);
-                    assertTrue(errorList.get(0).contains("Mandatory parameter 'Secret Key' is empty"));
+                    assertTrue(errorList
+                            .get(0)
+                            .equals(S3ErrorMessages.DS_MANDATORY_PARAMETER_SECRET_KEY_MISSING_ERROR_MSG));
                 })
                 .verifyComplete();
     }
@@ -153,12 +205,55 @@ public class AmazonS3PluginTest {
         StepVerifier.create(pluginExecutorMono)
                 .assertNext(executor -> {
                     Set<String> res = executor.validateDatasource(datasourceConfiguration);
-                    assertNotEquals(0, res.size());
+                    assertEquals(0, res.size());
+                })
+                .verifyComplete();
+    }
 
-                    List<String> errorList = new ArrayList<>(res);
-                    assertTrue(errorList.get(0).contains("Required parameter 'Region' is empty. Did you forget to " +
-                            "edit the 'Region' field in the datasource creation form ? You need to fill it with the " +
-                            "region where your S3 instance is hosted."));
+    @Test
+    public void testValidateDatasourceWithMissingRegionAndDefaultBucketWithNonAmazonProvider() {
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+
+        datasourceConfiguration.getProperties().get(1).setValue(GOOGLE_CLOUD_SERVICE_PROVIDER);
+
+        Property defaultBucketProperty = new Property("default bucket", "");
+        datasourceConfiguration.getProperties().add(defaultBucketProperty);
+
+        AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
+        Mono<AmazonS3Plugin.S3PluginExecutor> pluginExecutorMono = Mono.just(pluginExecutor);
+
+        StepVerifier.create(pluginExecutorMono)
+                .assertNext(executor -> {
+                    Set<String> res = executor.validateDatasource(datasourceConfiguration);
+                    // There should be no errors related to the region for GCS, but it should validate the default
+                    // bucket
+                    assertTrue(res.contains(S3ErrorMessages.DS_MANDATORY_PARAMETER_DEFAULT_BUCKET_MISSING_ERROR_MSG));
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    public void testValidateDatasourceWithMissingRegionWithNonAmazonProvider() {
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+
+        datasourceConfiguration.getProperties().get(1).setValue(GOOGLE_CLOUD_SERVICE_PROVIDER);
+
+        Property defaultBucketProperty = new Property("default bucket", "default-bucket");
+        datasourceConfiguration.getProperties().add(defaultBucketProperty);
+
+        AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
+        Mono<AmazonS3Plugin.S3PluginExecutor> pluginExecutorMono = Mono.just(pluginExecutor);
+
+        StepVerifier.create(pluginExecutorMono)
+                .assertNext(executor -> {
+                    Set<String> res = executor.validateDatasource(datasourceConfiguration);
+                    assertFalse(res.contains(S3ErrorMessages.DS_AT_LEAST_ONE_MANDATORY_PARAMETER_MISSING_ERROR_MSG));
+                    assertFalse(res.contains(S3ErrorMessages.DS_MANDATORY_PARAMETER_DEFAULT_BUCKET_MISSING_ERROR_MSG));
+                    assertFalse(res.contains(S3ErrorMessages.DS_MANDATORY_PARAMETER_SECRET_KEY_MISSING_ERROR_MSG));
+                    assertFalse(res.contains(S3ErrorMessages.DS_MANDATORY_PARAMETER_ACCESS_KEY_MISSING_ERROR_MSG));
+                    assertFalse(res.contains(S3ErrorMessages.DS_MANDATORY_PARAMETER_ENDPOINT_URL_MISSING_ERROR_MSG));
+                    assertFalse(res.contains(S3ErrorMessages.NON_EXITED_BUCKET_ERROR_MSG));
+                    assertTrue(res.isEmpty());
                 })
                 .verifyComplete();
     }
@@ -195,9 +290,9 @@ public class AmazonS3PluginTest {
                     assertNotEquals(0, res.size());
 
                     List<String> errorList = new ArrayList<>(res);
-                    assertTrue(errorList.get(0).contains("Required parameter 'Endpoint URL' is empty. Did you forget " +
-                            "to edit the 'Endpoint URL' field in the datasource creation form ? You need to fill it " +
-                            "with the endpoint URL of your S3 instance."));
+                    assertTrue(errorList
+                            .get(0)
+                            .equals(S3ErrorMessages.DS_MANDATORY_PARAMETER_ENDPOINT_URL_MISSING_ERROR_MSG));
                 })
                 .verifyComplete();
     }
@@ -211,7 +306,9 @@ public class AmazonS3PluginTest {
                     assertNotEquals(0, datasourceTestResult.getInvalids().size());
 
                     List<String> errorList = new ArrayList<>(datasourceTestResult.getInvalids());
-                    assertTrue(errorList.get(0).contains("The AWS Access Key Id you provided does not exist in our records"));
+                    assertTrue(errorList
+                            .get(0)
+                            .contains("The AWS Access Key Id you provided does not exist in our records"));
                 })
                 .verifyComplete();
     }
@@ -221,21 +318,15 @@ public class AmazonS3PluginTest {
         DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
         ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        actionConfiguration.setFormData(Map.of());
+        actionConfiguration.setFormData(new HashMap<>());
         Mono<AmazonS3Plugin.S3PluginExecutor> pluginExecutorMono = Mono.just(new AmazonS3Plugin.S3PluginExecutor());
-        Mono<ActionExecutionResult> resultMono = pluginExecutorMono
-                                                 .flatMap(executor -> {
-                                                     return executor.executeParameterized(
-                                                             null,
-                                                             executeActionDTO,
-                                                             datasourceConfiguration,
-                                                             actionConfiguration);
-                                                 });
+        Mono<ActionExecutionResult> resultMono = pluginExecutorMono.flatMap(executor -> {
+            return executor.executeParameterized(null, executeActionDTO, datasourceConfiguration, actionConfiguration);
+        });
 
-        StepVerifier.create(resultMono)
-                .verifyError(StaleConnectionException.class);
+        StepVerifier.create(resultMono).verifyError(StaleConnectionException.class);
     }
-    
+
     @Test
     public void testListFilesInBucketWithNoUrl() {
         DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
@@ -243,57 +334,32 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "LIST");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, LIST_SIGNED_URL, "NO");
+        setDataValueSafelyInFormData(configMap, BODY, "");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "LIST");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, LIST_SIGNED_URL, "NO");
 
         actionConfiguration.setFormData(configMap);
 
-        ObjectListing mockObjectListing = mock(ObjectListing.class);
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        when(mockConnection.listObjects(anyString(), anyString())).thenReturn(mockObjectListing);
-
-        S3ObjectSummary mockS3ObjectSummary = mock(S3ObjectSummary.class);
-        List<S3ObjectSummary> mockS3ObjectSummaryList = new ArrayList<>();
-        mockS3ObjectSummaryList.add(mockS3ObjectSummary);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
-
         String dummyKey1 = "file_path_1";
         String dummyKey2 = "file_path_2";
-        when(mockS3ObjectSummary.getKey()).thenReturn(dummyKey1).thenReturn(dummyKey2);
-
-        when(mockObjectListing.isTruncated()).thenReturn(true).thenReturn(false);
-        when(mockConnection.listNextBatchOfObjects(mockObjectListing)).thenReturn(mockObjectListing);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
+        S3Connection mockConnection = mockConnectionListingOneKeyPerPage(dummyKey1, dummyKey2);
 
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertTrue(result.getIsExecutionSuccess());
 
-                    ArrayList<Map<String, String>> node = (ArrayList<Map<String, String>>) result.getBody();
+                    ArrayNode node = (ArrayNode) result.getBody();
                     ArrayList<String> resultFilenamesArray = new ArrayList<>();
-                    resultFilenamesArray.add(node.get(0).get("fileName"));
-                    resultFilenamesArray.add(node.get(1).get("fileName"));
-                    assertArrayEquals(
-                            new String[]{
-                                    dummyKey1,
-                                    dummyKey2
-                            },
-                            resultFilenamesArray.toArray()
-                    );
+                    resultFilenamesArray.add(node.get(0).get("fileName").asText());
+                    resultFilenamesArray.add(node.get(1).get("fileName").asText());
+                    assertArrayEquals(new String[] {dummyKey1, dummyKey2}, resultFilenamesArray.toArray());
                 })
                 .verifyComplete();
     }
@@ -311,34 +377,29 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "{\"data\": \"\"}";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
-        setValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
+        setDataValueSafelyInFormData(configMap, BODY, "{\"data\": \"\"}");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
+        setDataValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
 
         actionConfiguration.setFormData(configMap);
 
-        AmazonS3 connection = pluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        S3Connection connection =
+                pluginExecutor.datasourceCreate(datasourceConfiguration).block();
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                connection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertFalse(result.getIsExecutionSuccess());
-                    String message = (String) result.getBody();
-                    assertTrue(message.contains("The AWS Access Key Id you provided does not exist in " +
-                            "our records"));
-                    assertEquals(AppsmithPluginError.PLUGIN_ERROR.getTitle(), result.getTitle());
+                    String message = result.getPluginErrorDetails().getDownstreamErrorMessage();
+                    assertTrue(
+                            message.contains("The AWS Access Key Id you provided does not exist in " + "our records"));
+                    assertEquals(S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED.getTitle(), result.getTitle());
                 })
                 .verifyComplete();
     }
@@ -356,33 +417,28 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "{\"data\": \"\"}";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
+        setDataValueSafelyInFormData(configMap, BODY, "{\"data\": \"\"}");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
 
         actionConfiguration.setFormData(configMap);
 
-        AmazonS3 connection = pluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        S3Connection connection =
+                pluginExecutor.datasourceCreate(datasourceConfiguration).block();
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                connection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertFalse(result.getIsExecutionSuccess());
-                    String message = (String) result.getBody();
-                    assertTrue(message.contains("The AWS Access Key Id you provided does not exist in " +
-                            "our records"));
-                    assertEquals(AppsmithPluginError.PLUGIN_ERROR.getTitle(), result.getTitle());
+                    String message = result.getPluginErrorDetails().getDownstreamErrorMessage();
+                    assertTrue(
+                            message.contains("The AWS Access Key Id you provided does not exist in " + "our records"));
+                    assertEquals(S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED.getTitle(), result.getTitle());
                 })
                 .verifyComplete();
     }
@@ -390,7 +446,7 @@ public class AmazonS3PluginTest {
     /*
      * - This method tests the create file program flow till the point where an actual call is made by the AmazonS3
      *   connection to upload a file.
-     * - If this test fails, the point of failure is expected to be the logic for smart substitution 
+     * - If this test fails, the point of failure is expected to be the logic for smart substitution
      * - If everything goes well, then only expected exception is the one thrown by AmazonS3 connection
      *   regarding false credentials.
      */
@@ -398,38 +454,35 @@ public class AmazonS3PluginTest {
     public void testSmartSubstitutionJSONBody() {
         DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
         ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
-        executeActionDTO.setParams(List.of(new Param("dynamicallyFoundFilePickerObject", "<html>Random\"Unescaped'String</html>")));
+        Param param = new Param("dynamicallyFoundFilePickerObject", "<html>Random\"Unescaped'String</html>");
+        param.setClientDataType(ClientDataType.OBJECT);
+        executeActionDTO.setParams(List.of(param));
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "{\"data\": {{dynamicallyFoundFilePickerObject}}}";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, SMART_SUBSTITUTION, true);
-        setValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
+        setDataValueSafelyInFormData(configMap, BODY, "{\"data\": {{dynamicallyFoundFilePickerObject}}}");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, SMART_SUBSTITUTION, true);
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
 
         actionConfiguration.setFormData(configMap);
 
-        AmazonS3 connection = pluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        S3Connection connection =
+                pluginExecutor.datasourceCreate(datasourceConfiguration).block();
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                connection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertFalse(result.getIsExecutionSuccess());
-                    String message = (String) result.getBody();
-                    assertTrue(message.contains("The AWS Access Key Id you provided does not exist in " +
-                            "our records"));
-                    assertEquals(AppsmithPluginError.PLUGIN_ERROR.getTitle(), result.getTitle());
+                    String message = result.getPluginErrorDetails().getDownstreamErrorMessage();
+                    assertTrue(
+                            message.contains("The AWS Access Key Id you provided does not exist in " + "our records"));
+                    assertEquals(S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED.getTitle(), result.getTitle());
                 })
                 .verifyComplete();
     }
@@ -441,32 +494,29 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "erroneousBody";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, CREATE_DATATYPE, "YES");
-        setValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
+        setDataValueSafelyInFormData(configMap, BODY, "erroneousBody");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "YES");
+        setDataValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
 
         actionConfiguration.setFormData(configMap);
 
-        AmazonS3 connection = pluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        S3Connection connection =
+                pluginExecutor.datasourceCreate(datasourceConfiguration).block();
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                connection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertFalse(result.getIsExecutionSuccess());
                     String message = (String) result.getBody();
-                    assertTrue(message.contains("Unable to parse content"));
+                    assertTrue(message.contains("Unrecognized token 'erroneousBody': was expecting "
+                            + "(JSON String, Number, Array, Object or token 'null', 'true' or 'false')\n"
+                            + " at [Source: (String)\"erroneousBody\"; line: 1, column: 14]"));
                     assertEquals(AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR.getTitle(), result.getTitle());
 
                     /*
@@ -474,14 +524,17 @@ public class AmazonS3PluginTest {
                      * - The other two RequestParamDTO attributes - label and type are null at this point.
                      */
                     List<RequestParamDTO> expectedRequestParams = new ArrayList<>();
-                    expectedRequestParams.add(new RequestParamDTO("command",
-                            "UPLOAD_FILE_FROM_BODY", null, null, null)); // Action
-                    expectedRequestParams.add(new RequestParamDTO("bucket", "bucket_name",
-                            null, null, null)); // Bucket name
-                    expectedRequestParams.add(new RequestParamDTO(ACTION_CONFIGURATION_PATH, dummyPath, null, null, null)); // Path
-                    expectedRequestParams.add(new RequestParamDTO("create.dataType", "Base64", null,
-                            null, null)); // File data type
-                    assertEquals(result.getRequest().getRequestParams().toString(), expectedRequestParams.toString());
+                    expectedRequestParams.add(
+                            new RequestParamDTO(COMMAND, "UPLOAD_FILE_FROM_BODY", null, null, null)); // Action
+                    expectedRequestParams.add(
+                            new RequestParamDTO(BUCKET, "bucket_name", null, null, null)); // Bucket name
+                    expectedRequestParams.add(
+                            new RequestParamDTO(ACTION_CONFIGURATION_PATH, "path", null, null, null)); // Path
+                    expectedRequestParams.add(
+                            new RequestParamDTO(CREATE_DATATYPE, "Base64", null, null, null)); // File data type
+                    assertEquals(
+                            expectedRequestParams.toString(),
+                            result.getRequest().getRequestParams().toString());
                 })
                 .verifyComplete();
     }
@@ -493,32 +546,29 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "{\"data\": \"dummyBody;\"}";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, CREATE_DATATYPE, "YES");
-        setValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
+        setDataValueSafelyInFormData(configMap, BODY, "{\"data\": \"dummyBody;\"}");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "YES");
+        setDataValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
 
         actionConfiguration.setFormData(configMap);
 
-        AmazonS3 connection = pluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        S3Connection connection =
+                pluginExecutor.datasourceCreate(datasourceConfiguration).block();
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                connection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertFalse(result.getIsExecutionSuccess());
                     String message = (String) result.getBody();
-                    assertTrue(message.contains("File content is not base64 encoded"));
+                    assertTrue(message.contains(
+                            "File content is not base64 encoded. " + "File content needs to be base64 encoded when the "
+                                    + "'File data type: Base64/Text' field is selected 'Yes'."));
                     assertEquals(AppsmithPluginError.PLUGIN_EXECUTE_ARGUMENT_ERROR.getTitle(), result.getTitle());
 
                     /*
@@ -526,14 +576,17 @@ public class AmazonS3PluginTest {
                      * - The other two RequestParamDTO attributes - label and type are null at this point.
                      */
                     List<RequestParamDTO> expectedRequestParams = new ArrayList<>();
-                    expectedRequestParams.add(new RequestParamDTO("command",
-                            "UPLOAD_FILE_FROM_BODY", null, null, null)); // Action
-                    expectedRequestParams.add(new RequestParamDTO("bucket", "bucket_name",
-                            null, null, null)); // Bucket name
-                    expectedRequestParams.add(new RequestParamDTO(ACTION_CONFIGURATION_PATH, dummyPath, null, null, null)); // Path
-                    expectedRequestParams.add(new RequestParamDTO("create.dataType", "Base64", null,
-                            null, null)); // File data type
-                    assertEquals(result.getRequest().getRequestParams().toString(), expectedRequestParams.toString());
+                    expectedRequestParams.add(
+                            new RequestParamDTO(COMMAND, "UPLOAD_FILE_FROM_BODY", null, null, null)); // Action
+                    expectedRequestParams.add(
+                            new RequestParamDTO(BUCKET, "bucket_name", null, null, null)); // Bucket name
+                    expectedRequestParams.add(
+                            new RequestParamDTO(ACTION_CONFIGURATION_PATH, "path", null, null, null)); // Path
+                    expectedRequestParams.add(
+                            new RequestParamDTO(CREATE_DATATYPE, "Base64", null, null, null)); // File data type
+                    assertEquals(
+                            expectedRequestParams.toString(),
+                            result.getRequest().getRequestParams().toString());
                 })
                 .verifyComplete();
     }
@@ -551,34 +604,29 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "UPLOAD_MULTIPLE_FILES_FROM_BODY");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
-        setValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_MULTIPLE_FILES_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
+        setDataValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
 
         actionConfiguration.setFormData(configMap);
 
-        AmazonS3 connection = pluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        S3Connection connection =
+                pluginExecutor.datasourceCreate(datasourceConfiguration).block();
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                connection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertFalse(result.getIsExecutionSuccess());
-                    String message = (String) result.getBody();
-                    assertTrue(message.contains("The AWS Access Key Id you provided does not exist in " +
-                            "our records"));
-                    assertEquals(AppsmithPluginError.PLUGIN_ERROR.getTitle(), result.getTitle());
+                    String message = result.getPluginErrorDetails().getDownstreamErrorMessage();
+                    assertTrue(
+                            message.contains("The AWS Access Key Id you provided does not exist in " + "our records"));
+                    assertEquals(S3PluginError.AMAZON_S3_QUERY_EXECUTION_FAILED.getTitle(), result.getTitle());
                 })
                 .verifyComplete();
     }
@@ -590,33 +638,26 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "READ_FILE");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, READ_USING_BASE64_ENCODING, "NO");
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "READ_FILE");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, READ_DATATYPE, "NO");
 
         actionConfiguration.setFormData(configMap);
 
-        S3Object mockS3Object = mock(S3Object.class);
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        when(mockConnection.getObject(anyString(), anyString())).thenReturn(mockS3Object);
-
         String dummyContent = "Hello World !!!\n";
-        InputStream dummyInputStream = new ByteArrayInputStream(dummyContent.getBytes());
-        S3ObjectInputStream dummyS3ObjectInputStream = new S3ObjectInputStream(dummyInputStream, null);
-        when(mockS3Object.getObjectContent()).thenReturn(dummyS3ObjectInputStream);
+        S3Client mockClient = mock(S3Client.class);
+        when(mockClient.getObjectAsBytes(any(GetObjectRequest.class)))
+                .thenReturn(
+                        ResponseBytes.fromByteArray(GetObjectResponse.builder().build(), dummyContent.getBytes()));
+        S3Connection mockConnection = mock(S3Connection.class);
+        when(mockConnection.client()).thenReturn(mockClient);
 
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
@@ -634,53 +675,48 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "READ_FILE");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, READ_USING_BASE64_ENCODING, "YES");
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "READ_FILE");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, READ_DATATYPE, "YES");
 
         actionConfiguration.setFormData(configMap);
 
-        S3Object mockS3Object = mock(S3Object.class);
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        when(mockConnection.getObject(anyString(), anyString())).thenReturn(mockS3Object);
-
         String dummyContent = "Hello World !!!\n";
-        InputStream dummyInputStream = new ByteArrayInputStream(dummyContent.getBytes());
-        S3ObjectInputStream dummyS3ObjectInputStream = new S3ObjectInputStream(dummyInputStream, null);
-        when(mockS3Object.getObjectContent()).thenReturn(dummyS3ObjectInputStream);
+        S3Client mockClient = mock(S3Client.class);
+        when(mockClient.getObjectAsBytes(any(GetObjectRequest.class)))
+                .thenReturn(
+                        ResponseBytes.fromByteArray(GetObjectResponse.builder().build(), dummyContent.getBytes()));
+        S3Connection mockConnection = mock(S3Connection.class);
+        when(mockConnection.client()).thenReturn(mockClient);
 
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertTrue(result.getIsExecutionSuccess());
                     Map<String, Object> body = (Map<String, Object>) result.getBody();
-                    assertEquals(new String(Base64.encode(dummyContent.getBytes())), body.get("fileData"));
+                    assertEquals(new String(Base64.getEncoder().encode(dummyContent.getBytes())), body.get("fileData"));
 
                     /*
                      * - RequestParamDTO object only have attributes configProperty and value at this point.
                      * - The other two RequestParamDTO attributes - label and type are null at this point.
                      */
                     List<RequestParamDTO> expectedRequestParams = new ArrayList<>();
-                    expectedRequestParams.add(new RequestParamDTO("command", "READ_FILE",
-                            null, null, null)); // Action
-                    expectedRequestParams.add(new RequestParamDTO("bucket", "bucket_name",
-                            null, null, null)); // Bucket name
-                    expectedRequestParams.add(new RequestParamDTO(ACTION_CONFIGURATION_PATH, dummyPath, null, null, null)); // Path
-                    expectedRequestParams.add(new RequestParamDTO("read.usingBase64Encoding", "YES", null,
-                            null, null)); // Base64 encode file
-                    assertEquals(result.getRequest().getRequestParams().toString(), expectedRequestParams.toString());
+                    expectedRequestParams.add(new RequestParamDTO(COMMAND, "READ_FILE", null, null, null)); // Action
+                    expectedRequestParams.add(
+                            new RequestParamDTO(BUCKET, "bucket_name", null, null, null)); // Bucket name
+                    expectedRequestParams.add(
+                            new RequestParamDTO(ACTION_CONFIGURATION_PATH, "path", null, null, null)); // Path
+                    expectedRequestParams.add(
+                            new RequestParamDTO(READ_DATATYPE, "YES", null, null, null)); // Base64 encode file
+                    assertEquals(
+                            expectedRequestParams.toString(),
+                            result.getRequest().getRequestParams().toString());
                 })
                 .verifyComplete();
     }
@@ -692,26 +728,23 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "DELETE_FILE");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "DELETE_FILE");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
 
         actionConfiguration.setFormData(configMap);
 
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        doNothing().when(mockConnection).deleteObject(anyString(), anyString());
+        S3Client mockClient = mock(S3Client.class);
+        when(mockClient.deleteObject(any(DeleteObjectRequest.class)))
+                .thenReturn(DeleteObjectResponse.builder().build());
+        S3Connection mockConnection = mock(S3Connection.class);
+        when(mockConnection.client()).thenReturn(mockClient);
 
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertTrue(result.getIsExecutionSuccess());
@@ -724,13 +757,14 @@ public class AmazonS3PluginTest {
                      * - The other two RequestParamDTO attributes - label and type are null at this point.
                      */
                     List<RequestParamDTO> expectedRequestParams = new ArrayList<>();
-                    expectedRequestParams.add(new RequestParamDTO("command", "DELETE_FILE",
-                            null, null, null)); // Action
-                    expectedRequestParams.add(new RequestParamDTO("bucket", "bucket_name",
-                            null, null, null)); // Bucket name
-                    expectedRequestParams.add(new RequestParamDTO(ACTION_CONFIGURATION_PATH, dummyPath, null, null, null)); // Path
-                    assertEquals(result.getRequest().getRequestParams().toString(),
-                            expectedRequestParams.toString());
+                    expectedRequestParams.add(new RequestParamDTO(COMMAND, "DELETE_FILE", null, null, null)); // Action
+                    expectedRequestParams.add(
+                            new RequestParamDTO(BUCKET, "bucket_name", null, null, null)); // Bucket name
+                    expectedRequestParams.add(
+                            new RequestParamDTO(ACTION_CONFIGURATION_PATH, "path", null, null, null)); // Path
+                    assertEquals(
+                            expectedRequestParams.toString(),
+                            result.getRequest().getRequestParams().toString());
                 })
                 .verifyComplete();
     }
@@ -742,57 +776,32 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "LIST");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, LIST_PREFIX, "Hel");
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "LIST");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, LIST_PREFIX, "Hel");
 
         actionConfiguration.setFormData(configMap);
 
-        ObjectListing mockObjectListing = mock(ObjectListing.class);
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        when(mockConnection.listObjects(anyString(), anyString())).thenReturn(mockObjectListing);
-
-        S3ObjectSummary mockS3ObjectSummary = mock(S3ObjectSummary.class);
-        List<S3ObjectSummary> mockS3ObjectSummaryList = new ArrayList<>();
-        mockS3ObjectSummaryList.add(mockS3ObjectSummary);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
-
         String dummyKey1 = "file_path_with_matching_prefix_1";
         String dummyKey2 = "file_path_with_matching_prefix_2";
-        when(mockS3ObjectSummary.getKey()).thenReturn(dummyKey1).thenReturn(dummyKey2);
-
-        when(mockObjectListing.isTruncated()).thenReturn(true).thenReturn(false);
-        when(mockConnection.listNextBatchOfObjects(mockObjectListing)).thenReturn(mockObjectListing);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
+        S3Connection mockConnection = mockConnectionListingOneKeyPerPage(dummyKey1, dummyKey2);
 
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertTrue(result.getIsExecutionSuccess());
 
-                    ArrayList<Map<String, String>> node = (ArrayList<Map<String, String>>) result.getBody();
+                    ArrayNode node = (ArrayNode) result.getBody();
                     ArrayList<String> resultFilenamesArray = new ArrayList<>();
-                    resultFilenamesArray.add(node.get(0).get("fileName"));
-                    resultFilenamesArray.add(node.get(1).get("fileName"));
-                    assertArrayEquals(
-                            new String[]{
-                                    dummyKey1,
-                                    dummyKey2
-                            },
-                            resultFilenamesArray.toArray()
-                    );
+                    resultFilenamesArray.add(node.get(0).get("fileName").asText());
+                    resultFilenamesArray.add(node.get(1).get("fileName").asText());
+                    assertArrayEquals(new String[] {dummyKey1, dummyKey2}, resultFilenamesArray.toArray());
                 })
                 .verifyComplete();
     }
@@ -804,74 +813,46 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "LIST");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, LIST_SIGNED_URL, "NO");
-        setValueSafelyInFormData(configMap, LIST_UNSIGNED_URL, "YES");
-        setValueSafelyInFormData(configMap, LIST_PREFIX, "");
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "LIST");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, LIST_SIGNED_URL, "NO");
+        setDataValueSafelyInFormData(configMap, LIST_UNSIGNED_URL, "YES");
+        setDataValueSafelyInFormData(configMap, LIST_PREFIX, "");
 
         actionConfiguration.setFormData(configMap);
 
-        ObjectListing mockObjectListing = mock(ObjectListing.class);
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        when(mockConnection.listObjects(anyString(), anyString())).thenReturn(mockObjectListing);
-
-        S3ObjectSummary mockS3ObjectSummary = mock(S3ObjectSummary.class);
-        List<S3ObjectSummary> mockS3ObjectSummaryList = new ArrayList<>();
-        mockS3ObjectSummaryList.add(mockS3ObjectSummary);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
-
         String dummyKey1 = "file_path_1";
         String dummyKey2 = "file_path_2";
-        when(mockS3ObjectSummary.getKey()).thenReturn(dummyKey1).thenReturn(dummyKey2);
-
-        when(mockObjectListing.isTruncated()).thenReturn(true).thenReturn(false);
-        when(mockConnection.listNextBatchOfObjects(mockObjectListing)).thenReturn(mockObjectListing);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
+        S3Connection mockConnection = mockConnectionListingOneKeyPerPage(dummyKey1, dummyKey2);
 
         URL dummyUrl1 = new URL("http", "dummy_url_1", "");
         URL dummyUrl2 = new URL("http", "dummy_url_1", "");
-        when(mockConnection.getUrl(anyString(), anyString())).thenReturn(dummyUrl1).thenReturn(dummyUrl2);
+        when(mockConnection.unsignedUrl(anyString(), anyString()))
+                .thenReturn(dummyUrl1.toString())
+                .thenReturn(dummyUrl2.toString());
 
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertTrue(result.getIsExecutionSuccess());
 
-                    ArrayList<Map<String, String>> node = (ArrayList<Map<String, String>>) result.getBody();
+                    ArrayNode node = (ArrayNode) result.getBody();
                     ArrayList<String> resultFilenamesArray = new ArrayList<>();
-                    resultFilenamesArray.add(node.get(0).get("fileName"));
-                    resultFilenamesArray.add(node.get(1).get("fileName"));
-                    assertArrayEquals(
-                            new String[]{
-                                    dummyKey1,
-                                    dummyKey2
-                            },
-                            resultFilenamesArray.toArray()
-                    );
+                    resultFilenamesArray.add(node.get(0).get("fileName").asText());
+                    resultFilenamesArray.add(node.get(1).get("fileName").asText());
+                    assertArrayEquals(new String[] {dummyKey1, dummyKey2}, resultFilenamesArray.toArray());
 
                     ArrayList<String> resultUrlArray = new ArrayList<>();
-                    resultUrlArray.add(node.get(0).get("url"));
-                    resultUrlArray.add(node.get(1).get("url"));
+                    resultUrlArray.add(node.get(0).get("url").asText());
+                    resultUrlArray.add(node.get(1).get("url").asText());
                     assertArrayEquals(
-                            new String[]{
-                                    dummyUrl1.toString(),
-                                    dummyUrl2.toString()
-                            },
-                            resultUrlArray.toArray()
-                    );
+                            new String[] {dummyUrl1.toString(), dummyUrl2.toString()}, resultUrlArray.toArray());
                 })
                 .verifyComplete();
     }
@@ -883,74 +864,45 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "LIST");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, LIST_SIGNED_URL, "YES");
-        setValueSafelyInFormData(configMap, LIST_EXPIRY, "1000");
-        setValueSafelyInFormData(configMap, LIST_PREFIX, "");
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "LIST");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, LIST_SIGNED_URL, "YES");
+        setDataValueSafelyInFormData(configMap, LIST_EXPIRY, "1000");
+        setDataValueSafelyInFormData(configMap, LIST_PREFIX, "");
 
         actionConfiguration.setFormData(configMap);
 
-        ObjectListing mockObjectListing = mock(ObjectListing.class);
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        when(mockConnection.listObjects(anyString(), anyString())).thenReturn(mockObjectListing);
-
-        S3ObjectSummary mockS3ObjectSummary = mock(S3ObjectSummary.class);
-        List<S3ObjectSummary> mockS3ObjectSummaryList = new ArrayList<>();
-        mockS3ObjectSummaryList.add(mockS3ObjectSummary);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
-
         String dummyKey1 = "file_path_1";
         String dummyKey2 = "file_path_2";
-        when(mockS3ObjectSummary.getKey()).thenReturn(dummyKey1).thenReturn(dummyKey2);
-
-        when(mockObjectListing.isTruncated()).thenReturn(true).thenReturn(false);
-        when(mockConnection.listNextBatchOfObjects(mockObjectListing)).thenReturn(mockObjectListing);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
+        S3Connection mockConnection = mockConnectionListingOneKeyPerPage(dummyKey1, dummyKey2);
 
         URL dummyUrl1 = new URL("http", "dummy_url_1", "");
         URL dummyUrl2 = new URL("http", "dummy_url_1", "");
-        when(mockConnection.generatePresignedUrl(any())).thenReturn(dummyUrl1).thenReturn(dummyUrl2);
+        when(mockConnection.presignedGetUrls(anyString(), any(), any()))
+                .thenReturn(List.of(dummyUrl1.toString(), dummyUrl2.toString()));
 
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertTrue(result.getIsExecutionSuccess());
 
-                    ArrayList<Map<String, String>> node = (ArrayList<Map<String, String>>) result.getBody();
+                    ArrayNode node = (ArrayNode) result.getBody();
                     ArrayList<String> resultFilenamesArray = new ArrayList<>();
-                    resultFilenamesArray.add(node.get(0).get("fileName"));
-                    resultFilenamesArray.add(node.get(1).get("fileName"));
-                    assertArrayEquals(
-                            new String[]{
-                                    dummyKey1,
-                                    dummyKey2
-                            },
-                            resultFilenamesArray.toArray()
-                    );
+                    resultFilenamesArray.add(node.get(0).get("fileName").asText());
+                    resultFilenamesArray.add(node.get(1).get("fileName").asText());
+                    assertArrayEquals(new String[] {dummyKey1, dummyKey2}, resultFilenamesArray.toArray());
 
                     ArrayList<String> resultUrlArray = new ArrayList<>();
-                    resultUrlArray.add(node.get(0).get("signedUrl"));
-                    resultUrlArray.add(node.get(1).get("signedUrl"));
+                    resultUrlArray.add(node.get(0).get("signedUrl").asText());
+                    resultUrlArray.add(node.get(1).get("signedUrl").asText());
                     assertArrayEquals(
-                            new String[]{
-                                    dummyUrl1.toString(),
-                                    dummyUrl2.toString()
-                            },
-                            resultUrlArray.toArray()
-                    );
+                            new String[] {dummyUrl1.toString(), dummyUrl2.toString()}, resultUrlArray.toArray());
 
                     assertNotNull(node.get(0).get("urlExpiryDate"));
                     assertNotNull(node.get(1).get("urlExpiryDate"));
@@ -965,73 +917,44 @@ public class AmazonS3PluginTest {
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
 
         ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
-
-        String dummyPath = "path";
-        actionConfiguration.setPath(dummyPath);
 
         Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "LIST");
-        setValueSafelyInFormData(configMap, BUCKET, "bucket_name");
-        setValueSafelyInFormData(configMap, LIST_SIGNED_URL, "YES");
-        setValueSafelyInFormData(configMap, LIST_PREFIX, "");
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "LIST");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, LIST_SIGNED_URL, "YES");
+        setDataValueSafelyInFormData(configMap, LIST_PREFIX, "");
 
         actionConfiguration.setFormData(configMap);
 
-        ObjectListing mockObjectListing = mock(ObjectListing.class);
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        when(mockConnection.listObjects(anyString(), anyString())).thenReturn(mockObjectListing);
-
-        S3ObjectSummary mockS3ObjectSummary = mock(S3ObjectSummary.class);
-        List<S3ObjectSummary> mockS3ObjectSummaryList = new ArrayList<>();
-        mockS3ObjectSummaryList.add(mockS3ObjectSummary);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
-
         String dummyKey1 = "file_path_1";
         String dummyKey2 = "file_path_2";
-        when(mockS3ObjectSummary.getKey()).thenReturn(dummyKey1).thenReturn(dummyKey2);
-
-        when(mockObjectListing.isTruncated()).thenReturn(true).thenReturn(false);
-        when(mockConnection.listNextBatchOfObjects(mockObjectListing)).thenReturn(mockObjectListing);
-        when(mockObjectListing.getObjectSummaries()).thenReturn(mockS3ObjectSummaryList);
+        S3Connection mockConnection = mockConnectionListingOneKeyPerPage(dummyKey1, dummyKey2);
 
         URL dummyUrl1 = new URL("http", "dummy_url_1", "");
         URL dummyUrl2 = new URL("http", "dummy_url_1", "");
-        when(mockConnection.generatePresignedUrl(any())).thenReturn(dummyUrl1).thenReturn(dummyUrl2);
+        when(mockConnection.presignedGetUrls(anyString(), any(), any()))
+                .thenReturn(List.of(dummyUrl1.toString(), dummyUrl2.toString()));
 
         Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
 
         StepVerifier.create(resultMono)
                 .assertNext(result -> {
                     assertTrue(result.getIsExecutionSuccess());
 
-                    ArrayList<Map<String, String>> node = (ArrayList<Map<String, String>>) result.getBody();
+                    ArrayNode node = (ArrayNode) result.getBody();
                     ArrayList<String> resultFilenamesArray = new ArrayList<>();
-                    resultFilenamesArray.add(node.get(0).get("fileName"));
-                    resultFilenamesArray.add(node.get(1).get("fileName"));
-                    assertArrayEquals(
-                            new String[]{
-                                    dummyKey1,
-                                    dummyKey2
-                            },
-                            resultFilenamesArray.toArray()
-                    );
+                    resultFilenamesArray.add(node.get(0).get("fileName").asText());
+                    resultFilenamesArray.add(node.get(1).get("fileName").asText());
+                    assertArrayEquals(new String[] {dummyKey1, dummyKey2}, resultFilenamesArray.toArray());
 
                     ArrayList<String> resultUrlArray = new ArrayList<>();
-                    resultUrlArray.add(node.get(0).get("signedUrl"));
-                    resultUrlArray.add(node.get(1).get("signedUrl"));
+                    resultUrlArray.add(node.get(0).get("signedUrl").asText());
+                    resultUrlArray.add(node.get(1).get("signedUrl").asText());
                     assertArrayEquals(
-                            new String[]{
-                                    dummyUrl1.toString(),
-                                    dummyUrl2.toString()
-                            },
-                            resultUrlArray.toArray()
-                    );
+                            new String[] {dummyUrl1.toString(), dummyUrl2.toString()}, resultUrlArray.toArray());
 
                     assertNotNull(node.get(0).get("urlExpiryDate"));
                     assertNotNull(node.get(1).get("urlExpiryDate"));
@@ -1041,68 +964,175 @@ public class AmazonS3PluginTest {
                      * - The other two RequestParamDTO attributes - label and type are null at this point.
                      */
                     List<RequestParamDTO> expectedRequestParams = new ArrayList<>();
-                    expectedRequestParams.add(new RequestParamDTO("command", "LIST", null
-                            , null, null)); // Action
-                    expectedRequestParams.add(new RequestParamDTO("bucket", "bucket_name",
-                            null, null, null)); // Bucket name
-                    expectedRequestParams.add(new RequestParamDTO("list.prefix", "", null,
-                            null, null)); // Prefix
-                    expectedRequestParams.add(new RequestParamDTO("list.signedUrl", "YES", null,
-                            null, null)); // Generate signed URL
-                    expectedRequestParams.add(new RequestParamDTO("list.expiry", "5", null,
-                            null, null)); // Expiry duration
-                    expectedRequestParams.add(new RequestParamDTO("list.unSignedUrl", "NO", null,
-                            null, null)); // Generate Un-signed URL
-                    assertEquals(result.getRequest().getRequestParams().toString(),
-                            expectedRequestParams.toString());
+                    expectedRequestParams.add(new RequestParamDTO(COMMAND, "LIST", null, null, null)); // Action
+                    expectedRequestParams.add(
+                            new RequestParamDTO(BUCKET, "bucket_name", null, null, null)); // Bucket name
+                    expectedRequestParams.add(new RequestParamDTO(LIST_PREFIX, "", null, null, null)); // Prefix
+                    expectedRequestParams.add(
+                            new RequestParamDTO(LIST_SIGNED_URL, "YES", null, null, null)); // Generate signed URL
+                    expectedRequestParams.add(
+                            new RequestParamDTO(LIST_EXPIRY, "5", null, null, null)); // Expiry duration
+                    expectedRequestParams.add(
+                            new RequestParamDTO(LIST_UNSIGNED_URL, "NO", null, null, null)); // Generate unsigned URL
+                    assertEquals(
+                            expectedRequestParams.toString(),
+                            result.getRequest().getRequestParams().toString());
                 })
                 .verifyComplete();
     }
 
     @Test
-    public void testListBuckets() {
+    public void testGetStructure() {
         DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
-        ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
         AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
-        Bucket mockS3Bucket = mock(Bucket.class);
-        mockS3Bucket.setName("dummy_bucket");
 
-        ActionConfiguration actionConfiguration = new ActionConfiguration();
-        String dummyBody = "";
-        actionConfiguration.setBody(dummyBody);
+        Bucket mockS3Bucket1 = Bucket.builder().name("dummy_bucket_1").build();
 
-        Map<String, Object> configMap = new HashMap<>();
-        setValueSafelyInFormData(configMap, COMMAND, "LIST_BUCKETS");
+        S3Client mockClient = mock(S3Client.class);
+        when(mockClient.listBuckets())
+                .thenReturn(ListBucketsResponse.builder().buckets(mockS3Bucket1).build());
+        S3Connection mockConnection = mock(S3Connection.class);
+        when(mockConnection.client()).thenReturn(mockClient);
 
-        actionConfiguration.setFormData(configMap);
+        StepVerifier.create(pluginExecutor.getStructure(mockConnection, datasourceConfiguration))
+                .assertNext(datasourceStructure -> {
+                    String expectedBucketName = "dummy_bucket_1";
+                    assertEquals(
+                            expectedBucketName,
+                            datasourceStructure.getTables().get(0).getName());
 
-        AmazonS3 mockConnection = mock(AmazonS3.class);
-        when(mockConnection.listBuckets()).thenReturn(List.of(mockS3Bucket));
+                    List<Template> templates =
+                            datasourceStructure.getTables().get(0).getTemplates();
 
-        Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
-                mockConnection,
-                executeActionDTO,
-                datasourceConfiguration,
-                actionConfiguration);
-        StepVerifier.create(resultMono)
-                .assertNext(result -> {
-                    assertTrue(result.getIsExecutionSuccess());
+                    // Check list files template
+                    Template listFilesTemplate = templates.get(0);
+                    assertEquals(LIST_FILES_TEMPLATE_NAME, listFilesTemplate.getTitle());
 
-                    Map<String, List<String>> node = (Map<String, List<String>>) result.getBody();
-                    List<String> buckets = node.get("bucketList");
-                    assertTrue(buckets.size() == 1);
-                    assertEquals(buckets.get(0), mockS3Bucket.getName());
-                    /*
-                     * - RequestParamDTO object only have attributes configProperty and value at this point.
-                     */
-                    List<RequestParamDTO> expectedRequestParams = new ArrayList<>();
-                    expectedRequestParams.add(new RequestParamDTO("command", "LIST_BUCKETS",
-                            null, null, null)); // Action
-                    expectedRequestParams.add(new RequestParamDTO("bucket", null,
-                            null, null, null)); // Bucket name
-                    assertEquals(result.getRequest().getRequestParams().toString(), expectedRequestParams.toString());
+                    Map<String, Object> listFilesConfig = (Map<String, Object>) listFilesTemplate.getConfiguration();
+                    assertEquals(
+                            AmazonS3Action.LIST.name(),
+                            PluginUtils.getDataValueSafelyFromFormData(listFilesConfig, COMMAND, STRING_TYPE));
+                    assertEquals(
+                            expectedBucketName,
+                            PluginUtils.getDataValueSafelyFromFormData(listFilesConfig, BUCKET, STRING_TYPE));
+                    assertEquals(
+                            NO,
+                            PluginUtils.getDataValueSafelyFromFormData(listFilesConfig, LIST_SIGNED_URL, STRING_TYPE));
+                    assertEquals(
+                            YES,
+                            PluginUtils.getDataValueSafelyFromFormData(
+                                    listFilesConfig, LIST_UNSIGNED_URL, STRING_TYPE));
+                    assertEquals(
+                            Map.of("condition", "AND"),
+                            PluginUtils.getDataValueSafelyFromFormData(
+                                    listFilesConfig, LIST_WHERE, new TypeReference<HashMap<String, Object>>() {}));
+
+                    // Check read file template
+                    Template readFileTemplate = templates.get(1);
+                    assertEquals(READ_FILE_TEMPLATE_NAME, readFileTemplate.getTitle());
+
+                    Map<String, Object> readFileConfig = (Map<String, Object>) readFileTemplate.getConfiguration();
+                    assertEquals(
+                            DEFAULT_FILE_NAME,
+                            PluginUtils.getDataValueSafelyFromFormData(readFileConfig, PATH, STRING_TYPE));
+                    assertEquals(
+                            AmazonS3Action.READ_FILE.name(),
+                            PluginUtils.getDataValueSafelyFromFormData(readFileConfig, COMMAND, STRING_TYPE));
+                    assertEquals(
+                            expectedBucketName,
+                            PluginUtils.getDataValueSafelyFromFormData(readFileConfig, BUCKET, STRING_TYPE));
+                    assertEquals(
+                            YES,
+                            PluginUtils.getDataValueSafelyFromFormData(readFileConfig, READ_DATATYPE, STRING_TYPE));
+                    assertEquals(
+                            DEFAULT_URL_EXPIRY_IN_MINUTES,
+                            PluginUtils.getDataValueSafelyFromFormData(readFileConfig, READ_EXPIRY, STRING_TYPE));
+
+                    // Check create file template
+                    Template createFileTemplate = templates.get(2);
+                    assertEquals(CREATE_FILE_TEMPLATE_NAME, createFileTemplate.getTitle());
+
+                    Map<String, Object> createFileConfig = (Map<String, Object>) createFileTemplate.getConfiguration();
+                    assertEquals(
+                            DEFAULT_FILE_NAME,
+                            PluginUtils.getDataValueSafelyFromFormData(createFileConfig, PATH, STRING_TYPE));
+                    assertEquals(
+                            FILE_PICKER_DATA_EXPRESSION,
+                            PluginUtils.getDataValueSafelyFromFormData(createFileConfig, BODY, STRING_TYPE));
+                    assertEquals(
+                            AmazonS3Action.UPLOAD_FILE_FROM_BODY.name(),
+                            PluginUtils.getDataValueSafelyFromFormData(createFileConfig, COMMAND, STRING_TYPE));
+                    assertEquals(
+                            expectedBucketName,
+                            PluginUtils.getDataValueSafelyFromFormData(createFileConfig, BUCKET, STRING_TYPE));
+                    assertEquals(
+                            YES,
+                            PluginUtils.getDataValueSafelyFromFormData(createFileConfig, CREATE_DATATYPE, STRING_TYPE));
+                    assertEquals(
+                            DEFAULT_URL_EXPIRY_IN_MINUTES,
+                            PluginUtils.getDataValueSafelyFromFormData(createFileConfig, CREATE_EXPIRY, STRING_TYPE));
+
+                    // Check create multiple files template
+                    Template createMultipleFilesTemplate = templates.get(3);
+                    assertEquals(CREATE_MULTIPLE_FILES_TEMPLATE_NAME, createMultipleFilesTemplate.getTitle());
+
+                    Map<String, Object> createMultipleFilesConfig =
+                            (Map<String, Object>) createMultipleFilesTemplate.getConfiguration();
+                    assertEquals(
+                            DEFAULT_DIR,
+                            PluginUtils.getDataValueSafelyFromFormData(createMultipleFilesConfig, PATH, STRING_TYPE));
+                    assertEquals(
+                            FILE_PICKER_MULTIPLE_FILES_DATA_EXPRESSION,
+                            PluginUtils.getDataValueSafelyFromFormData(createMultipleFilesConfig, BODY, STRING_TYPE));
+                    assertEquals(
+                            AmazonS3Action.UPLOAD_MULTIPLE_FILES_FROM_BODY.name(),
+                            PluginUtils.getDataValueSafelyFromFormData(
+                                    createMultipleFilesConfig, COMMAND, STRING_TYPE));
+                    assertEquals(
+                            expectedBucketName,
+                            PluginUtils.getDataValueSafelyFromFormData(createMultipleFilesConfig, BUCKET, STRING_TYPE));
+                    assertEquals(
+                            YES,
+                            PluginUtils.getDataValueSafelyFromFormData(
+                                    createMultipleFilesConfig, CREATE_DATATYPE, STRING_TYPE));
+                    assertEquals(
+                            DEFAULT_URL_EXPIRY_IN_MINUTES,
+                            PluginUtils.getDataValueSafelyFromFormData(
+                                    createMultipleFilesConfig, CREATE_EXPIRY, STRING_TYPE));
+
+                    // Check delete file template
+                    Template deleteFileTemplate = templates.get(4);
+                    assertEquals(DELETE_FILE_TEMPLATE_NAME, deleteFileTemplate.getTitle());
+
+                    Map<String, Object> deleteFileConfig = (Map<String, Object>) deleteFileTemplate.getConfiguration();
+                    assertEquals(
+                            DEFAULT_FILE_NAME,
+                            PluginUtils.getDataValueSafelyFromFormData(deleteFileConfig, PATH, STRING_TYPE));
+                    assertEquals(
+                            AmazonS3Action.DELETE_FILE.name(),
+                            PluginUtils.getDataValueSafelyFromFormData(deleteFileConfig, COMMAND, STRING_TYPE));
+                    assertEquals(
+                            expectedBucketName,
+                            PluginUtils.getDataValueSafelyFromFormData(deleteFileConfig, BUCKET, STRING_TYPE));
+
+                    // Check delete multiple files template
+                    Template deleteMultipleFilesTemplate = templates.get(5);
+                    assertEquals(DELETE_MULTIPLE_FILES_TEMPLATE_NAME, deleteMultipleFilesTemplate.getTitle());
+
+                    Map<String, Object> deleteMultipleFilesConfig =
+                            (Map<String, Object>) deleteMultipleFilesTemplate.getConfiguration();
+                    assertEquals(
+                            LIST_OF_FILES_STRING,
+                            PluginUtils.getDataValueSafelyFromFormData(deleteMultipleFilesConfig, PATH, STRING_TYPE));
+                    assertEquals(
+                            AmazonS3Action.DELETE_MULTIPLE_FILES.name(),
+                            PluginUtils.getDataValueSafelyFromFormData(
+                                    deleteMultipleFilesConfig, COMMAND, STRING_TYPE));
+                    assertEquals(
+                            expectedBucketName,
+                            PluginUtils.getDataValueSafelyFromFormData(deleteMultipleFilesConfig, BUCKET, STRING_TYPE));
                 })
-            .verifyComplete();
+                .verifyComplete();
     }
 
     @Test
@@ -1113,29 +1143,33 @@ public class AmazonS3PluginTest {
         datasourceConfiguration.getProperties().get(1).setValue("upcloud");
         datasourceConfiguration.getEndpoints().get(0).setHost("appsmith-test-storage-2.de-fra1.upcloudobjects.com");
 
-        AmazonS3ClientBuilder s3ClientBuilder = getS3ClientBuilder(datasourceConfiguration);
-        assertEquals("de-fra1", s3ClientBuilder.getEndpoint().getSigningRegion());
+        assertEquals(
+                "de-fra1",
+                getS3ConnectionSettings(datasourceConfiguration).region().id());
 
         // Test for Wasabi
         datasourceConfiguration.getProperties().get(1).setValue("wasabi");
         datasourceConfiguration.getEndpoints().get(0).setHost("s3.ap-northeast-1.wasabisys.com");
 
-        s3ClientBuilder = getS3ClientBuilder(datasourceConfiguration);
-        assertEquals("ap-northeast-1", s3ClientBuilder.getEndpoint().getSigningRegion());
+        assertEquals(
+                "ap-northeast-1",
+                getS3ConnectionSettings(datasourceConfiguration).region().id());
 
-        // Test for Digital Ocean Spaces
+        // Test for Digital Ocean spaces
         datasourceConfiguration.getProperties().get(1).setValue("digital-ocean-spaces");
         datasourceConfiguration.getEndpoints().get(0).setHost("fra1.digitaloceanspaces.com");
 
-        s3ClientBuilder = getS3ClientBuilder(datasourceConfiguration);
-        assertEquals("fra1", s3ClientBuilder.getEndpoint().getSigningRegion());
+        assertEquals(
+                "fra1",
+                getS3ConnectionSettings(datasourceConfiguration).region().id());
 
         // Test for Dream Objects
         datasourceConfiguration.getProperties().get(1).setValue("dream-objects");
         datasourceConfiguration.getEndpoints().get(0).setHost("objects-us-east-1.dream.io");
 
-        s3ClientBuilder = getS3ClientBuilder(datasourceConfiguration);
-        assertEquals("us-east-1", s3ClientBuilder.getEndpoint().getSigningRegion());
+        assertEquals(
+                "us-east-1",
+                getS3ConnectionSettings(datasourceConfiguration).region().id());
     }
 
     @Test
@@ -1146,12 +1180,439 @@ public class AmazonS3PluginTest {
         datasourceConfiguration.getProperties().get(1).setValue("upcloud");
         datasourceConfiguration.getEndpoints().get(0).setHost("appsmith-test-storage-2..de-fra1.upcloudobjects.com");
 
-        StepVerifier.create(Mono.fromCallable(() -> getS3ClientBuilder(datasourceConfiguration)))
+        StepVerifier.create(Mono.fromCallable(() -> getS3ConnectionSettings(datasourceConfiguration)))
                 .expectErrorSatisfies(error -> {
-                    String expectedErrorMessage = "Your S3 endpoint URL seems to be incorrect for the selected S3 " +
-                            "service provider. Please check your endpoint URL and the selected S3 service provider.";
+                    String expectedErrorMessage = "Your S3 endpoint URL seems to be incorrect for the selected S3 "
+                            + "service provider. Please check your endpoint URL and the selected S3 service provider.";
                     assertEquals(expectedErrorMessage, error.getMessage());
                 })
                 .verify();
+    }
+
+    @Test
+    public void testDeleteMultipleFiles() {
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+        ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
+        AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
+
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+
+        String dummyPath = "[\"image1.png\", \"image2.png\"]";
+
+        Map<String, Object> configMap = new HashMap<>();
+        setDataValueSafelyInFormData(configMap, BODY, "[{\"data\": \"plain text\"}, {\"data\": \"plain text2\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, dummyPath);
+        setDataValueSafelyInFormData(configMap, COMMAND, "DELETE_MULTIPLE_FILES");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+
+        actionConfiguration.setFormData(configMap);
+
+        S3Client mockClient = mock(S3Client.class);
+        when(mockClient.deleteObjects(any(DeleteObjectsRequest.class)))
+                .thenReturn(DeleteObjectsResponse.builder().build());
+        S3Connection mockConnection = mock(S3Connection.class);
+        when(mockConnection.client()).thenReturn(mockClient);
+
+        Mono<ActionExecutionResult> resultMono = pluginExecutor.executeParameterized(
+                mockConnection, executeActionDTO, datasourceConfiguration, actionConfiguration);
+        StepVerifier.create(resultMono)
+                .assertNext(result -> {
+                    assertTrue(result.getIsExecutionSuccess());
+
+                    Map<String, String> node = (Map<String, String>) result.getBody();
+                    assertEquals("All files deleted successfully", node.get("status"));
+
+                    /*
+                     * - RequestParamDTO object only have attributes configProperty and value at this point.
+                     * - The other two RequestParamDTO attributes - label and type are null at this point.
+                     */
+                    List<RequestParamDTO> expectedRequestParams = new ArrayList<>();
+                    expectedRequestParams.add(
+                            new RequestParamDTO(COMMAND, "DELETE_MULTIPLE_FILES", null, null, null)); // Action
+                    expectedRequestParams.add(
+                            new RequestParamDTO(BUCKET, "bucket_name", null, null, null)); // Bucket name
+                    expectedRequestParams.add(
+                            new RequestParamDTO(ACTION_CONFIGURATION_PATH, dummyPath, null, null, null)); // Path
+                    assertEquals(
+                            expectedRequestParams.toString(),
+                            result.getRequest().getRequestParams().toString());
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    public void testExecuteCommonForAmazonS3Exception()
+            throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
+
+        String errorMessage = "The requested range is not valid for the request. Try another range.";
+        String errorCode = "InvalidRange";
+        AwsServiceException amazonS3Exception = S3Exception.builder()
+                .message(errorMessage)
+                .awsErrorDetails(AwsErrorDetails.builder()
+                        .errorCode(errorCode)
+                        .errorMessage(errorMessage)
+                        .build())
+                .build();
+
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+        AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
+        S3Connection mockConnection = Mockito.mock(S3Connection.class);
+        Method executeCommon = AmazonS3Plugin.S3PluginExecutor.class.getDeclaredMethod(
+                "executeCommon", S3Connection.class, DatasourceConfiguration.class, ActionConfiguration.class);
+        executeCommon.setAccessible(true);
+
+        ActionConfiguration mockAction = Mockito.mock(ActionConfiguration.class);
+        when(mockAction.getFormData()).thenThrow(amazonS3Exception);
+        Mono<ActionExecutionResult> invoke = (Mono<ActionExecutionResult>)
+                executeCommon.invoke(pluginExecutor, mockConnection, datasourceConfiguration, mockAction);
+        ActionExecutionResult actionExecutionResult = invoke.block();
+        assertEquals(actionExecutionResult.getReadableError(), errorCode + ": " + errorMessage);
+    }
+
+    @Test
+    public void testExecuteCommonForIllegalStateException()
+            throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
+
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+        ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
+        ActionConfiguration mockActionConfiguration = mock(ActionConfiguration.class);
+        Mockito.when(mockActionConfiguration.getFormData()).thenCallRealMethod().thenThrow(new IllegalStateException());
+        Mono<AmazonS3Plugin.S3PluginExecutor> pluginExecutorMono = Mono.just(new AmazonS3Plugin.S3PluginExecutor());
+        Mono<ActionExecutionResult> resultMono = pluginExecutorMono.flatMap(executor -> {
+            return executor.executeParameterized(
+                    null, executeActionDTO, datasourceConfiguration, mockActionConfiguration);
+        });
+
+        StepVerifier.create(resultMono).verifyError(StaleConnectionException.class);
+    }
+
+    @Test
+    public void testExecuteCommonForAmazonServiceException()
+            throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
+        String errorMessage = "The version ID specified in the request does not match an existing version.";
+        String errorCode = "NoSuchVersion";
+        AwsServiceException amazonServiceException = AwsServiceException.builder()
+                .message(errorMessage)
+                .awsErrorDetails(AwsErrorDetails.builder()
+                        .errorCode(errorCode)
+                        .errorMessage(errorMessage)
+                        .build())
+                .build();
+
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+        AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
+        S3Connection mockConnection = Mockito.mock(S3Connection.class);
+        Method executeCommon = AmazonS3Plugin.S3PluginExecutor.class.getDeclaredMethod(
+                "executeCommon", S3Connection.class, DatasourceConfiguration.class, ActionConfiguration.class);
+        executeCommon.setAccessible(true);
+
+        ActionConfiguration mockAction = Mockito.mock(ActionConfiguration.class);
+        when(mockAction.getFormData()).thenThrow(amazonServiceException);
+        Mono<ActionExecutionResult> invoke = (Mono<ActionExecutionResult>)
+                executeCommon.invoke(pluginExecutor, mockConnection, datasourceConfiguration, mockAction);
+        ActionExecutionResult actionExecutionResult = invoke.block();
+        assertEquals(actionExecutionResult.getReadableError(), errorCode + ": " + errorMessage);
+    }
+
+    @Test
+    public void uploadsSingleFileWithFilePicker() throws InterruptedException {
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+        ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
+        AmazonS3Plugin.S3PluginExecutor spyS3PluginExecutor = spy(AmazonS3Plugin.S3PluginExecutor.class);
+
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+
+        Map<String, Object> configMap = new HashMap<>();
+        setDataValueSafelyInFormData(
+                configMap,
+                BODY,
+                "{\n" + "\t\"type\":\"text/plain\",\n"
+                        + "\t\"data\": \"data:text/plain;base64,SGVsbG8gV29ybGQhCg==\"\n"
+                        + "}");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "YES");
+        setDataValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
+
+        actionConfiguration.setFormData(configMap);
+
+        S3Connection connection =
+                spyS3PluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        ArrayList<String> signedURLS = new ArrayList<>();
+        signedURLS.add("https://example.signed.url");
+        doNothing().when(spyS3PluginExecutor).uploadFileInS3(any(), any(), any(), anyString(), anyString());
+        doReturn(signedURLS).when(spyS3PluginExecutor).getSignedUrls(any(), anyString(), any(), any());
+        String unsignedURL = "https://example.unsigned.url";
+        doReturn(unsignedURL).when(spyS3PluginExecutor).createFileUrl(any(), anyString(), anyString());
+        Mono<ActionExecutionResult> resultMono = spyS3PluginExecutor.executeParameterized(
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
+
+        StepVerifier.create(resultMono)
+                .assertNext(result -> {
+                    assertTrue(result.getIsExecutionSuccess());
+                    assertEquals(((HashMap) result.getBody()).get("signedUrl"), signedURLS.get(0));
+                    assertEquals(((HashMap) result.getBody()).get("url"), unsignedURL);
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    public void uploadsMultipleFilesWithFilePicker() throws InterruptedException {
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+        ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
+        AmazonS3Plugin.S3PluginExecutor spyS3PluginExecutor = spy(AmazonS3Plugin.S3PluginExecutor.class);
+
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+
+        Map<String, Object> configMap = new HashMap<>();
+        setDataValueSafelyInFormData(
+                configMap,
+                BODY,
+                "[{\"data\":\"data:application/json;base64,ewogICAgIm1vc3QiOiAic2ltcGxlIgp9Cg==\",\"size\":25,\"dataFormat\":\"Base64\",\"name\":\"testfile.json\",\"id\":\"uppy-testfile/json-1e-application/json-25-1661283894345\",\"type\":\"application/json\"},{\"data\":\"data:text/plain;base64,SGVsbG8gV29ybGQhCg==\",\"size\":13,\"dataFormat\":\"Base64\",\"name\":\"testFile.txt\",\"id\":\"uppy-testfile/txt-1e-text/plain-13-1659676685242\",\"type\":\"text/plain\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_MULTIPLE_FILES_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "YES");
+        setDataValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
+
+        actionConfiguration.setFormData(configMap);
+
+        S3Connection connection =
+                spyS3PluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        ArrayList<String> signedURLS = new ArrayList<>();
+        signedURLS.add("https://example.signed.url1");
+        signedURLS.add("https://example.signed.url2");
+        doNothing().when(spyS3PluginExecutor).uploadFileInS3(any(), any(), any(), anyString(), anyString());
+        doReturn(signedURLS).when(spyS3PluginExecutor).getSignedUrls(any(), anyString(), any(), any());
+        ArrayList<String> unsignedURLS = new ArrayList<>();
+        unsignedURLS.add("https://example.unsigned.url1");
+        unsignedURLS.add("https://example.unsigned.url2");
+        doReturn(unsignedURLS)
+                .when(spyS3PluginExecutor)
+                .createFileUrlsFromBody(any(), anyString(), anyString(), anyString());
+        Mono<ActionExecutionResult> resultMono = spyS3PluginExecutor.executeParameterized(
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
+
+        StepVerifier.create(resultMono)
+                .assertNext(result -> {
+                    assertTrue(result.getIsExecutionSuccess());
+                    ArrayList<String> x = (ArrayList<String>) ((HashMap) result.getBody()).get("signedUrls");
+                    assertEquals(x.size(), signedURLS.size());
+                    assertEquals(x.get(0), signedURLS.get(0));
+                    assertEquals(x.get(1), signedURLS.get(1));
+                    ArrayList<String> urls = (ArrayList<String>) ((HashMap) result.getBody()).get("urls");
+                    assertEquals(urls.size(), unsignedURLS.size());
+                    assertEquals(urls.get(0), unsignedURLS.get(0));
+                    assertEquals(urls.get(1), unsignedURLS.get(1));
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    public void uploadsSingleFileWithoutFilePicker() throws InterruptedException {
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+        ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
+        AmazonS3Plugin.S3PluginExecutor spyS3PluginExecutor = spy(AmazonS3Plugin.S3PluginExecutor.class);
+
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+
+        Map<String, Object> configMap = new HashMap<>();
+        setDataValueSafelyInFormData(
+                configMap,
+                BODY,
+                "{\n" + "   \"type\": \"text/json\",\n"
+                        + "   \"data\": {\"data\":\"{\\n    \\\"most\\\": \\\"simple\\\"\\n}\\n\",\"size\":25,\"dataFormat\":\"Text\",\"name\":\"testfile.json\",\"id\":\"uppy-testfile/json-1e-application/json-25-1661283894345\",\"type\":\"application/json\"}\n"
+                        + "}");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_FILE_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
+        setDataValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
+
+        actionConfiguration.setFormData(configMap);
+
+        S3Connection connection =
+                spyS3PluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        ArrayList<String> signedURLS = new ArrayList<>();
+        signedURLS.add("https://example.signed.url");
+        doNothing().when(spyS3PluginExecutor).uploadFileInS3(any(), any(), any(), anyString(), anyString());
+        doReturn(signedURLS).when(spyS3PluginExecutor).getSignedUrls(any(), anyString(), any(), any());
+        Mono<ActionExecutionResult> resultMono = spyS3PluginExecutor.executeParameterized(
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
+
+        StepVerifier.create(resultMono)
+                .assertNext(result -> {
+                    assertTrue(result.getIsExecutionSuccess());
+                    assertEquals(((HashMap) result.getBody()).get("signedUrl"), signedURLS.get(0));
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    public void uploadsMultipleFilesWithoutFilePicker() throws InterruptedException {
+        DatasourceConfiguration datasourceConfiguration = createDatasourceConfiguration();
+        ExecuteActionDTO executeActionDTO = new ExecuteActionDTO();
+        AmazonS3Plugin.S3PluginExecutor spyS3PluginExecutor = spy(AmazonS3Plugin.S3PluginExecutor.class);
+
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+
+        Map<String, Object> configMap = new HashMap<>();
+        setDataValueSafelyInFormData(
+                configMap,
+                BODY,
+                "[{\"data\":\"data:application/json;base64,ewogICAgIm1vc3QiOiAic2ltcGxlIgp9Cg==\",\"size\":25,\"dataFormat\":\"Base64\",\"name\":\"testfile.json\",\"id\":\"uppy-testfile/json-1e-application/json-25-1661283894345\",\"type\":\"application/json\"},{\"data\":\"data:text/plain;base64,SGVsbG8gV29ybGQhCg==\",\"size\":13,\"dataFormat\":\"Base64\",\"name\":\"testFile.txt\",\"id\":\"uppy-testfile/txt-1e-text/plain-13-1659676685242\",\"type\":\"text/plain\"}]");
+        setDataValueSafelyInFormData(configMap, PATH, "path");
+        setDataValueSafelyInFormData(configMap, COMMAND, "UPLOAD_MULTIPLE_FILES_FROM_BODY");
+        setDataValueSafelyInFormData(configMap, BUCKET, "bucket_name");
+        setDataValueSafelyInFormData(configMap, CREATE_DATATYPE, "NO");
+        setDataValueSafelyInFormData(configMap, CREATE_EXPIRY, "100000");
+
+        actionConfiguration.setFormData(configMap);
+
+        S3Connection connection =
+                spyS3PluginExecutor.datasourceCreate(datasourceConfiguration).block();
+        ArrayList<String> signedURLS = new ArrayList<>();
+        signedURLS.add("https://example.signed.url1");
+        signedURLS.add("https://example.signed.url2");
+        doNothing().when(spyS3PluginExecutor).uploadFileInS3(any(), any(), any(), anyString(), anyString());
+        doReturn(signedURLS).when(spyS3PluginExecutor).getSignedUrls(any(), anyString(), any(), any());
+        Mono<ActionExecutionResult> resultMono = spyS3PluginExecutor.executeParameterized(
+                connection, executeActionDTO, datasourceConfiguration, actionConfiguration);
+
+        StepVerifier.create(resultMono)
+                .assertNext(result -> {
+                    assertTrue(result.getIsExecutionSuccess());
+                    ArrayList<String> x = (ArrayList<String>) ((HashMap) result.getBody()).get("signedUrls");
+                    assertEquals(x.size(), signedURLS.size());
+                    assertEquals(x.get(0), signedURLS.get(0));
+                    assertEquals(x.get(1), signedURLS.get(1));
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    public void verifyUniquenessOfAmazonS3PluginErrorCode() {
+        assert (Arrays.stream(S3PluginError.values())
+                        .map(S3PluginError::getAppErrorCode)
+                        .distinct()
+                        .count()
+                == S3PluginError.values().length);
+
+        assert (Arrays.stream(S3PluginError.values())
+                        .map(S3PluginError::getAppErrorCode)
+                        .filter(appErrorCode -> appErrorCode.length() != 11 || !appErrorCode.startsWith("PE-AS3"))
+                        .collect(Collectors.toList())
+                        .size()
+                == 0);
+    }
+
+    @Test
+    public void verifyTestDatasourcePassOnAccessDeniedError() {
+        AwsServiceException accessDeniedException = S3Exception.builder()
+                .message("access denied")
+                .awsErrorDetails(AwsErrorDetails.builder()
+                        .errorCode("AccessDenied")
+                        .errorMessage("access denied")
+                        .build())
+                .build();
+        S3Client mockClient = mock(S3Client.class);
+        when(mockClient.listBuckets()).thenThrow(accessDeniedException);
+        S3Connection mockConnection = mock(S3Connection.class);
+        when(mockConnection.client()).thenReturn(mockClient);
+
+        AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
+        Mono<DatasourceTestResult> datasourceTestResultMono = pluginExecutor.testDatasource(mockConnection);
+        StepVerifier.create(datasourceTestResultMono)
+                .assertNext(result -> assertEquals(0, result.getInvalids().size()))
+                .verifyComplete();
+    }
+
+    @Test
+    public void verify_sanitizeGenerateCRUDPageTemplateInfo_doesNothing_onEmptyActionConfig() {
+        AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
+        List<ActionConfiguration> actionConfigurationList = new ArrayList<>();
+        Map<String, String> mappedColumnsAndTableName = new HashMap<>();
+        pluginExecutor
+                .sanitizeGenerateCRUDPageTemplateInfo(actionConfigurationList, mappedColumnsAndTableName, "test")
+                .block();
+        assertEquals(0, actionConfigurationList.size());
+        assertEquals(true, isEmpty(mappedColumnsAndTableName));
+    }
+
+    @Test
+    public void verify_sanitizeGenerateCRUDPageTemplateInfo_addsInfoToReplaceTemplateBucket_withUserSelectedBucket() {
+        Map<String, String> mappedColumnsAndTableName = new HashMap<>();
+        String userSelectedBucketName = "userBucket";
+        ActionConfiguration actionConfiguration = new ActionConfiguration();
+        Map<String, Object> formData = new HashMap<>();
+        setDataValueSafelyInFormData(formData, "bucket", "templateBucket");
+        actionConfiguration.setFormData(formData);
+        AmazonS3Plugin.S3PluginExecutor pluginExecutor = new AmazonS3Plugin.S3PluginExecutor();
+        pluginExecutor
+                .sanitizeGenerateCRUDPageTemplateInfo(
+                        List.of(actionConfiguration), mappedColumnsAndTableName, userSelectedBucketName)
+                .block();
+        assertEquals(userSelectedBucketName, mappedColumnsAndTableName.get("templateBucket"));
+    }
+
+    @Test
+    public void testContentMD5CalculationForObjectLock() throws NoSuchAlgorithmException {
+        // Test that MD5 calculation works correctly for Object Lock compliance
+        String testContent = "Hello, World!";
+        byte[] payload = testContent.getBytes();
+
+        // Calculate MD5 hash using the same logic as in uploadFileInS3
+        MessageDigest md5Digest = MessageDigest.getInstance("MD5");
+        byte[] md5Hash = md5Digest.digest(payload);
+        String md5Base64 = java.util.Base64.getEncoder().encodeToString(md5Hash);
+
+        // Verify MD5 calculation is correct
+        assertNotNull(md5Base64);
+        assertTrue(md5Base64.length() > 0);
+
+        // For "Hello, World!" the MD5 hash should be deterministic
+        // Expected MD5 for "Hello, World!" is 65a8e27d8879283831b664bd8b7f0ad4
+        String expectedMd5Hex = "65a8e27d8879283831b664bd8b7f0ad4";
+        String actualMd5Hex = bytesToHex(md5Hash);
+        assertEquals(expectedMd5Hex, actualMd5Hex);
+
+        // Verify base64 encoding
+        String expectedBase64 = java.util.Base64.getEncoder().encodeToString(hexToBytes(expectedMd5Hex));
+        assertEquals(expectedBase64, md5Base64);
+    }
+
+    /** A connection whose bucket lists the first key on a truncated first page and the second key on the next page. */
+    private static S3Connection mockConnectionListingOneKeyPerPage(String firstKey, String secondKey) {
+        S3Client mockClient = mock(S3Client.class);
+        when(mockClient.listObjects(any(ListObjectsRequest.class)))
+                .thenReturn(ListObjectsResponse.builder()
+                        .contents(S3Object.builder().key(firstKey).build())
+                        .isTruncated(true)
+                        .build())
+                .thenReturn(ListObjectsResponse.builder()
+                        .contents(S3Object.builder().key(secondKey).build())
+                        .isTruncated(false)
+                        .build());
+        S3Connection mockConnection = mock(S3Connection.class);
+        when(mockConnection.client()).thenReturn(mockClient);
+        return mockConnection;
+    }
+
+    private String bytesToHex(byte[] bytes) {
+        StringBuilder result = new StringBuilder();
+        for (byte b : bytes) {
+            result.append(String.format("%02x", b));
+        }
+        return result.toString();
+    }
+
+    private byte[] hexToBytes(String hex) {
+        int len = hex.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4) + Character.digit(hex.charAt(i + 1), 16));
+        }
+        return data;
     }
 }

@@ -1,109 +1,99 @@
-import { get, compact } from "lodash";
-import classNames from "classnames";
-import * as Sentry from "@sentry/react";
+import React, {
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+} from "react";
 import { useSelector } from "react-redux";
-import React, { memo, useEffect, useRef, useMemo } from "react";
-
-import PerformanceTracker, {
-  PerformanceTransactionName,
-} from "utils/PerformanceTracker";
 import { getSelectedWidgets } from "selectors/ui";
-import { tailwindLayers } from "constants/Layers";
 import WidgetPropertyPane from "pages/Editor/PropertyPane";
-import { previewModeSelector } from "selectors/editorSelectors";
 import CanvasPropertyPane from "pages/Editor/CanvasPropertyPane";
-import useHorizontalResize from "utils/hooks/useHorizontalResize";
-import { commentModeSelector } from "selectors/commentsSelectors";
-import { getIsDraggingForSelection } from "selectors/canvasSelectors";
 import MultiSelectPropertyPane from "pages/Editor/MultiSelectPropertyPane";
-import { getWidgets } from "sagas/selectors";
+import { getIsDraggingOrResizing } from "selectors/widgetSelectors";
+import { selectedWidgetsPresentInCanvas } from "selectors/propertyPaneSelectors";
+import WalkthroughContext from "components/featureWalkthrough/walkthroughContext";
+import { MAIN_CONTAINER_WIDGET_ID } from "constants/WidgetConstants";
+import { selectCombinedPreviewMode } from "selectors/gitModSelectors";
 
-type Props = {
-  width: number;
-  onDragEnd?: () => void;
-  onWidthChange: (width: number) => void;
-};
+export const PROPERTY_PANE_ID = "t--property-pane-sidebar";
 
-export const PropertyPaneSidebar = memo((props: Props) => {
+export const PropertyPaneSidebar = memo(() => {
   const sidebarRef = useRef<HTMLDivElement>(null);
-  const {
-    onMouseDown,
-    onMouseUp,
-    onTouchStart,
-    resizing,
-  } = useHorizontalResize(
-    sidebarRef,
-    props.onWidthChange,
-    props.onDragEnd,
-    true,
-  );
-  const canvasWidgets = useSelector(getWidgets);
-  const isPreviewMode = useSelector(previewModeSelector);
-  const isCommentMode = useSelector(commentModeSelector);
-  const selectedWidgetIds = useSelector(getSelectedWidgets);
-  const selectedWidgets = useMemo(
-    () =>
-      compact(
-        selectedWidgetIds.map((widgetId) => get(canvasWidgets, widgetId)),
-      ),
-    [canvasWidgets, selectedWidgetIds],
-  );
-  const isDraggingForSelection = useSelector(getIsDraggingForSelection);
+  const prevSelectedWidgetId = useRef<string | undefined>();
+  const isPreviewMode = useSelector(selectCombinedPreviewMode);
 
-  PerformanceTracker.startTracking(PerformanceTransactionName.SIDE_BAR_MOUNT);
-  useEffect(() => {
-    PerformanceTracker.stopTracking();
-  });
+  const selectedWidgetIds = useSelector(getSelectedWidgets);
+  const isDraggingOrResizing = useSelector(getIsDraggingOrResizing);
+  const { isOpened: isWalkthroughOpened, popFeature } =
+    useContext(WalkthroughContext) || {};
+  //while dragging or resizing and
+  //the current selected WidgetId is not equal to previous widget id,
+  //then don't render PropertyPane
+  const shouldNotRenderPane =
+    isPreviewMode ||
+    (isDraggingOrResizing &&
+      selectedWidgetIds[0] !== prevSelectedWidgetId.current) ||
+    selectedWidgetIds[0] === MAIN_CONTAINER_WIDGET_ID;
+
+  const selectedWidgetsLength = useSelector(
+    (state) => selectedWidgetsPresentInCanvas(state).length,
+  );
+
+  prevSelectedWidgetId.current =
+    selectedWidgetIds.length === 1 ? selectedWidgetIds[0] : undefined;
 
   /**
    * renders the property pane:
-   * 1. if no widget is selected -> CanvasPropertyPane
-   * 2. if more than one widget is selected -> MultiWidgetPropertyPane
-   * 3. if user is dragging for selection -> CanvasPropertyPane
-   * 4. if only one widget is selected -> WidgetPropertyPane
+   * 2. if no widget is selected -> CanvasPropertyPane
+   * 3. if more than one widget is selected -> MultiWidgetPropertyPane
+   * 4. if user is dragging for selection -> CanvasPropertyPane
+   * 5. if only one widget is selected -> WidgetPropertyPane
    */
   const propertyPane = useMemo(() => {
     switch (true) {
-      case selectedWidgets.length == 0:
-        return <CanvasPropertyPane />;
-      case selectedWidgets.length > 1:
+      case selectedWidgetsLength > 1:
         return <MultiSelectPropertyPane />;
-      case selectedWidgets.length === 1:
-        return <WidgetPropertyPane />;
+      case selectedWidgetsLength === 1:
+        if (shouldNotRenderPane) return <CanvasPropertyPane />;
+        else return <WidgetPropertyPane />;
+      case selectedWidgetsLength === 0:
+        return <CanvasPropertyPane />;
       default:
         return <CanvasPropertyPane />;
     }
-  }, [selectedWidgets.length, isDraggingForSelection]);
+  }, [selectedWidgetsLength, shouldNotRenderPane]);
+
+  const closeWalkthrough = useCallback(() => {
+    if (popFeature) {
+      popFeature("PROPERTY_PANE");
+      sidebarRef.current?.removeEventListener("click", closeWalkthrough);
+    }
+  }, [popFeature]);
+
+  useEffect(() => {
+    const currentSidebar = sidebarRef.current;
+
+    if (isWalkthroughOpened) {
+      currentSidebar?.addEventListener("click", closeWalkthrough);
+    }
+
+    return () => {
+      currentSidebar?.removeEventListener("click", closeWalkthrough);
+    };
+  }, [closeWalkthrough, isWalkthroughOpened]);
 
   return (
-    <div className="relative">
-      {/* RESIZOR */}
-      <div
-        className={`absolute top-0 left-0 w-2 h-full -ml-2 group  cursor-ew-resize ${tailwindLayers.resizer}`}
-        onMouseDown={onMouseDown}
-        onTouchEnd={onMouseUp}
-        onTouchStart={onTouchStart}
-      >
-        <div
-          className={classNames({
-            "w-1 h-full ml-1 bg-transparent group-hover:bg-gray-300 transform transition": true,
-            "bg-gray-300": resizing,
-          })}
-        />
-      </div>
+    <div className="relative h-full">
       {/* PROPERTY PANE */}
       <div
-        className={classNames({
-          [`js-property-pane-sidebar t--property-pane-sidebar bg-white flex h-full  border-l border-gray-200 transform transition duration-300 ${tailwindLayers.propertyPane}`]: true,
-          "relative ": !isPreviewMode,
-          "fixed translate-x-full right-0": isPreviewMode || isCommentMode,
-        })}
+        className="js-property-pane-sidebar t--property-pane-sidebar flex h-full border-l bg-white"
+        data-testid={PROPERTY_PANE_ID}
+        id={PROPERTY_PANE_ID}
         ref={sidebarRef}
       >
-        <div
-          className="h-full p-0 overflow-y-auto min-w-72 max-w-104"
-          style={{ width: props.width }}
-        >
+        <div className={"h-full p-0 overflow-y-auto min-w-72 max-w-104 w-full"}>
           {propertyPane}
         </div>
       </div>
@@ -113,4 +103,4 @@ export const PropertyPaneSidebar = memo((props: Props) => {
 
 PropertyPaneSidebar.displayName = "PropertyPaneSidebar";
 
-export default Sentry.withProfiler(PropertyPaneSidebar);
+export default PropertyPaneSidebar;

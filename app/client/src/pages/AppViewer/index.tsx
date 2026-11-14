@@ -1,224 +1,316 @@
-import React, { Component } from "react";
+import React, { useEffect } from "react";
 import styled, { ThemeProvider } from "styled-components";
-import { connect } from "react-redux";
-import { withRouter, RouteComponentProps, Route } from "react-router";
-import { Switch } from "react-router-dom";
-import { AppState } from "reducers";
-import {
+import { useDispatch } from "react-redux";
+import type { RouteComponentProps } from "react-router";
+import { withRouter } from "react-router";
+import type { DefaultRootState } from "react-redux";
+import type {
   AppViewerRouteParams,
   BuilderRouteParams,
-  GIT_BRANCH_QUERY_KEY,
-  VIEWER_FORK_PATH,
-  VIEWER_URL,
 } from "constants/routes";
+import { GIT_BRANCH_QUERY_KEY } from "constants/routes";
 import {
-  PageListPayload,
-  ReduxActionTypes,
-} from "constants/ReduxActionConstants";
-import { getIsInitialized } from "selectors/appViewSelectors";
-import { executeTrigger } from "actions/widgetActions";
-import { ExecuteTriggerPayload } from "constants/AppsmithActionConstants/ActionConstants";
-import { updateWidgetPropertyRequest } from "actions/controlActions";
-import { EditorContext } from "components/editorComponents/EditorContextProvider";
+  getIsInitialized,
+  getAppViewHeaderHeight,
+} from "selectors/appViewSelectors";
+import EditorContextProvider from "components/editorComponents/EditorContextProvider";
 import AppViewerPageContainer from "./AppViewerPageContainer";
 import {
-  resetChildrenMetaProperty,
-  updateWidgetMetaProperty,
-} from "actions/metaActions";
-import { editorInitializer } from "utils/EditorUtils";
-import * as Sentry from "@sentry/react";
-import { getViewModePageList } from "selectors/editorSelectors";
-import AddCommentTourComponent from "comments/tour/AddCommentTourComponent";
-import CommentShowCaseCarousel from "comments/CommentsShowcaseCarousel";
+  getBasePageIdFromStaticSlug,
+  getCurrentPageDescription,
+  getIsAutoLayout,
+  getPageList,
+} from "selectors/editorSelectors";
 import { getThemeDetails, ThemeMode } from "selectors/themeSelectors";
-import { Theme } from "constants/DefaultTheme";
-import GlobalHotKeys from "./GlobalHotKeys";
-
 import { getSearchQuery } from "utils/helpers";
-import AppViewerCommentsSidebar from "./AppViewerComemntsSidebar";
+import { getSelectedAppTheme } from "selectors/appThemingSelectors";
+import { useSelector } from "react-redux";
+import BrandingBadge from "./BrandingBadge";
+import { ViewerEditionExtensions } from "ee/pages/AppViewer/ViewerEditionExtensions";
+import { setAppViewHeaderHeight } from "actions/appViewActions";
+import { CANVAS_SELECTOR } from "constants/WidgetConstants";
+import { fetchPublishedPageResources } from "actions/pageActions";
+import usePrevious from "utils/hooks/usePrevious";
+import { getIsBranchUpdated } from "../utils";
+import { APP_MODE } from "entities/App";
+import { initAppViewerAction } from "actions/initActions";
+import { WidgetGlobaStyles } from "globalStyles/WidgetGlobalStyles";
+import useWidgetFocus from "utils/hooks/useWidgetFocus/useWidgetFocus";
+import HtmlTitle from "./AppViewerHtmlTitle";
+import type { ApplicationPayload } from "entities/Application";
+import {
+  getAppThemeSettings,
+  getCurrentApplication,
+} from "ee/selectors/applicationSelectors";
+import {
+  ThemeProvider as WDSThemeProvider,
+  useTheme,
+} from "@appsmith/wds-theming";
+import urlBuilder from "ee/entities/URLRedirect/URLAssembly";
+import { getHideWatermark } from "ee/selectors/organizationSelectors";
+import { getIsAnvilLayout } from "layoutSystems/anvil/integrations/selectors";
+import { getRenderPage } from "selectors/evaluationSelectors";
+import type { ReactNode } from "react";
+import { registerLayoutComponents } from "layoutSystems/anvil/utils/layouts/layoutUtils";
+import { widgetInitialisationSuccess } from "actions/widgetActions";
+import AnalyticsUtil from "ee/utils/AnalyticsUtil";
+import { useWDSThemeProps } from "ee/hooks/useWDSThemeProps";
 
-const SentryRoute = Sentry.withSentryRouting(Route);
-
-const AppViewerBody = styled.section<{ hasPages: boolean }>`
+const AppViewerBody = styled.section<{
+  hasPages: boolean;
+  headerHeight: number;
+  $contain: string;
+}>`
   display: flex;
   flex-direction: row;
   align-items: stretch;
   justify-content: flex-start;
-  height: calc(
-    100vh -
-      ${(props) =>
-        !props.hasPages ? `${props.theme.smallHeaderHeight} - 1px` : "72px"}
-  );
+  height: calc(100dvh - ${({ headerHeight }) => headerHeight}px);
+  --view-mode-header-height: ${({ headerHeight }) => headerHeight}px;
+  contain: ${({ $contain }) => $contain};
 `;
 
-const ContainerWithComments = styled.div`
-  display: flex;
-  width: 100%;
-  height: 100%;
-  background: ${(props) => props.theme.colors.artboard};
-`;
-
-const AppViewerBodyContainer = styled.div<{ width?: string }>`
+const AppViewerBodyContainer = styled.div<{
+  width?: string;
+  backgroundColor: string;
+}>`
   flex: 1;
   overflow: auto;
   margin: 0 auto;
+  background: ${({ backgroundColor }) => backgroundColor};
 `;
 
-export type AppViewerProps = {
-  initializeAppViewer: (params: {
-    applicationId: string;
-    pageId?: string;
-    branch?: string;
-  }) => void;
-  isInitialized: boolean;
-  isInitializeError: boolean;
-  executeAction: (actionPayload: ExecuteTriggerPayload) => void;
-  updateWidgetProperty: (
-    widgetId: string,
-    propertyName: string,
-    propertyValue: any,
-  ) => void;
-  updateWidgetMetaProperty: (
-    widgetId: string,
-    propertyName: string,
-    propertyValue: any,
-  ) => void;
-  resetChildrenMetaProperty: (widgetId: string) => void;
-  pages: PageListPayload;
-  lightTheme: Theme;
-} & RouteComponentProps<BuilderRouteParams>;
+export type AppViewerProps = RouteComponentProps<BuilderRouteParams>;
 
 type Props = AppViewerProps & RouteComponentProps<AppViewerRouteParams>;
 
-class AppViewer extends Component<Props> {
-  public state = {
-    registered: false,
-    isSideNavOpen: true,
-  };
-  componentDidMount() {
-    editorInitializer().then(() => {
-      this.setState({ registered: true });
-    });
+const DEFAULT_FONT_NAME = "System Default";
 
-    const { applicationId, pageId } = this.props.match.params;
-    const {
-      location: { search },
-    } = this.props;
-    const branch = getSearchQuery(search, GIT_BRANCH_QUERY_KEY);
+function WDSThemeProviderWithTheme({ children }: { children: ReactNode }) {
+  const isAnvilLayout = useSelector(getIsAnvilLayout);
+  const themeSetting = useSelector(getAppThemeSettings);
+  const wdsThemeProps = useWDSThemeProps(themeSetting);
+  const { theme } = useTheme(isAnvilLayout ? wdsThemeProps : {});
 
-    if (applicationId) {
-      this.props.initializeAppViewer({
-        branch: branch,
-        applicationId,
-        pageId,
-      });
-    }
-  }
-
-  componentDidUpdate(prevProps: Props) {
-    const { applicationId, pageId } = this.props.match.params;
-    const {
-      location: { search: prevSearch },
-    } = prevProps;
-    const {
-      location: { search },
-    } = this.props;
-
-    const prevBranch = getSearchQuery(prevSearch, GIT_BRANCH_QUERY_KEY);
-    const branch = getSearchQuery(search, GIT_BRANCH_QUERY_KEY);
-
-    if (branch && branch !== prevBranch && applicationId && pageId) {
-      this.props.initializeAppViewer({
-        applicationId,
-        pageId,
-        branch: branch,
-      });
-    }
-  }
-
-  toggleCollapse = (open: boolean) => {
-    this.setState({ isSideNavOpen: open });
-  };
-
-  public render() {
-    const { isInitialized } = this.props;
-    return (
-      <ThemeProvider theme={this.props.lightTheme}>
-        <GlobalHotKeys>
-          <EditorContext.Provider
-            value={{
-              executeAction: this.props.executeAction,
-              updateWidgetMetaProperty: this.props.updateWidgetMetaProperty,
-              resetChildrenMetaProperty: this.props.resetChildrenMetaProperty,
-            }}
-          >
-            <ContainerWithComments>
-              <AppViewerCommentsSidebar />
-              <AppViewerBodyContainer>
-                <AppViewerBody hasPages={this.props.pages.length > 1}>
-                  {isInitialized && this.state.registered && (
-                    <Switch>
-                      <SentryRoute
-                        component={AppViewerPageContainer}
-                        exact
-                        path={VIEWER_URL}
-                      />
-                      <SentryRoute
-                        component={AppViewerPageContainer}
-                        exact
-                        path={VIEWER_FORK_PATH}
-                      />
-                    </Switch>
-                  )}
-                </AppViewerBody>
-              </AppViewerBodyContainer>
-            </ContainerWithComments>
-            <AddCommentTourComponent />
-            <CommentShowCaseCarousel />
-          </EditorContext.Provider>
-        </GlobalHotKeys>
-      </ThemeProvider>
-    );
-  }
+  return <WDSThemeProvider theme={theme}>{children}</WDSThemeProvider>;
 }
 
-const mapStateToProps = (state: AppState) => ({
-  isInitialized: getIsInitialized(state),
-  pages: getViewModePageList(state),
-  lightTheme: getThemeDetails(state, ThemeMode.LIGHT),
-});
+function AppViewer(props: Props) {
+  const dispatch = useDispatch();
+  const { pathname, search } = props.location;
+  const {
+    baseApplicationId,
+    basePageId,
+    staticApplicationSlug,
+    staticPageSlug,
+  } = props.match.params;
+  const isInitialized = useSelector(getIsInitialized);
+  const pages = useSelector(getPageList);
+  const resolvedBasePageIdFromSlug = useSelector((state) =>
+    staticPageSlug
+      ? getBasePageIdFromStaticSlug(state, staticPageSlug)
+      : undefined,
+  );
 
-const mapDispatchToProps = (dispatch: any) => ({
-  executeAction: (actionPayload: ExecuteTriggerPayload) =>
-    dispatch(executeTrigger(actionPayload)),
-  updateWidgetProperty: (
-    widgetId: string,
-    propertyName: string,
-    propertyValue: any,
-  ) =>
-    dispatch(
-      updateWidgetPropertyRequest(widgetId, propertyName, propertyValue),
-    ),
-  updateWidgetMetaProperty: (
-    widgetId: string,
-    propertyName: string,
-    propertyValue: any,
-  ) =>
-    dispatch(updateWidgetMetaProperty(widgetId, propertyName, propertyValue)),
-  resetChildrenMetaProperty: (widgetId: string) =>
-    dispatch(resetChildrenMetaProperty(widgetId)),
-  initializeAppViewer: (params: {
-    applicationId: string;
-    pageId?: string;
-    branch?: string;
-  }) => {
-    dispatch({
-      type: ReduxActionTypes.INITIALIZE_PAGE_VIEWER,
-      payload: params,
-    });
-  },
-});
+  // Resolve basePageId from staticPageSlug if needed
+  const resolvedBasePageId =
+    !basePageId && staticPageSlug ? resolvedBasePageIdFromSlug : basePageId;
 
-export default withRouter(
-  connect(mapStateToProps, mapDispatchToProps)(Sentry.withProfiler(AppViewer)),
-);
+  const selectedTheme = useSelector(getSelectedAppTheme);
+  const lightTheme = useSelector((state: DefaultRootState) =>
+    getThemeDetails(state, ThemeMode.LIGHT),
+  );
+  const headerHeight = useSelector(getAppViewHeaderHeight);
+  const branch = getSearchQuery(search, GIT_BRANCH_QUERY_KEY);
+  const prevValues = usePrevious({
+    branch,
+    location: props.location,
+    basePageId,
+    resolvedBasePageId,
+  });
+  const hideWatermark = useSelector(getHideWatermark);
+  const pageDescription = useSelector(getCurrentPageDescription);
+  const currentApplicationDetails: ApplicationPayload | undefined = useSelector(
+    getCurrentApplication,
+  );
+  const isAnvilLayout = useSelector(getIsAnvilLayout);
+  const renderPage = useSelector(getRenderPage);
+
+  const focusRef = useWidgetFocus();
+  const isAutoLayout = useSelector(getIsAutoLayout);
+
+  /**
+   * initializes the widgets factory and registers all widgets
+   */
+  useEffect(() => {
+    registerLayoutComponents();
+    // we want to intialise only the widgets relevant to the tab within the appViewer page first so that first evaluation is faster
+    dispatch(widgetInitialisationSuccess());
+  }, []);
+  /**
+   * initialize the app if branch, pageId or application is changed
+   */
+  useEffect(() => {
+    const prevBranch = prevValues?.branch;
+    const prevLocation = prevValues?.location;
+    const prevPageBaseId = prevValues?.resolvedBasePageId;
+    let isBranchUpdated = false;
+
+    if (prevBranch && prevLocation) {
+      isBranchUpdated = getIsBranchUpdated(props.location, prevLocation);
+    }
+
+    const isPageIdUpdated = resolvedBasePageId !== prevPageBaseId;
+
+    if (
+      prevBranch &&
+      isBranchUpdated &&
+      (baseApplicationId || resolvedBasePageId)
+    ) {
+      dispatch(
+        initAppViewerAction({
+          baseApplicationId,
+          branch,
+          basePageId: resolvedBasePageId || "",
+          mode: APP_MODE.PUBLISHED,
+          staticApplicationSlug,
+          staticPageSlug,
+        }),
+      );
+    } else {
+      /**
+       * First time load is handled by init sagas
+       * If we don't check for `prevPageId`: fetch page is retriggered
+       * when redirected to the default page
+       */
+      if (prevPageBaseId && resolvedBasePageId && isPageIdUpdated) {
+        const pageId = pages.find(
+          (page) => page.basePageId === resolvedBasePageId,
+        )?.pageId;
+
+        if (pageId) {
+          dispatch(
+            fetchPublishedPageResources({
+              basePageId: resolvedBasePageId,
+              pageId,
+              branch,
+            }),
+          );
+        }
+      }
+    }
+  }, [
+    baseApplicationId,
+    branch,
+    dispatch,
+    pages,
+    prevValues?.resolvedBasePageId,
+    prevValues?.branch,
+    prevValues?.location,
+    props.location,
+    resolvedBasePageId,
+    staticApplicationSlug,
+    staticPageSlug,
+    pathname,
+  ]);
+
+  useEffect(() => {
+    urlBuilder.setCurrentBasePageId(resolvedBasePageId);
+
+    return () => {
+      urlBuilder.setCurrentBasePageId(null);
+    };
+  }, [resolvedBasePageId]);
+
+  // The engine sets PUBLISHED mode on entry; the viewer owns that state for its whole lifetime.
+  // Clear it on unmount so builder telemetry resumes once the user leaves the published app by any
+  // route (back button, logo, "All apps", or direct navigation), not just a single button.
+  useEffect(function clearAnalyticsAppModeOnUnmount() {
+    return () => {
+      AnalyticsUtil.setAppMode(undefined);
+    };
+  }, []);
+
+  useEffect(() => {
+    const header = document.querySelector(".js-appviewer-header");
+
+    dispatch(setAppViewHeaderHeight(header?.clientHeight || 0));
+  }, [pages.length, isInitialized]);
+
+  /**
+   * returns the font to be used for the canvas
+   */
+  const appFontFamily =
+    selectedTheme.properties.fontFamily.appFont === DEFAULT_FONT_NAME
+      ? "inherit"
+      : selectedTheme.properties.fontFamily.appFont;
+
+  /**
+   * loads font for canvas based on theme
+   */
+  useEffect(() => {
+    document.body.style.fontFamily = `${appFontFamily}, sans-serif`;
+
+    return function reset() {
+      document.body.style.fontFamily = "inherit";
+    };
+  }, [selectedTheme.properties.fontFamily.appFont]);
+
+  if (!renderPage) return null;
+
+  const renderChildren = () => {
+    return (
+      <EditorContextProvider renderMode="PAGE">
+        {!isAnvilLayout && (
+          <WidgetGlobaStyles
+            fontFamily={selectedTheme.properties.fontFamily.appFont}
+            primaryColor={selectedTheme.properties.colors.primaryColor}
+          />
+        )}
+        <HtmlTitle
+          description={pageDescription}
+          lang={currentApplicationDetails?.applicationDetail?.htmlLang}
+          name={currentApplicationDetails?.name}
+        />
+        <AppViewerBodyContainer
+          backgroundColor={
+            isAnvilLayout ? "" : selectedTheme.properties.colors.backgroundColor
+          }
+        >
+          <AppViewerBody
+            $contain={isAutoLayout ? "content" : "strict"}
+            className={CANVAS_SELECTOR}
+            hasPages={pages.length > 1}
+            headerHeight={headerHeight}
+            ref={focusRef}
+          >
+            {isInitialized && <AppViewerPageContainer />}
+          </AppViewerBody>
+          {isInitialized && <ViewerEditionExtensions />}
+          <div className={"fixed hidden right-8 z-3 md:flex bottom-4"}>
+            {!hideWatermark && (
+              <a
+                className="hover:no-underline"
+                href="https://appsmith.com"
+                rel="noreferrer"
+                target="_blank"
+              >
+                <BrandingBadge />
+              </a>
+            )}
+          </div>
+        </AppViewerBodyContainer>
+      </EditorContextProvider>
+    );
+  };
+
+  if (isAnvilLayout) {
+    return (
+      <WDSThemeProviderWithTheme>{renderChildren()}</WDSThemeProviderWithTheme>
+    );
+  }
+
+  return <ThemeProvider theme={lightTheme}>{renderChildren()}</ThemeProvider>;
+}
+
+export default withRouter(AppViewer);

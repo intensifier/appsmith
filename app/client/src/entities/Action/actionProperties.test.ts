@@ -1,6 +1,7 @@
-import { Action, PluginType } from "entities/Action/index";
-import { getBindingPathsOfAction } from "entities/Action/actionProperties";
-import { EvaluationSubstitutionType } from "entities/DataTree/dataTreeFactory";
+import type { Action } from "entities/Action";
+import { PluginType } from "entities/Plugin";
+import { getBindingAndReactivePathsOfAction } from "entities/Action/actionProperties";
+import { EvaluationSubstitutionType } from "constants/EvaluationConstants";
 
 const DEFAULT_ACTION: Action = {
   actionConfiguration: {},
@@ -9,25 +10,37 @@ const DEFAULT_ACTION: Action = {
     id: "randomDatasource",
   },
   dynamicBindingPathList: [],
-  executeOnLoad: false,
+  runBehaviour: "MANUAL",
   id: "",
+  baseId: "",
   invalids: [],
   isValid: false,
   jsonPathKeys: [],
   name: "",
-  organizationId: "",
+  workspaceId: "",
+  applicationId: "",
   pageId: "",
   pluginId: "",
+  messages: [],
   pluginType: PluginType.DB,
+  isDirtyMap: {
+    SCHEMA_GENERATION: false,
+  },
 };
 
-describe("getBindingPathsOfAction", () => {
+describe("getReactivePathsOfAction", () => {
   it("returns default list of no config is sent", () => {
-    const response = getBindingPathsOfAction(DEFAULT_ACTION, undefined);
+    const response = getBindingAndReactivePathsOfAction(
+      DEFAULT_ACTION,
+      undefined,
+    ).reactivePaths;
+
     expect(response).toStrictEqual({
       data: EvaluationSubstitutionType.TEMPLATE,
       isLoading: EvaluationSubstitutionType.TEMPLATE,
       config: EvaluationSubstitutionType.TEMPLATE,
+      datasourceUrl: EvaluationSubstitutionType.TEMPLATE,
+      run: EvaluationSubstitutionType.TEMPLATE,
     });
   });
 
@@ -72,10 +85,16 @@ describe("getBindingPathsOfAction", () => {
       },
     };
 
-    const response = getBindingPathsOfAction(basicAction, config);
+    const response = getBindingAndReactivePathsOfAction(
+      basicAction,
+      config,
+    ).reactivePaths;
+
     expect(response).toStrictEqual({
       data: EvaluationSubstitutionType.TEMPLATE,
       isLoading: EvaluationSubstitutionType.TEMPLATE,
+      datasourceUrl: EvaluationSubstitutionType.TEMPLATE,
+      run: EvaluationSubstitutionType.TEMPLATE,
       "config.body": EvaluationSubstitutionType.TEMPLATE,
       "config.body2": EvaluationSubstitutionType.TEMPLATE,
       "config.field1": EvaluationSubstitutionType.SMART_SUBSTITUTE,
@@ -135,12 +154,17 @@ describe("getBindingPathsOfAction", () => {
       },
     };
 
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore
-    const response = getBindingPathsOfAction(basicAction, config);
+    const response = getBindingAndReactivePathsOfAction(
+      // @ts-expect-error: Types are not available
+      basicAction,
+      config,
+    ).reactivePaths;
+
     expect(response).toStrictEqual({
       data: EvaluationSubstitutionType.TEMPLATE,
       isLoading: EvaluationSubstitutionType.TEMPLATE,
+      datasourceUrl: EvaluationSubstitutionType.TEMPLATE,
+      run: EvaluationSubstitutionType.TEMPLATE,
       "config.params[0].key": EvaluationSubstitutionType.TEMPLATE,
       "config.params[0].value": EvaluationSubstitutionType.TEMPLATE,
       "config.params[1].key": EvaluationSubstitutionType.TEMPLATE,
@@ -190,18 +214,23 @@ describe("getBindingPathsOfAction", () => {
       },
     };
 
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore
-    const response = getBindingPathsOfAction(basicAction, config);
+    const response = getBindingAndReactivePathsOfAction(
+      // @ts-expect-error: Types are not available
+      basicAction,
+      config,
+    ).reactivePaths;
+
     expect(response).toStrictEqual({
       data: EvaluationSubstitutionType.TEMPLATE,
       isLoading: EvaluationSubstitutionType.TEMPLATE,
+      datasourceUrl: EvaluationSubstitutionType.TEMPLATE,
+      run: EvaluationSubstitutionType.TEMPLATE,
       "config.key": EvaluationSubstitutionType.TEMPLATE,
       "config.value": EvaluationSubstitutionType.TEMPLATE,
     });
   });
 
-  it("checks for hidden field and returns bindingPaths accordingly", () => {
+  it("checks for hidden field and returns reactivePaths accordingly", () => {
     const config = [
       {
         sectionName: "",
@@ -248,22 +277,97 @@ describe("getBindingPathsOfAction", () => {
       },
     };
 
-    const response = getBindingPathsOfAction(basicAction, config);
+    const response = getBindingAndReactivePathsOfAction(
+      basicAction,
+      config,
+    ).reactivePaths;
+
     expect(response).toStrictEqual({
       data: EvaluationSubstitutionType.TEMPLATE,
       isLoading: EvaluationSubstitutionType.TEMPLATE,
+      datasourceUrl: EvaluationSubstitutionType.TEMPLATE,
+      run: EvaluationSubstitutionType.TEMPLATE,
       "config.body": EvaluationSubstitutionType.TEMPLATE,
       "config.field1": EvaluationSubstitutionType.SMART_SUBSTITUTE,
     });
 
     basicAction.actionConfiguration.template.setting = true;
 
-    const response2 = getBindingPathsOfAction(basicAction, config);
+    const response2 = getBindingAndReactivePathsOfAction(
+      basicAction,
+      config,
+    ).reactivePaths;
+
     expect(response2).toStrictEqual({
       data: EvaluationSubstitutionType.TEMPLATE,
       isLoading: EvaluationSubstitutionType.TEMPLATE,
+      datasourceUrl: EvaluationSubstitutionType.TEMPLATE,
+      run: EvaluationSubstitutionType.TEMPLATE,
       "config.body": EvaluationSubstitutionType.TEMPLATE,
       "config.body2": EvaluationSubstitutionType.TEMPLATE,
+    });
+  });
+
+  it("returns default list of no config is sent", () => {
+    const response = getBindingAndReactivePathsOfAction(
+      DEFAULT_ACTION,
+      undefined,
+    ).bindingPaths;
+
+    expect(response).toStrictEqual({});
+  });
+
+  it("returns correct values for basic config", () => {
+    const config = [
+      {
+        sectionName: "",
+        id: 1,
+        children: [
+          {
+            label: "",
+            configProperty: "actionConfiguration.body",
+            controlType: "QUERY_DYNAMIC_TEXT",
+          },
+          {
+            label: "",
+            configProperty: "actionConfiguration.body2",
+            controlType: "QUERY_DYNAMIC_INPUT_TEXT",
+          },
+          {
+            label: "",
+            configProperty: "actionConfiguration.field1",
+            controlType: "QUERY_DYNAMIC_INPUT_TEXT",
+            evaluationSubstitutionType: "SMART_SUBSTITUTE",
+          },
+          {
+            label: "",
+            configProperty: "actionConfiguration.field2",
+            controlType: "QUERY_DYNAMIC_INPUT_TEXT",
+            evaluationSubstitutionType: "PARAMETER",
+          },
+        ],
+      },
+    ];
+    const basicAction = {
+      ...DEFAULT_ACTION,
+      actionConfiguration: {
+        body: "basic action",
+        body2: "another body",
+        field1: "test",
+        field2: "anotherTest",
+      },
+    };
+
+    const response = getBindingAndReactivePathsOfAction(
+      basicAction,
+      config,
+    ).bindingPaths;
+
+    expect(response).toStrictEqual({
+      "config.body": EvaluationSubstitutionType.TEMPLATE,
+      "config.body2": EvaluationSubstitutionType.TEMPLATE,
+      "config.field1": EvaluationSubstitutionType.SMART_SUBSTITUTE,
+      "config.field2": EvaluationSubstitutionType.PARAMETER,
     });
   });
 });

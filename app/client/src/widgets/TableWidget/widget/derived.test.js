@@ -15,6 +15,7 @@ describe("Validates Derived Properties", () => {
     const expected = [];
 
     let result = getTableColumns(input, moment, _);
+
     expect(result).toStrictEqual(expected);
 
     result = getTableColumns(
@@ -80,6 +81,7 @@ describe("Validates Derived Properties", () => {
     ];
 
     let result = getTableColumns(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
   it("generated columns does not modify primary columns", () => {
@@ -170,6 +172,7 @@ describe("Validates Derived Properties", () => {
     ];
 
     let result = getTableColumns(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -279,6 +282,7 @@ describe("Validates Derived Properties", () => {
     ];
 
     let result = getTableColumns(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
   it("generated columns does not remove derived columns in primary columns", () => {
@@ -405,6 +409,7 @@ describe("Validates Derived Properties", () => {
     ];
 
     let result = getTableColumns(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -548,6 +553,7 @@ describe("Validates Derived Properties", () => {
     ];
 
     let result = getFilteredTableData(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -563,6 +569,7 @@ describe("Validates Derived Properties", () => {
     const expected = [];
 
     let result = getFilteredTableData(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -714,6 +721,7 @@ describe("Validates Derived Properties", () => {
     ];
 
     let result = getFilteredTableData(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -873,6 +881,7 @@ describe("Validates Derived Properties", () => {
     ];
 
     let result = getFilteredTableData(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -1032,6 +1041,7 @@ describe("Validates Derived Properties", () => {
     ];
 
     let result = getFilteredTableData(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
 
@@ -1169,12 +1179,91 @@ describe("Validates Derived Properties", () => {
     const expected = [];
 
     let result = getFilteredTableData(input, moment, _);
+
+    expect(result).toStrictEqual(expected);
+  });
+
+  it("validates generated sanitized table data with valid property keys", () => {
+    const { getSanitizedTableData } = derivedProperty;
+
+    const input = {
+      tableData: [
+        {
+          1: "abc",
+          2: "bcd",
+          3: "cde",
+          Dec: "mon",
+          demo: "3",
+          demo_1: "1",
+          "test one": "1",
+          "test 3 4 9": "4",
+          rowIndex: "0",
+          "😀smile😀": "smile 1",
+          "🙁sad🙁": "sad 1",
+          "@user": "user 1",
+          "@name": "name 1",
+          ÜserÑame: "john",
+        },
+        {
+          1: "asd",
+          2: "dfg",
+          3: "jkl",
+          Dec: "mon2",
+          demo: "2",
+          demo_1: "1",
+          "test one": "2",
+          "test 3 4 9": "3",
+          rowIndex: "1",
+          "😀smile😀": "smile 2",
+          "🙁sad🙁": "sad 2",
+          "@user": "user 2",
+          "@name": "name 2",
+          ÜserÑame: "mike",
+        },
+      ],
+    };
+    const expected = [
+      {
+        _1: "abc",
+        _2: "bcd",
+        _3: "cde",
+        Dec: "mon",
+        demo: "3",
+        demo_1: "1",
+        test_one: "1",
+        test_3_4_9: "4",
+        rowIndex: "0",
+        _smile_: "smile 1",
+        _sad_: "sad 1",
+        _user: "user 1",
+        _name: "name 1",
+        _ser_ame: "john",
+      },
+      {
+        _1: "asd",
+        _2: "dfg",
+        _3: "jkl",
+        Dec: "mon2",
+        demo: "2",
+        demo_1: "1",
+        test_one: "2",
+        test_3_4_9: "3",
+        rowIndex: "1",
+        _smile_: "smile 2",
+        _sad_: "sad 2",
+        _user: "user 2",
+        _name: "name 2",
+        _ser_ame: "mike",
+      },
+    ];
+    let result = getSanitizedTableData(input, moment, _);
+
     expect(result).toStrictEqual(expected);
   });
 });
 
 describe("Validate getSelectedRow function", () => {
-  it("Multple row selection, with selected rows", () => {
+  it("Multiple row selection, with selected rows", () => {
     const { getSelectedRow } = derivedProperty;
     const input = {
       multiRowSelection: true,
@@ -1186,16 +1275,16 @@ describe("Validate getSelectedRow function", () => {
         { id: 123, name: "John Doe", extra: "Extra1", __originalIndex__: 1 },
       ],
     };
+
     expect(getSelectedRow(input, moment, _)).toStrictEqual({
       id: 234,
       name: "Jane Doe",
       extra: "Extra2",
-      __originalIndex__: 2,
     });
   });
 
-  it("Multple row selection, with no selected rows", () => {
-    const { getSelectedRow } = derivedProperty;
+  it("Multiple row selection, with no selected rows", () => {
+    const { getSelectedRows } = derivedProperty;
     const input = {
       multiRowSelection: true,
       selectedRowIndices: [],
@@ -1206,12 +1295,8 @@ describe("Validate getSelectedRow function", () => {
         { id: 123, name: "John Doe", extra: "Extra1", __originalIndex__: 1 },
       ],
     };
-    expect(getSelectedRow(input, moment, _)).toStrictEqual({
-      id: "",
-      name: "",
-      extra: "",
-      __originalIndex__: "",
-    });
+
+    expect(getSelectedRows(input, moment, _)).toStrictEqual([]);
   });
 
   it("Single row selection, with selected row", () => {
@@ -1226,18 +1311,18 @@ describe("Validate getSelectedRow function", () => {
         { id: 123, name: "John Doe", extra: "Extra1", __originalIndex__: 1 },
       ],
     };
+
     expect(getSelectedRow(input, moment, _)).toStrictEqual({
       id: 234,
       name: "Jane Doe",
       extra: "Extra2",
-      __originalIndex__: 2,
     });
   });
 
   it("Single row selection, without selected row", () => {
     const { getSelectedRow } = derivedProperty;
     const input = {
-      multiRowSelection: true,
+      multiRowSelection: false,
       selectedRowIndices: [],
       selectedRowIndex: -1,
       sanitizedTableData: [
@@ -1251,7 +1336,6 @@ describe("Validate getSelectedRow function", () => {
       id: "",
       name: "",
       extra: "",
-      __originalIndex__: "",
     });
   });
 
@@ -1272,7 +1356,6 @@ describe("Validate getSelectedRow function", () => {
       id: "",
       name: "",
       extra: "",
-      __originalIndex__: "",
     });
   });
   it("Single row selection, with indices undefined", () => {
@@ -1292,7 +1375,6 @@ describe("Validate getSelectedRow function", () => {
       id: "",
       name: "",
       extra: "",
-      __originalIndex__: "",
     });
   });
   it("Single row selection, with invalid indices", () => {
@@ -1312,7 +1394,6 @@ describe("Validate getSelectedRow function", () => {
       id: "",
       name: "",
       extra: "",
-      __originalIndex__: "",
     });
   });
   it("Single row selection, with invalid indices", () => {
@@ -1332,7 +1413,6 @@ describe("Validate getSelectedRow function", () => {
       id: "",
       name: "",
       extra: "",
-      __originalIndex__: "",
     });
   });
   it("Single row selection, with invalid indices", () => {
@@ -1352,7 +1432,6 @@ describe("Validate getSelectedRow function", () => {
       id: "",
       name: "",
       extra: "",
-      __originalIndex__: "",
     });
   });
   it("Single row selection, with invalid indices", () => {
@@ -1372,7 +1451,6 @@ describe("Validate getSelectedRow function", () => {
       id: "",
       name: "",
       extra: "",
-      __originalIndex__: "",
     });
   });
   it("Single row selection, with invalid indices", () => {
@@ -1392,7 +1470,26 @@ describe("Validate getSelectedRow function", () => {
       id: "",
       name: "",
       extra: "",
-      __originalIndex__: "",
+    });
+  });
+});
+
+describe("Validate getSelectedRow function", () => {
+  it("Trigger row selection", () => {
+    const { getTriggeredRow } = derivedProperty;
+    const input = {
+      triggeredRowIndex: 0,
+      sanitizedTableData: [
+        { id: 1234, name: "Jim Doe", extra: "", __originalIndex__: 0 },
+        { id: 234, name: "Jane Doe", extra: "Extra2", __originalIndex__: 2 },
+        { id: 123, name: "John Doe", extra: "Extra1", __originalIndex__: 1 },
+      ],
+    };
+
+    expect(getTriggeredRow(input, moment, _)).toStrictEqual({
+      id: 1234,
+      name: "Jim Doe",
+      extra: "",
     });
   });
 });

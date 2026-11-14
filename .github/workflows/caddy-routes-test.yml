@@ -1,0 +1,48 @@
+name: Caddy route tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - release
+    paths:
+      - .github/workflows/caddy-routes-test.yml
+      - deploy/docker/fs/opt/appsmith/**
+      - deploy/docker/route-tests/**
+      - deploy/docker/tests/**
+  pull_request:
+    paths:
+      - .github/workflows/caddy-routes-test.yml
+      - deploy/docker/fs/opt/appsmith/**
+      - deploy/docker/route-tests/**
+      - deploy/docker/tests/**
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test configuration parsing and startup boundaries
+        run: python3 deploy/docker/tests/env-loader-test.py
+
+      - name: Check the shared shell loader
+        run: shellcheck deploy/docker/fs/opt/appsmith/load-env.sh
+
+      - name: Check startup shell syntax
+        run: |
+          bash -n deploy/docker/fs/opt/appsmith/load-env.sh
+          bash -n deploy/docker/fs/opt/appsmith/entrypoint.sh
+          bash -n deploy/docker/fs/opt/appsmith/run-with-env.sh
+
+      - name: docker.env.sh default frame-ancestors is safe
+        run: deploy/docker/tests/docker-env-defaults-test.sh
+
+      - name: caddy rate-limit key is not spoofable (GHSA-qrgm-h8c4-jjf7)
+        run: deploy/docker/tests/caddy-rate-limit-key-test.sh
+
+      - run: deploy/docker/route-tests/run.sh

@@ -1,64 +1,70 @@
+// This file must be executed as early as possible to ensure the preloads are triggered ASAP
+import "./preload-route-chunks";
+// Initialise eval worker instance
+import "utils/workerInstances";
+// Populate the widget loader registry (side effect of importing the barrel).
+// Consumers (EvaluationsSaga, EditorUtils) read loaders from `widgets/registry`,
+// so this import is what registers them on the main thread.
+import "widgets";
+
 import React from "react";
 import "./wdyr";
 import ReactDOM from "react-dom";
 import { Provider } from "react-redux";
 import "./index.css";
-import { ThemeProvider } from "constants/DefaultTheme";
-import { appInitializer } from "utils/AppsmithUtils";
-import { Slide } from "react-toastify";
-import store from "./store";
+import "@appsmith/ads-old/src/themes/default/index.css";
+import "@appsmith/ads/src/__theme__/default/index.css";
+import { ThemeProvider } from "styled-components";
+import { appInitializer } from "utils/AppUtils";
+import store, { runSagaMiddleware } from "./store";
 import { LayersContext, Layers } from "constants/Layers";
-import AppRouter from "./AppRouter";
-import * as Sentry from "@sentry/react";
-import { getCurrentThemeDetails, ThemeMode } from "selectors/themeSelectors";
+import AppRouter from "ee/AppRouter";
+import { getCurrentThemeDetails } from "selectors/themeSelectors";
 import { connect } from "react-redux";
-import { AppState } from "reducers";
-import { setThemeMode } from "actions/themeActions";
-import { StyledToastContainer } from "components/ads/Toast";
-import localStorage from "utils/localStorage";
+import type { DefaultRootState } from "react-redux";
+import { Toast } from "@appsmith/ads";
 import "./assets/styles/index.css";
-import "./polyfills/corejs-add-on";
+import "./polyfills";
+import GlobalStyles from "globalStyles";
 // enable autofreeze only in development
-import { setAutoFreeze } from "immer";
-const shouldAutoFreeze = process.env.NODE_ENV === "development";
-setAutoFreeze(shouldAutoFreeze);
 
 import AppErrorBoundary from "./AppErrorBoundry";
-import GlobalStyles from "globalStyles";
+import log from "loglevel";
+import { FaroErrorBoundary } from "@grafana/faro-react";
+
+runSagaMiddleware();
+
 appInitializer();
+
+(async () => {
+  try {
+    await import(/* webpackChunkName: "instrumentation" */ "./instrumentation");
+  } catch (e) {
+    log.error("Error loading telemetry script", e);
+  }
+})();
 
 function App() {
   return (
-    <Sentry.ErrorBoundary fallback={"An error has occured"}>
+    <FaroErrorBoundary fallback={<div>An error has occured</div>}>
       <Provider store={store}>
         <LayersContext.Provider value={Layers}>
           <ThemedAppWithProps />
         </LayersContext.Provider>
       </Provider>
-    </Sentry.ErrorBoundary>
+    </FaroErrorBoundary>
   );
 }
 
 class ThemedApp extends React.Component<{
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   currentTheme: any;
-  setTheme: (themeMode: ThemeMode) => void;
 }> {
-  componentDidMount() {
-    if (localStorage.getItem("THEME") === "LIGHT") {
-      this.props.setTheme(ThemeMode.LIGHT);
-    }
-  }
   render() {
     return (
       <ThemeProvider theme={this.props.currentTheme}>
-        <StyledToastContainer
-          autoClose={5000}
-          closeButton={false}
-          draggable={false}
-          hideProgressBar
-          pauseOnHover={false}
-          transition={Slide}
-        />
+        <Toast />
         <GlobalStyles />
         <AppErrorBoundary>
           <AppRouter />
@@ -67,23 +73,19 @@ class ThemedApp extends React.Component<{
     );
   }
 }
-const mapStateToProps = (state: AppState) => ({
+const mapStateToProps = (state: DefaultRootState) => ({
   currentTheme: getCurrentThemeDetails(state),
 });
-const mapDispatchToProps = (dispatch: any) => ({
-  setTheme: (mode: ThemeMode) => {
-    dispatch(setThemeMode(mode));
-  },
-});
 
-const ThemedAppWithProps = connect(
-  mapStateToProps,
-  mapDispatchToProps,
-)(ThemedApp);
+const ThemedAppWithProps = connect(mapStateToProps)(ThemedApp);
 
 ReactDOM.render(<App />, document.getElementById("root"));
 
 // expose store when run in Cypress
+// TODO: Fix this the next time the file is edited
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 if ((window as any).Cypress) {
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (window as any).store = store;
 }

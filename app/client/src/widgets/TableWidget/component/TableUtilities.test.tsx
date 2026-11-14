@@ -13,10 +13,13 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.IMAGE,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,
     );
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = ImageCellComponent.props.children.map((imageDiv: any) => {
       return imageDiv.props.children.props.style.backgroundImage
         .slice(4, -1)
@@ -37,10 +40,13 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.IMAGE,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,
     );
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = ImageCellComponent.props.children.map((imageDiv: any) => {
       return imageDiv.props.children.props.style.backgroundImage
         .slice(4, -1)
@@ -63,10 +69,13 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.IMAGE,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,
     );
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = ImageCellComponent.props.children.map((imageDiv: any) => {
       return imageDiv.props.children.props.style.backgroundImage
         .slice(4, -1)
@@ -88,10 +97,13 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.IMAGE,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,
     );
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = ImageCellComponent.props.children.map((imageDiv: any) => {
       return imageDiv.props.children.props.style.backgroundImage
         .slice(4, -1)
@@ -113,13 +125,17 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.IMAGE,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,
     );
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = ImageCellComponent.props.children.map((imageDiv: any) => {
       // check and get img url if exist
       const imageDivProps = imageDiv.props.children.props;
+
       if (imageDivProps) {
         return imageDivProps.style.backgroundImage
           .slice(4, -1)
@@ -139,6 +155,7 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.TEXT,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,
@@ -154,6 +171,7 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.TEXT,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,
@@ -169,6 +187,7 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.NUMBER,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,
@@ -184,6 +203,7 @@ describe("Test table columnType Image render", () => {
       value,
       ColumnTypes.NUMBER,
       false,
+      // @ts-expect-error: other Props are missing
       { isCellVisible: true },
       930,
       true,

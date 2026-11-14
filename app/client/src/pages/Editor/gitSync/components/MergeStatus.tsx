@@ -1,10 +1,7 @@
 import React from "react";
-import styled from "constants/DefaultTheme";
+import styled from "styled-components";
 import StatusLoader from "./StatusLoader";
-import Text, { TextType } from "components/ads/Text";
-import ErrorWarning from "remixicon-react/ErrorWarningLineIcon";
-import CheckLine from "remixicon-react/CheckLineIcon";
-import { Colors } from "constants/Colors";
+import { Icon, Text } from "@appsmith/ads";
 
 const Flex = styled.div`
   display: flex;
@@ -15,12 +12,19 @@ export const MERGE_STATUS_STATE = {
   MERGEABLE: "MERGEABLE",
   NOT_MERGEABLE: "NOT_MERGEABLE",
   NONE: "NONE",
+  ERROR: "ERROR",
 };
 
 const Wrapper = styled.div`
   display: flex;
   flex-direction: row;
   margin-top: ${(props) => `${props.theme.spaces[3]}px`};
+  width: 45%;
+  align-items: flex-start;
+  gap: 5px;
+  .ads-v2-icon {
+    margin-top: 3px;
+  }
 `;
 
 function MergeStatus({
@@ -41,53 +45,30 @@ function MergeStatus({
       return (
         <Flex>
           <Wrapper>
-            <CheckLine color={Colors.GREEN} size={18} />
-            <Text
-              color={Colors.GREEN}
-              style={{ marginLeft: 8, alignSelf: "center" }}
-              type={TextType.P3}
-              weight="600"
-            >
+            <Text color="var(--ads-v2-color-fg-success)" kind="body-m">
               {message}
             </Text>
           </Wrapper>
         </Flex>
       );
     case MERGE_STATUS_STATE.NOT_MERGEABLE:
+    case MERGE_STATUS_STATE.ERROR:
       return (
         <Flex>
           <Wrapper>
-            <ErrorWarning color={Colors.CRIMSON} size={18} />
-            <Text
-              color={Colors.CRIMSON}
-              style={{ marginLeft: 8, alignSelf: "center" }}
-              type={TextType.P3}
-              weight="600"
-            >
+            <Icon
+              color="var(--ads-v2-color-fg-error)"
+              name="alert-line"
+              size="md"
+            />
+            <Text color="var(--ads-v2-color-fg-error)" kind="body-m">
               {message}
             </Text>
           </Wrapper>
         </Flex>
       );
-
-    // case MERGE_STATUS_STATE.NONE:
-    //   return (
-    //     <Flex>
-    //       <Space horizontal size={10} />
-    //       <Wrapper>
-    //         <ErrorWarning size={18} />
-    //         <Text
-    //           style={{ marginLeft: 8, alignSelf: "center" }}
-    //           type={TextType.P3}
-    //         >
-    //           {createMessage(FETCH_MERGE_STATUS_FAILURE)}
-    //         </Text>
-    //       </Wrapper>
-    //     </Flex>
-    //   );
     default:
       return null;
-    // status === MERGE_STATUS_STATE.NONE will execute default case.
   }
 }
 

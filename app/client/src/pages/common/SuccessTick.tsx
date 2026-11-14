@@ -1,6 +1,8 @@
-import { ReactComponent as CheckmarkSvg } from "assets/svg/checkmark.svg";
 import styled from "styled-components";
-import React from "react";
+import React, { type CSSProperties } from "react";
+import { importSvg } from "@appsmith/ads-old";
+
+const CheckmarkSvg = importSvg(async () => import("assets/svg/checkmark.svg"));
 
 const CheckmarkWrapper = styled.div<{ $height: string; $width: string }>`
   height: ${(props) => props.$height};
@@ -15,7 +17,7 @@ const CheckmarkWrapper = styled.div<{ $height: string; $width: string }>`
     stroke-dashoffset: 166;
     stroke-width: 2;
     stroke-miterlimit: 10;
-    stroke: green;
+    stroke: var(--ads-v2-color-fg-success);
     fill: none;
     animation: stroke 0.6s cubic-bezier(0.65, 0, 0.45, 1) forwards;
   }
@@ -26,11 +28,12 @@ const CheckmarkWrapper = styled.div<{ $height: string; $width: string }>`
     border-radius: 50%;
     display: block;
     stroke-width: 2;
-    stroke: green;
+    stroke: var(--ads-v2-color-fg-success);
     stroke-miterlimit: 10;
     margin: 10% auto;
     box-shadow: inset 0px 0px 0px #7ac142;
-    animation: fill 0.4s ease-in-out 0.4s forwards,
+    animation:
+      fill 0.4s ease-in-out 0.4s forwards,
       scale 0.3s ease-in-out 0.9s both;
   }
 
@@ -62,9 +65,17 @@ const CheckmarkWrapper = styled.div<{ $height: string; $width: string }>`
   }
 `;
 
-function SuccessTick(props: { height: string; width: string }) {
+function SuccessTick(props: {
+  height: string;
+  width: string;
+  style?: CSSProperties;
+}) {
   return (
-    <CheckmarkWrapper $height={props.height} $width={props.width}>
+    <CheckmarkWrapper
+      $height={props.height}
+      $width={props.width}
+      style={props.style}
+    >
       <CheckmarkSvg />
     </CheckmarkWrapper>
   );

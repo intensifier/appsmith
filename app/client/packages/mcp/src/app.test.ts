@@ -1,0 +1,13698 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import supertest from "supertest";
+import {
+  AppsmithApiError,
+  LayoutRequestError,
+  STALE_LAYOUT_CODE,
+  MAX_ARTIFACT_BYTES,
+  MCP_BUILD_INFO,
+  READ_PAGES_LAYOUT_CONCURRENCY,
+  REQUEST_TIMEOUT_MS,
+  createAppsmithApi,
+  createMcpHttpServer,
+  hostHeaderName,
+  looksLikeWriteAction,
+  mcpKeyIdPrefix,
+  sessionOriginFromHeaders,
+  writeActionNames,
+  type AppsmithApi,
+} from "./app.js";
+import { INSTRUCTION_DOCS } from "./builder/instructions.js";
+import { compileJsObject } from "./builder/jsObject.js";
+import { markMcpAuthoredBody, mcpAuthoredBody } from "./builder/query.js";
+import {
+  buildRestActionDto,
+  compileRestApi,
+  restApiSpecSchema,
+} from "./builder/restApi.js";
+import { fingerprintDsl } from "./builder/semantic.js";
+import { McpGovernanceCoordinator } from "./governance/coordinator.js";
+import { WIDGET_REMOVAL_MAX } from "./governance/widgetRemoval.js";
+import type {
+  McpChangeRecord,
+  McpGovernanceStore,
+  McpJsDefinitionRecord,
+  PreparedConfirmation,
+} from "./governance/store.js";
+
+const API_BASE_URL = "https://appsmith.example";
+
+function successfulFetch() {
+  return jest.fn<Promise<Response>, [RequestInfo | URL, RequestInit?]>(
+    async () => {
+      return new Response(JSON.stringify({ data: { ok: true } }), {
+        status: 200,
+      });
+    },
+  );
+}
+
+describe("Appsmith API client", () => {
+  it("forwards bearer and correlation headers for read and artifact import requests", async () => {
+    const fetchFn = successfulFetch();
+    const api = createAppsmithApi(
+      "user-token",
+      API_BASE_URL,
+      fetchFn as unknown as typeof fetch,
+      {
+        "X-Appsmith-Request-Id": "internal-request-id",
+        "X-Request-Id": "client-request-id",
+      },
+    );
+
+    await api.listWorkspaces();
+    await api.listApplications("workspace-1");
+    await api.getApplicationContext("application-1", "page-1", "layout-1");
+    await api.importApplicationArtifact("workspace-1", {
+      application: { name: "New application" },
+    });
+    await api.importPartialApplicationArtifact(
+      "workspace-1",
+      "application-1",
+      "page-1",
+      { widgets: {} },
+    );
+
+    expect(fetchFn.mock.calls.map(([url]) => String(url))).toEqual([
+      `${API_BASE_URL}/api/v1/workspaces/home`,
+      `${API_BASE_URL}/api/v1/applications/home?workspaceId=workspace-1`,
+      `${API_BASE_URL}/api/v1/pages?applicationId=application-1`,
+      `${API_BASE_URL}/api/v1/pages/page-1`,
+      `${API_BASE_URL}/api/v1/layouts/layout-1/pages/page-1`,
+      `${API_BASE_URL}/api/v1/applications/import/workspace-1`,
+      `${API_BASE_URL}/api/v1/applications/import/partial/workspace-1/application-1?pageId=page-1`,
+    ]);
+    expect(
+      fetchFn.mock.calls.every(
+        ([, init]) =>
+          new Headers(init?.headers).get("Authorization") ===
+          "Bearer user-token",
+      ),
+    ).toBe(true);
+    // Every upstream call carries the CSRF-exemption header so multipart (import) POSTs aren't denied.
+    expect(
+      fetchFn.mock.calls.every(
+        ([, init]) =>
+          new Headers(init?.headers).get("X-Requested-By") === "Appsmith",
+      ),
+    ).toBe(true);
+    expect(
+      fetchFn.mock.calls.every(
+        ([, init]) =>
+          new Headers(init?.headers).get("X-Appsmith-Request-Id") ===
+            "internal-request-id" &&
+          new Headers(init?.headers).get("X-Request-Id") ===
+            "client-request-id",
+      ),
+    ).toBe(true);
+
+    for (const callIndex of [5, 6]) {
+      const init = fetchFn.mock.calls[callIndex][1];
+      const formData = init?.body as FormData;
+      const file = formData.get("file") as File;
+
+      expect(init?.method).toBe("POST");
+      expect(new Headers(init?.headers).get("Content-Type")).toBeNull();
+      expect(file.name).toBe("appsmith-artifact.json");
+      expect(file.type).toBe("application/json");
+    }
+
+    const fullArtifact = (fetchFn.mock.calls[5][1]?.body as FormData).get(
+      "file",
+    ) as File;
+    const partialArtifact = (fetchFn.mock.calls[6][1]?.body as FormData).get(
+      "file",
+    ) as File;
+
+    await expect(fullArtifact.text()).resolves.toBe(
+      JSON.stringify({ application: { name: "New application" } }),
+    );
+    await expect(partialArtifact.text()).resolves.toBe(
+      JSON.stringify({ widgets: {} }),
+    );
+  });
+
+  it("stamps the internal marker header when APPSMITH_MCP_INTERNAL_SECRET is set", async () => {
+    const previous = process.env.APPSMITH_MCP_INTERNAL_SECRET;
+
+    process.env.APPSMITH_MCP_INTERNAL_SECRET = "internal-marker-secret";
+    try {
+      const fetchFn = successfulFetch();
+      const api = createAppsmithApi(
+        "user-token",
+        API_BASE_URL,
+        fetchFn as unknown as typeof fetch,
+      );
+
+      await api.listWorkspaces();
+
+      expect(
+        new Headers(fetchFn.mock.calls[0][1]?.headers).get(
+          "X-Appsmith-Mcp-Internal",
+        ),
+      ).toBe("internal-marker-secret");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.APPSMITH_MCP_INTERNAL_SECRET;
+      } else {
+        process.env.APPSMITH_MCP_INTERNAL_SECRET = previous;
+      }
+    }
+  });
+
+  it("omits the internal marker header when APPSMITH_MCP_INTERNAL_SECRET is unset", async () => {
+    const previous = process.env.APPSMITH_MCP_INTERNAL_SECRET;
+
+    delete process.env.APPSMITH_MCP_INTERNAL_SECRET;
+    try {
+      const fetchFn = successfulFetch();
+      const api = createAppsmithApi(
+        "user-token",
+        API_BASE_URL,
+        fetchFn as unknown as typeof fetch,
+      );
+
+      await api.listWorkspaces();
+
+      expect(
+        new Headers(fetchFn.mock.calls[0][1]?.headers).has(
+          "X-Appsmith-Mcp-Internal",
+        ),
+      ).toBe(false);
+    } finally {
+      if (previous !== undefined) {
+        process.env.APPSMITH_MCP_INTERNAL_SECRET = previous;
+      }
+    }
+  });
+
+  it("sends exactly the env marker value on a body-carrying request (never a caller-influenced value)", async () => {
+    // Constraint 3: the marker is sourced ONLY from this process's env and is spread LAST in the header object, so no
+    // request body/shape or internal call site can override or inject it. Exercise the multipart/body path (createAction).
+    const previous = process.env.APPSMITH_MCP_INTERNAL_SECRET;
+
+    process.env.APPSMITH_MCP_INTERNAL_SECRET = "env-only-secret";
+    try {
+      const fetchFn = successfulFetch();
+      const api = createAppsmithApi(
+        "user-token",
+        API_BASE_URL,
+        fetchFn as unknown as typeof fetch,
+      );
+
+      await api.createAction({ name: "q1", pageId: "p1" });
+
+      expect(
+        new Headers(fetchFn.mock.calls[0][1]?.headers).get(
+          "X-Appsmith-Mcp-Internal",
+        ),
+      ).toBe("env-only-secret");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.APPSMITH_MCP_INTERNAL_SECRET;
+      } else {
+        process.env.APPSMITH_MCP_INTERNAL_SECRET = previous;
+      }
+    }
+  });
+
+  it("getAction fetches by applicationId and selects the action by id (no GET /actions/{id})", async () => {
+    const fetchFn = jest.fn<
+      Promise<Response>,
+      [RequestInfo | URL, RequestInit?]
+    >(async () =>
+      Response.json({
+        responseMeta: { success: true },
+        data: [
+          { id: "other", name: "Other" },
+          { id: "act1", name: "Target" },
+        ],
+      }),
+    );
+    const api = createAppsmithApi(
+      "user-token",
+      API_BASE_URL,
+      fetchFn as unknown as typeof fetch,
+    );
+
+    const action = (await api.getAction("app1", "act1")) as { name: string };
+
+    // It lists the application's actions (the single-action GET does not exist) and filters by id.
+    expect(String(fetchFn.mock.calls[0][0])).toBe(
+      `${API_BASE_URL}/api/v1/actions?applicationId=app1`,
+    );
+    expect(action.name).toBe("Target");
+  });
+
+  it("getAction throws a clear error when the action is not in the application", async () => {
+    const fetchFn = jest.fn<
+      Promise<Response>,
+      [RequestInfo | URL, RequestInit?]
+    >(async () =>
+      Response.json({
+        responseMeta: { success: true },
+        data: [{ id: "other" }],
+      }),
+    );
+    const api = createAppsmithApi(
+      "user-token",
+      API_BASE_URL,
+      fetchFn as unknown as typeof fetch,
+    );
+
+    await expect(api.getAction("app1", "missing")).rejects.toThrow(
+      /action missing was not found in application app1/,
+    );
+  });
+
+  it("surfaces Appsmith API errors without obscuring their status", async () => {
+    const fetchFn = jest.fn<
+      Promise<Response>,
+      [RequestInfo | URL, RequestInit?]
+    >(async () => {
+      return new Response("forbidden", { status: 403 });
+    });
+    const api = createAppsmithApi(
+      "user-token",
+      API_BASE_URL,
+      fetchFn as unknown as typeof fetch,
+    );
+
+    await expect(api.listWorkspaces()).rejects.toThrow(
+      "Appsmith API request failed (403)",
+    );
+  });
+
+  it("APP-16100: page and layout reads carry the Appsmith error code, never the body", async () => {
+    const fetchFn = jest.fn<
+      Promise<Response>,
+      [RequestInfo | URL, RequestInit?]
+    >(async () =>
+      Response.json(
+        {
+          responseMeta: {
+            error: { code: "AE-APP-4000", message: "secret detail" },
+          },
+        },
+        { status: 400 },
+      ),
+    );
+    const api = createAppsmithApi(
+      "user-token",
+      API_BASE_URL,
+      fetchFn as unknown as typeof fetch,
+    );
+
+    const pageError = await api.getPage("p1").catch((error: unknown) => error);
+
+    expect(pageError).toBeInstanceOf(AppsmithApiError);
+    expect(pageError).toMatchObject({ status: 400, errorCode: "AE-APP-4000" });
+    expect(String(pageError)).not.toContain("secret detail");
+    await expect(
+      api.getApplicationContext("a1", "p1", "l1"),
+    ).rejects.toMatchObject({ status: 400, errorCode: "AE-APP-4000" });
+  });
+
+  it("APP-16100: only the layout request's failure is a LayoutRequestError", async () => {
+    // Fail exactly one of getApplicationContext's three parallel reads, by path.
+    const failing = (failPath: RegExp) =>
+      createAppsmithApi("user-token", API_BASE_URL, (async (
+        input: RequestInfo | URL,
+      ) =>
+        failPath.test(String(input))
+          ? Response.json(
+              { responseMeta: { error: { code: "AE-APP-4000" } } },
+              { status: 400 },
+            )
+          : Response.json({
+              responseMeta: { success: true },
+              data: {},
+            })) as unknown as typeof fetch);
+
+    const layoutError = await failing(/\/layouts\//)
+      .getApplicationContext("a1", "p1", "l1")
+      .catch((error: unknown) => error);
+
+    expect(layoutError).toBeInstanceOf(LayoutRequestError);
+    expect(layoutError).toMatchObject({
+      status: 400,
+      errorCode: "AE-APP-4000",
+    });
+
+    // Anchored to the page path, so the layout request (/layouts/l1/pages/p1) still succeeds.
+    const pageError = await failing(/\/api\/v1\/pages\/p1$/)
+      .getApplicationContext("a1", "p1", "l1")
+      .catch((error: unknown) => error);
+
+    expect(pageError).toBeInstanceOf(AppsmithApiError);
+    expect(pageError).not.toBeInstanceOf(LayoutRequestError);
+  });
+
+  it("rejects oversized artifacts before issuing an API request", async () => {
+    const fetchFn = successfulFetch();
+    const api = createAppsmithApi(
+      "user-token",
+      API_BASE_URL,
+      fetchFn as unknown as typeof fetch,
+    );
+
+    await expect(
+      api.importApplicationArtifact("workspace-1", {
+        content: "x".repeat(MAX_ARTIFACT_BYTES),
+      }),
+    ).rejects.toThrow("Artifact must not exceed");
+    await expect(
+      api.importApplicationArtifact(
+        "workspace-1",
+        [] as unknown as Record<string, unknown>,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      api.importApplicationArtifact("workspace-1", {}),
+    ).rejects.toThrow("Artifact must not be empty");
+    await expect(
+      api.importApplicationArtifact("workspace-1", {
+        invalid: new Date(),
+      }),
+    ).rejects.toThrow("Artifact must contain only plain JSON objects");
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
+function createApi(
+  // Typed as the real wrapper (() => Promise<unknown>) so a test can pass a custom profile mock without every
+  // field — the default carries a realistic organizationId so governed audit reads are tenant-scoped.
+  validateToken: AppsmithApi["validateToken"] = jest.fn(async () => ({
+    username: "user@appsmith.com",
+    isAnonymous: false,
+    organizationId: "org-default",
+  })),
+) {
+  return (): AppsmithApi => ({
+    getApplicationContext: jest.fn(),
+    importApplicationArtifact: jest.fn(),
+    importPartialApplicationArtifact: jest.fn(),
+    listApplications: jest.fn(),
+    listWorkspaces: jest.fn(),
+    updateLayout: jest.fn(),
+    listDatasources: jest.fn(),
+    createDatasource: jest.fn(),
+    getDatasourceStructure: jest.fn(),
+    triggerDatasource: jest.fn(),
+    getApplicationPages: jest.fn(async () => ({ workspaceId: "ws1" })),
+    // Default: no layouts, so F3 layoutId surfacing degrades to undefined unless a test overrides it.
+    getPage: jest.fn(async () => ({})),
+    // Default: a non-git application (no gitApplicationMetadata) so layout-edit tests see no git warning and the
+    // M7 branch gate passes without a branch parameter.
+    getApplication: jest.fn(async () => ({})),
+    getGitStatus: jest.fn(async () => ({})),
+    getGitProtectedBranches: jest.fn(async () => []),
+    listGitBranches: jest.fn(async () => []),
+    createGitBranch: jest.fn(async () => ({})),
+    checkoutGitBranch: jest.fn(async () => ({})),
+    commitGitApplication: jest.fn(async () => ({})),
+    listActions: jest.fn(),
+    createAction: jest.fn(),
+    getAction: jest.fn(),
+    updateAction: jest.fn(),
+    deleteAction: jest.fn(),
+    executeAction: jest.fn(),
+    getCurrentTheme: jest.fn(),
+    updateTheme: jest.fn(),
+    createPage: jest.fn(),
+    updatePage: jest.fn(),
+    deletePage: jest.fn(),
+    publishApplication: jest.fn(),
+    listPlugins: jest.fn(),
+    listActionCollections: jest.fn(),
+    createActionCollection: jest.fn(),
+    updateActionCollection: jest.fn(),
+    updateActionCollectionBody: jest.fn(),
+    setActionRunBehaviour: jest.fn(),
+    deleteActionCollection: jest.fn(),
+    validateToken,
+  });
+}
+
+// The Streamable HTTP transport (MCP SDK 1.29+) returns request responses as an
+// SSE stream when the client accepts text/event-stream, so the JSON-RPC payload
+// arrives on a `data:` line rather than as a parsed JSON body. Handle both shapes.
+function parseJsonRpc(response: { body?: unknown; text?: string }): {
+  result: { tools: { name: string }[]; content: { text: string }[] };
+} {
+  const body = response.body as { result?: unknown } | undefined;
+
+  if (body && body.result !== undefined) {
+    return body as {
+      result: { tools: { name: string }[]; content: { text: string }[] };
+    };
+  }
+
+  const dataLine = (response.text ?? "")
+    .split("\n")
+    .find((line) => line.startsWith("data:"));
+
+  if (!dataLine) {
+    throw new Error(`No JSON-RPC payload in response: ${response.text}`);
+  }
+
+  return JSON.parse(dataLine.slice("data:".length).trim());
+}
+
+const initializeRequest = {
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: {
+    protocolVersion: "2025-03-26",
+    capabilities: {},
+    clientInfo: { name: "test-client", version: "1.0.0" },
+  },
+};
+
+describe("MCP HTTP server", () => {
+  it("rejects MCP requests without a bearer token", async () => {
+    const response = await supertest(createMcpHttpServer(API_BASE_URL))
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .send({});
+
+    expect(response.status).toBe(401);
+    expect(response.headers["www-authenticate"]).toBe("Bearer");
+  });
+
+  it("/health carries the build identity (package.json version), unauthenticated", async () => {
+    const response = await supertest(createMcpHttpServer(API_BASE_URL)).get(
+      "/health",
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe("ok");
+    // Read once at startup from package.json — the answer to "which build is this instance running".
+    expect(response.body.version).toBe(MCP_BUILD_INFO.version);
+    expect(response.body.version).toBe(
+      // Independent read so the assertion is not a tautology against the same constant.
+      JSON.parse(readFileSync(resolve(__dirname, "../package.json"), "utf8"))
+        .version,
+    );
+  });
+
+  it("returns a safe response for malformed JSON and oversized requests", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi());
+
+    const malformed = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("Content-Type", "application/json")
+      .send("{not-json");
+    const oversized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("Content-Type", "application/json")
+      .send(`{"content":"${"x".repeat(2 * 1024 * 1024)}"}`);
+
+    expect(malformed).toMatchObject({
+      status: 400,
+      body: { error: "invalid JSON request body" },
+    });
+    expect(oversized).toMatchObject({
+      status: 413,
+      body: { error: "request body too large" },
+    });
+  });
+
+  // M4-T4 adoption telemetry: the structured request event must carry the coarse success/error CLASS and the
+  // gate state, while still never leaking the bearer token, tool arguments, or request bodies.
+  it("emits a request telemetry event with statusClass + gates and no token/args", async () => {
+    const events: Record<string, unknown>[] = [];
+    const stderrSpy = jest
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        const line = typeof chunk === "string" ? chunk : chunk.toString();
+
+        try {
+          events.push(JSON.parse(line));
+        } catch {
+          // Non-JSON writes are irrelevant to this assertion.
+        }
+
+        return true;
+      });
+
+    try {
+      const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+        dataEnabled: true,
+        jsEnabled: true,
+      });
+
+      // A malformed body deterministically yields a 4xx without needing a full session; the telemetry event
+      // is still emitted on response finish.
+      await supertest(server)
+        .post("/mcp")
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", "Bearer mcp_user-secret-token")
+        .set("Content-Type", "application/json")
+        .send("{not-json");
+
+      const requestEvent = events.find(
+        (event) => event.event === "appsmith_mcp_request",
+      );
+
+      expect(requestEvent).toBeDefined();
+      expect(requestEvent).toMatchObject({
+        statusClass: "client_error",
+        gates: "data,js",
+      });
+
+      // Proof no secret/args/body leak: the serialized event must not contain the token secret or request body,
+      // and must expose no argument/body-bearing fields.
+      const serialized = JSON.stringify(requestEvent);
+
+      expect(serialized).not.toContain("user-secret-token");
+      expect(serialized).not.toContain("not-json");
+      expect(requestEvent).not.toHaveProperty("arguments");
+      expect(requestEvent).not.toHaveProperty("args");
+      expect(requestEvent).not.toHaveProperty("body");
+      expect(requestEvent).not.toHaveProperty("params");
+      // The caller's identity is only ever recorded as a hash, never in plaintext.
+      expect(requestEvent).not.toHaveProperty("username");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  // The telemetry event must correlate per user WITHOUT logging the user's email in plaintext: the username is
+  // recorded only as a stable SHA-256 hash (matching the server-side DigestUtils.sha256Hex posture).
+  it("records the caller's username as a SHA-256 hash, never in plaintext", async () => {
+    const email = "user@appsmith.com";
+    const events: Record<string, unknown>[] = [];
+    const stderrSpy = jest
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        const line = typeof chunk === "string" ? chunk : chunk.toString();
+
+        try {
+          events.push(JSON.parse(line));
+        } catch {
+          // Non-JSON writes are irrelevant to this assertion.
+        }
+
+        return true;
+      });
+
+    try {
+      const validateToken = jest.fn(async () => ({
+        username: email,
+        isAnonymous: false,
+      }));
+      const server = createMcpHttpServer(
+        API_BASE_URL,
+        createApi(validateToken),
+      );
+
+      await supertest(server)
+        .post("/mcp")
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", "Bearer mcp_user-token")
+        .send(initializeRequest);
+
+      const requestEvent = events.find(
+        (event) =>
+          event.event === "appsmith_mcp_request" &&
+          event.usernameHash !== undefined,
+      );
+
+      expect(requestEvent).toBeDefined();
+      expect(requestEvent?.usernameHash).toBe(
+        createHash("sha256").update(email).digest("hex"),
+      );
+      // The plaintext email must never appear anywhere in the serialized event.
+      expect(JSON.stringify(requestEvent)).not.toContain(email);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  // A refused request must say why in its request event, and name the key by a short public prefix only, so an
+  // operator can match it to the backend's "MCP token rejected" line without the log ever holding a secret.
+  describe("auth rejection telemetry", () => {
+    const KEY_ID = "6abbc80c72911eecce2a61dd";
+    const SECRET = "s3cret-part-of-the-token";
+    const TOKEN = `mcp_${KEY_ID}_${SECRET}`;
+
+    async function requestEventFor(
+      send: (
+        server: ReturnType<typeof createMcpHttpServer>,
+      ) => Promise<unknown>,
+      server: ReturnType<typeof createMcpHttpServer>,
+    ): Promise<Record<string, unknown> | undefined> {
+      const events: Record<string, unknown>[] = [];
+      const stderrSpy = jest
+        .spyOn(process.stderr, "write")
+        .mockImplementation((chunk: string | Uint8Array) => {
+          const line = typeof chunk === "string" ? chunk : chunk.toString();
+
+          try {
+            events.push(JSON.parse(line));
+          } catch {
+            // Non-JSON writes are irrelevant to these assertions.
+          }
+
+          return true;
+        });
+
+      try {
+        await send(server);
+      } finally {
+        stderrSpy.mockRestore();
+      }
+
+      return events.find((event) => event.event === "appsmith_mcp_request");
+    }
+
+    it("keeps only the first 10 characters of a hex or UUID key id", () => {
+      expect(mcpKeyIdPrefix(TOKEN)).toBe("6abbc80c72");
+      expect(mcpKeyIdPrefix("mcp_6ABBC80C72911eecce2a61dd_x")).toBe(
+        "6abbc80c72",
+      );
+      expect(mcpKeyIdPrefix("mcp_8f3a2b1c-4d5e-6f70-8192-a3b4c5d6e7f8_x")).toBe(
+        "8f3a2b1c-4",
+      );
+      expect(mcpKeyIdPrefix("mcp_user-token")).toBe("invalid");
+      expect(mcpKeyIdPrefix("mcp_6abb")).toBe("invalid");
+    });
+
+    it("records missing_bearer when no bearer is sent", async () => {
+      const server = createMcpHttpServer(API_BASE_URL, createApi());
+      const event = await requestEventFor(
+        (target) =>
+          supertest(target)
+            .post("/mcp")
+            .set("Accept", "application/json, text/event-stream")
+            .send(initializeRequest),
+        server,
+      );
+
+      expect(event).toMatchObject({
+        status: 401,
+        authRejection: "missing_bearer",
+      });
+      expect(event).not.toHaveProperty("keyIdPrefix");
+    });
+
+    it("records not_mcp_token and no key prefix for a non-MCP bearer", async () => {
+      const server = createMcpHttpServer(API_BASE_URL, createApi());
+      const event = await requestEventFor(
+        (target) =>
+          supertest(target)
+            .post("/mcp")
+            .set("Accept", "application/json, text/event-stream")
+            .set("Authorization", "Bearer some-other-secret")
+            .send(initializeRequest),
+        server,
+      );
+
+      expect(event).toMatchObject({
+        status: 401,
+        authRejection: "not_mcp_token",
+      });
+      expect(event).not.toHaveProperty("keyIdPrefix");
+      expect(JSON.stringify(event)).not.toContain("some-other-secret");
+    });
+
+    it("records token_rejected with the key prefix when the backend refuses the token", async () => {
+      const validateToken = jest.fn(async () => {
+        throw new Error("401 from backend");
+      });
+      const server = createMcpHttpServer(
+        API_BASE_URL,
+        createApi(validateToken),
+      );
+      const event = await requestEventFor(
+        (target) =>
+          supertest(target)
+            .post("/mcp")
+            .set("Accept", "application/json, text/event-stream")
+            .set("Authorization", `Bearer ${TOKEN}`)
+            .send(initializeRequest),
+        server,
+      );
+
+      expect(event).toMatchObject({
+        status: 401,
+        authRejection: "token_rejected",
+        keyIdPrefix: "6abbc80c72",
+      });
+
+      const serialized = JSON.stringify(event);
+
+      expect(serialized).not.toContain(SECRET);
+      expect(serialized).not.toContain(KEY_ID);
+    });
+
+    it("records token_rejected when the backend answers with an anonymous profile", async () => {
+      const validateToken = jest.fn(async () => ({ isAnonymous: true }));
+      const server = createMcpHttpServer(
+        API_BASE_URL,
+        createApi(validateToken),
+      );
+      const event = await requestEventFor(
+        (target) =>
+          supertest(target)
+            .post("/mcp")
+            .set("Accept", "application/json, text/event-stream")
+            .set("Authorization", `Bearer ${TOKEN}`)
+            .send(initializeRequest),
+        server,
+      );
+
+      expect(event).toMatchObject({
+        status: 401,
+        authRejection: "token_rejected",
+        keyIdPrefix: "6abbc80c72",
+      });
+    });
+
+    it("records session_token_mismatch when another token names the session", async () => {
+      const server = createMcpHttpServer(API_BASE_URL, createApi());
+      const sessionId = await initSession(server);
+      const event = await requestEventFor(
+        (target) =>
+          supertest(target)
+            .post("/mcp")
+            .set("Accept", "application/json, text/event-stream")
+            .set("Authorization", `Bearer ${TOKEN}`)
+            .set("mcp-session-id", sessionId)
+            .send({ jsonrpc: "2.0", method: "notifications/initialized" }),
+        server,
+      );
+
+      expect(event).toMatchObject({
+        status: 401,
+        authRejection: "session_token_mismatch",
+      });
+    });
+
+    it("records session_owner_mismatch when the token now belongs to another user", async () => {
+      const validateToken = jest
+        .fn()
+        .mockResolvedValueOnce({
+          username: "user@appsmith.com",
+          isAnonymous: false,
+        })
+        .mockResolvedValue({
+          username: "other@appsmith.com",
+          isAnonymous: false,
+        });
+      const server = createMcpHttpServer(
+        API_BASE_URL,
+        createApi(validateToken),
+      );
+      const sessionId = await initSession(server);
+      const event = await requestEventFor(
+        (target) =>
+          supertest(target)
+            .post("/mcp")
+            .set("Accept", "application/json, text/event-stream")
+            .set("Authorization", "Bearer mcp_user-token")
+            .set("mcp-session-id", sessionId)
+            .send({ jsonrpc: "2.0", method: "notifications/initialized" }),
+        server,
+      );
+
+      expect(event).toMatchObject({
+        status: 401,
+        authRejection: "session_owner_mismatch",
+      });
+    });
+
+    it("records the key prefix and no rejection when the token is accepted", async () => {
+      const server = createMcpHttpServer(API_BASE_URL, createApi());
+      const event = await requestEventFor(
+        (target) =>
+          supertest(target)
+            .post("/mcp")
+            .set("Accept", "application/json, text/event-stream")
+            .set("Authorization", `Bearer ${TOKEN}`)
+            .send(initializeRequest),
+        server,
+      );
+
+      expect(event).toMatchObject({ status: 200, keyIdPrefix: "6abbc80c72" });
+      expect(event).not.toHaveProperty("authRejection");
+      expect(JSON.stringify(event)).not.toContain(SECRET);
+    });
+  });
+
+  it("binds sessions to the bearer token and revalidates reuse", async () => {
+    const validateToken = jest.fn(async () => ({
+      username: "user@appsmith.com",
+      isAnonymous: false,
+    }));
+    const server = createMcpHttpServer(API_BASE_URL, createApi(validateToken));
+
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    expect(initialized.status).toBe(200);
+    expect(sessionId).toBeTruthy();
+    expect(validateToken).toHaveBeenCalledTimes(1);
+
+    const mismatchedToken = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_other-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(mismatchedToken).toMatchObject({
+      status: 401,
+      body: { error: "invalid MCP session" },
+    });
+    expect(validateToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes only bounded artifact write tools", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi());
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const tools = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    const payload = parseJsonRpc(tools);
+    const names = payload.result.tools.map(
+      (tool: { name: string }) => tool.name,
+    );
+
+    expect(names).toEqual(
+      expect.arrayContaining([
+        "list_workspaces",
+        "list_applications",
+        "get_application_context",
+        "get_capabilities",
+        "list_presets",
+        "get_preset",
+        "validate_app_spec",
+        "build_application",
+        "edit_page",
+      ]),
+    );
+
+    // The raw artifact-import tools and the removed raw-DSL tools must not be exposed.
+    // Check each individually: not.arrayContaining passes if even one is absent, so it
+    // would miss a case where some (but not all) excluded tools leaked back in.
+    for (const excluded of [
+      "create_application",
+      "update_layout",
+      "import_application_artifact",
+      "import_partial_application_artifact",
+    ]) {
+      expect(names).not.toContain(excluded);
+    }
+  });
+
+  it("build_application compiles a page spec and imports the artifact", async () => {
+    const importApplicationArtifact = jest.fn<
+      Promise<{ id: string }>,
+      [string, Record<string, unknown>]
+    >(async () => ({ id: "app-1" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      importApplicationArtifact,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "build_application",
+          arguments: {
+            workspaceId: "ws1",
+            app: {
+              name: "Demo",
+              pages: [
+                { name: "Home", widgets: [{ type: "text", text: "Hi" }] },
+              ],
+            },
+          },
+        },
+      });
+
+    expect(importApplicationArtifact).toHaveBeenCalledTimes(1);
+    const [workspaceId, artifact] = importApplicationArtifact.mock.calls[0];
+
+    expect(workspaceId).toBe("ws1");
+    expect(artifact.clientSchemaVersion).toBe(2);
+    expect(artifact.actionList).toEqual([]);
+    expect(artifact.pageList).toHaveLength(1);
+
+    // Structural diagnostics are returned inline so the agent gets feedback without a second call.
+    const body = JSON.parse(parseJsonRpc(call).result.content[0].text);
+
+    expect(body.diagnostics).toEqual({
+      errors: 0,
+      warnings: 0,
+      pages: expect.any(Object),
+    });
+  });
+
+  it("inspect_page lints a live page read-back and reports structural issues", async () => {
+    // A page whose two widgets overlap on the same canvas — the lint must surface it.
+    const overlappingDsl = {
+      widgetId: "0",
+      widgetName: "MainContainer",
+      type: "CANVAS_WIDGET",
+      topRow: 0,
+      bottomRow: 380,
+      leftColumn: 0,
+      rightColumn: 640,
+      children: [
+        {
+          widgetId: "a",
+          widgetName: "A",
+          type: "INPUT_WIDGET_V2",
+          topRow: 0,
+          bottomRow: 10,
+          leftColumn: 0,
+          rightColumn: 30,
+        },
+        {
+          widgetId: "b",
+          widgetName: "B",
+          type: "INPUT_WIDGET_V2",
+          topRow: 5,
+          bottomRow: 15,
+          leftColumn: 10,
+          rightColumn: 40,
+        },
+      ],
+    };
+    const getApplicationContext = jest.fn(async (applicationId: string) => ({
+      pages: [],
+      page: { applicationId },
+      layout: { dsl: overlappingDsl },
+    }));
+    const updateLayout = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext,
+      updateLayout,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: {
+          name: "inspect_page",
+          arguments: { applicationId: "app1", pageId: "p1", layoutId: "l1" },
+        },
+      });
+
+    // Read-only: inspecting must never write the layout back.
+    expect(updateLayout).not.toHaveBeenCalled();
+    expect(getApplicationContext).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(parseJsonRpc(call).result.content[0].text);
+
+    expect(body.diagnostics.warnings).toBeGreaterThan(0);
+    expect(
+      body.diagnostics.issues.map((i: { rule: string }) => i.rule),
+    ).toContain("overlap");
+  });
+
+  it("build_application rejects an invalid spec without importing", async () => {
+    const importApplicationArtifact = jest.fn<
+      Promise<{ id: string }>,
+      [string, Record<string, unknown>]
+    >(async () => ({ id: "app-1" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      importApplicationArtifact,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "build_application",
+          arguments: {
+            workspaceId: "ws1",
+            app: { name: "Bad", pages: [{ name: "P", widgets: [] }] },
+          },
+        },
+      });
+    const text = parseJsonRpc(call).result.content[0].text;
+
+    expect(importApplicationArtifact).not.toHaveBeenCalled();
+    expect(text).toContain('"valid": false');
+  });
+
+  const existingPageDsl = {
+    widgetId: "0",
+    widgetName: "MainContainer",
+    type: "CANVAS_WIDGET",
+    topRow: 0,
+    bottomRow: 380,
+    leftColumn: 0,
+    rightColumn: 640,
+    children: [
+      {
+        widgetId: "email1",
+        widgetName: "Email",
+        type: "INPUT_WIDGET_V2",
+        topRow: 0,
+        bottomRow: 7,
+        leftColumn: 0,
+        rightColumn: 24,
+      },
+    ],
+  };
+
+  async function initSession(server: ReturnType<typeof createMcpHttpServer>) {
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    return sessionId;
+  }
+
+  it("edit_page appends to the existing DSL and writes it back", async () => {
+    const getApplicationContext = jest.fn(async (applicationId: string) => ({
+      pages: [],
+      page: { applicationId },
+      layout: { dsl: existingPageDsl },
+    }));
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async () => ({ ok: true }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext,
+      updateLayout,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const sessionId = await initSession(server);
+
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: {
+          name: "edit_page",
+          arguments: {
+            applicationId: "app1",
+            pageId: "p1",
+            layoutId: "l1",
+            edit: { add: [{ type: "button", text: "Save" }] },
+          },
+        },
+      });
+
+    expect(parseJsonRpc(call).result.content[0].text).not.toContain(
+      '"valid": false',
+    );
+    expect(updateLayout).toHaveBeenCalledTimes(1);
+    const [, , , writtenDsl] = updateLayout.mock.calls[0];
+    const children = writtenDsl.children as { widgetName: string }[];
+
+    expect(children).toHaveLength(2);
+    expect(children.map((c) => c.widgetName)).toContain("Email");
+
+    // edit_page returns structural diagnostics inline, same as build_application.
+    const body = JSON.parse(parseJsonRpc(call).result.content[0].text);
+
+    expect(body.diagnostics).toEqual({
+      errors: 0,
+      warnings: 0,
+      issues: [],
+    });
+  });
+
+  it("edit_page reports a read failure without writing when the layout is missing", async () => {
+    const getApplicationContext = jest.fn(async (applicationId: string) => ({
+      pages: [],
+      page: { applicationId },
+      layout: {},
+    }));
+    const updateLayout = jest.fn(async () => ({ ok: true }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext,
+      updateLayout,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const sessionId = await initSession(server);
+
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: {
+          name: "edit_page",
+          arguments: {
+            applicationId: "app1",
+            pageId: "p1",
+            layoutId: "l1",
+            edit: { add: [{ type: "button", text: "Save" }] },
+          },
+        },
+      });
+
+    expect(updateLayout).not.toHaveBeenCalled();
+    expect(parseJsonRpc(call).result.content[0].text).toContain(
+      "could not read the current page layout",
+    );
+  });
+
+  it("does not evict a session when a mismatched token is presented", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi());
+    const sessionId = await initSession(server);
+
+    const attacker = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_attacker-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(attacker.status).toBe(401);
+
+    // The real owner's session must survive the mismatch — otherwise a leaked session id is a targeted DoS.
+    const owner = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(owner.status).not.toBe(404);
+  });
+
+  it("enforces the per-user session cap under concurrent initialize requests", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      maxSessionsPerUser: 1,
+    });
+
+    // Listen once so concurrent requests share one address (supertest otherwise re-listens per call).
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+
+    try {
+      const fire = () =>
+        supertest(server)
+          .post("/mcp")
+          .set("Accept", "application/json, text/event-stream")
+          .set("Authorization", "Bearer mcp_user-token")
+          .send(initializeRequest);
+      const responses = await Promise.all([
+        fire(),
+        fire(),
+        fire(),
+        fire(),
+        fire(),
+      ]);
+      const acceptedIds = responses
+        .map((r) => r.headers["mcp-session-id"] as string | undefined)
+        .filter((id): id is string => Boolean(id));
+      const rejected = responses.filter((r) => r.status === 429).length;
+
+      // Every request either gets a session or hits the cap — nothing slips through unaccounted. An initialize
+      // that lands while another is still a pending reservation is rejected (reservations are not evictable);
+      // one that lands after a session registered evicts it and takes its place. Timing decides the split, so
+      // assert the invariants rather than an exact count.
+      expect(acceptedIds.length).toBeGreaterThanOrEqual(1);
+      expect(acceptedIds.length + rejected).toBe(5);
+
+      // The cap itself is the hard invariant: at most one of the issued sessions is still alive afterwards.
+      const probes = await Promise.all(
+        acceptedIds.map((id) =>
+          supertest(server)
+            .post("/mcp")
+            .set("Accept", "application/json, text/event-stream")
+            .set("Authorization", "Bearer mcp_user-token")
+            .set("mcp-session-id", id)
+            .send({ jsonrpc: "2.0", method: "notifications/initialized" }),
+        ),
+      );
+      const alive = probes.filter((probe) => probe.status !== 404).length;
+
+      expect(alive).toBe(1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("fails safely when session token revalidation fails", async () => {
+    const validateToken = jest
+      .fn<Promise<{ username: string; isAnonymous: boolean }>, []>()
+      .mockResolvedValueOnce({
+        username: "user@appsmith.com",
+        isAnonymous: false,
+      })
+      .mockRejectedValueOnce(new Error("token must not leak"));
+    const server = createMcpHttpServer(API_BASE_URL, createApi(validateToken));
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    const reused = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(reused).toMatchObject({
+      status: 401,
+      body: { error: "invalid bearer token" },
+    });
+  });
+
+  it("removes expired sessions before dispatching a request", async () => {
+    let time = 0;
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      now: () => time,
+      sessionTtlMs: 1,
+    });
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    time = 1;
+    const expired = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    // 404, not 400: the spec-defined signal on which a compliant client re-initializes transparently.
+    expect(expired).toMatchObject({
+      status: 404,
+      body: { error: "session not found; initialize a new MCP session" },
+    });
+  });
+
+  it("answers 400 only when NO session id accompanies a non-initialize request", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi());
+    const response = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(response).toMatchObject({
+      status: 400,
+      body: { error: "initialize the MCP session first" },
+    });
+  });
+
+  it("rejects new sessions when the configured session limit is reached", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      maxSessions: 0,
+    });
+
+    const response = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    expect(response).toMatchObject({
+      status: 503,
+      body: { error: "MCP session limit reached" },
+    });
+  });
+
+  it("rejects bearer tokens that are not MCP tokens", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi());
+
+    const response = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer not-an-mcp-token")
+      .send(initializeRequest);
+
+    expect(response.status).toBe(401);
+    expect(response.headers["www-authenticate"]).toBe("Bearer");
+  });
+
+  it("rejects cross-origin requests", async () => {
+    const response = await supertest(
+      createMcpHttpServer(API_BASE_URL, createApi()),
+    )
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Origin", "https://evil.example")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    expect(response).toMatchObject({
+      status: 403,
+      body: { error: "cross-origin requests are not allowed" },
+    });
+  });
+
+  it("rejects a Host not in the configured allowlist before any session/auth work", async () => {
+    const validateToken = jest.fn();
+    const server = createMcpHttpServer(API_BASE_URL, createApi(validateToken), {
+      allowedHosts: ["127.0.0.1", "localhost"],
+    });
+    const rejected = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Host", "attacker.example")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    expect(rejected).toMatchObject({
+      status: 403,
+      body: { error: "host not allowed" },
+    });
+    // Rejected before authentication — no session is created and the token is never validated.
+    expect(validateToken).not.toHaveBeenCalled();
+
+    // A loopback Host (what supertest and Caddy-to-loopback send) is allowed through to normal processing.
+    const allowed = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Host", "127.0.0.1")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    expect(allowed.status).not.toBe(403);
+  });
+
+  it("leaves the Host header unchecked when no allowlist is configured (default)", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi());
+    const response = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Host", "any-public-domain.example")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    // No allowlist -> Host is not a rejection reason (Caddy-fronted deployments preserve the public Host).
+    expect(response.status).not.toBe(403);
+  });
+
+  it("allows a listed host that arrives with a port (loopback deployments send host:port)", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      allowedHosts: ["127.0.0.1"],
+    });
+    const response = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Host", "127.0.0.1:9000")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    // The port is stripped before the allowlist check, so 127.0.0.1:9000 matches "127.0.0.1".
+    expect(response.status).not.toBe(403);
+  });
+
+  describe("hostHeaderName", () => {
+    it("extracts the lowercased hostname without the port", () => {
+      expect(hostHeaderName("127.0.0.1")).toBe("127.0.0.1");
+      expect(hostHeaderName("127.0.0.1:8092")).toBe("127.0.0.1");
+      expect(hostHeaderName("LocalHost:8092")).toBe("localhost");
+      expect(hostHeaderName("  Example.COM:443  ")).toBe("example.com");
+      // Bracketed IPv6 keeps the address and drops the port.
+      expect(hostHeaderName("[::1]:8092")).toBe("::1");
+      expect(hostHeaderName("[::1]")).toBe("::1");
+    });
+
+    it("returns an empty string for a missing or non-string header (fails closed)", () => {
+      expect(hostHeaderName(undefined)).toBe("");
+      expect(hostHeaderName("")).toBe("");
+      expect(hostHeaderName(["127.0.0.1"])).toBe("");
+      // A malformed bracket does not silently become a loopback match.
+      expect(hostHeaderName("[::1")).not.toBe("::1");
+    });
+  });
+
+  // M5 — the session-scoped origin for build_application's URLs, derived from the initialize request's headers.
+  describe("sessionOriginFromHeaders", () => {
+    it("builds an origin only from an exact http/https proto and a charset-clean host", () => {
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": "https", host: "Apps.Example.Com:8443" },
+          new Set(),
+        ),
+      ).toBe("https://apps.example.com:8443");
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": "http", host: "localhost:8080" },
+          new Set(),
+        ),
+      ).toBe("http://localhost:8080");
+    });
+
+    it("fails closed on a forged/missing/duplicated proto or a hostile host", () => {
+      const noAllowlist = new Set<string>();
+
+      expect(
+        sessionOriginFromHeaders({ host: "apps.example.com" }, noAllowlist),
+      ).toBeUndefined();
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": "javascript", host: "apps.example.com" },
+          noAllowlist,
+        ),
+      ).toBeUndefined();
+      // Node joins duplicated X-Forwarded-Proto headers with a comma; the literal comparison rejects that too.
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": "https, http", host: "apps.example.com" },
+          noAllowlist,
+        ),
+      ).toBeUndefined();
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": ["https"], host: "apps.example.com" },
+          noAllowlist,
+        ),
+      ).toBeUndefined();
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": "https", host: "evil.com<script>" },
+          noAllowlist,
+        ),
+      ).toBeUndefined();
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": "https", host: "" },
+          noAllowlist,
+        ),
+      ).toBeUndefined();
+      expect(
+        sessionOriginFromHeaders({ "x-forwarded-proto": "https" }, noAllowlist),
+      ).toBeUndefined();
+    });
+
+    it("enforces the configured Host allowlist (hostname compared, port ignored)", () => {
+      const allowed = new Set(["apps.example.com"]);
+
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": "https", host: "apps.example.com:443" },
+          allowed,
+        ),
+      ).toBe("https://apps.example.com:443");
+      expect(
+        sessionOriginFromHeaders(
+          { "x-forwarded-proto": "https", host: "other.example.com" },
+          allowed,
+        ),
+      ).toBeUndefined();
+    });
+  });
+
+  it("rejects tokens that resolve to an anonymous session", async () => {
+    const validateToken = jest.fn(async () => ({
+      isAnonymous: true,
+      username: "anonymousUser",
+    }));
+    const server = createMcpHttpServer(API_BASE_URL, createApi(validateToken));
+
+    const response = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_anon-token")
+      .send(initializeRequest);
+
+    expect(response).toMatchObject({
+      status: 401,
+      body: { error: "invalid bearer token" },
+    });
+  });
+
+  it("rejects a new session when the per-user cap leaves nothing to evict", async () => {
+    // A zero cap means no registered session can ever exist to evict, so the 429 path still fires.
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      maxSessionsPerUser: 0,
+    });
+
+    const response = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    expect(response).toMatchObject({
+      status: 429,
+      body: { error: "MCP session limit reached for this user" },
+    });
+  });
+
+  it("evicts the user's own oldest session instead of rejecting at the per-user cap", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      maxSessionsPerUser: 1,
+    });
+    const firstId = await initSession(server);
+
+    // The second initialize succeeds — the stale first session is displaced rather than the client seeing a 429.
+    const second = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const secondId = second.headers["mcp-session-id"] as string;
+
+    expect(second.status).not.toBe(429);
+    expect(secondId).toBeDefined();
+
+    const evicted = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", firstId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    // 404 per spec: the evicted session's client re-initializes transparently instead of stranding.
+    expect(evicted).toMatchObject({
+      status: 404,
+      body: { error: "session not found; initialize a new MCP session" },
+    });
+
+    const survivor = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", secondId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(survivor.status).not.toBe(404);
+  });
+
+  it("evicts the least-recently-active session, not the most recent one", async () => {
+    let time = 0;
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      maxSessionsPerUser: 2,
+      now: () => time,
+    });
+    const touchedId = await initSession(server);
+
+    time = 1000;
+    const idleId = await initSession(server);
+
+    // Touch the first session at t=2000, making the second one the least recently active of the two.
+    time = 2000;
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", touchedId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    time = 3000;
+    const third = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    expect(third.headers["mcp-session-id"]).toBeDefined();
+
+    // The idle session was the oldest by last activity and is the one displaced — creation order is irrelevant.
+    const displaced = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", idleId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(displaced.status).toBe(404);
+
+    const survivor = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", touchedId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(survivor.status).not.toBe(404);
+  });
+
+  it("admits a capped user at global saturation when their own eviction frees the slot", async () => {
+    // Eviction candidates count against the global cap check: displacing the user's own session is net-zero
+    // for the instance, so a full instance must not 503 a user who is only displacing themselves.
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      maxSessions: 1,
+      maxSessionsPerUser: 1,
+    });
+
+    await initSession(server);
+
+    const second = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+
+    expect(second.status).not.toBe(503);
+    expect(second.headers["mcp-session-id"]).toBeDefined();
+  });
+
+  it("never evicts another user's session at the per-user cap", async () => {
+    // Username derives from the token so two bearer tokens act as two distinct users.
+    const apiForToken = (token: string): AppsmithApi => ({
+      ...createApi()(),
+      validateToken: jest.fn(async () => ({
+        username: token.includes("alice") ? "alice" : "bob",
+        isAnonymous: false,
+      })),
+    });
+    const server = createMcpHttpServer(API_BASE_URL, apiForToken, {
+      maxSessionsPerUser: 1,
+    });
+    const init = (token: string) =>
+      supertest(server)
+        .post("/mcp")
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", `Bearer ${token}`)
+        .send(initializeRequest);
+    const aliceFirst = await init("mcp_alice-token");
+    const bobSession = await init("mcp_bob-token");
+    const aliceSecond = await init("mcp_alice-token");
+
+    const aliceFirstId = aliceFirst.headers["mcp-session-id"] as string;
+    const bobSessionId = bobSession.headers["mcp-session-id"] as string;
+
+    expect(aliceSecond.headers["mcp-session-id"]).toBeDefined();
+
+    // Alice's churn displaced only her own session; Bob's is untouched.
+    const aliceEvicted = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_alice-token")
+      .set("mcp-session-id", aliceFirstId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(aliceEvicted.status).toBe(404);
+
+    const bobAlive = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_bob-token")
+      .set("mcp-session-id", bobSessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    expect(bobAlive.status).not.toBe(404);
+  });
+});
+
+describe("MCP instruction surface (M2)", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async function session(): Promise<{ server: any; sessionId: string }> {
+    const server = createMcpHttpServer(API_BASE_URL, createApi());
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    return { server, sessionId };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async function rpc(method: string, params?: unknown): Promise<any> {
+    const { server, sessionId } = await session();
+    const response = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", id: 9, method, params });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (parseJsonRpc(response) as any).result;
+  }
+
+  it("exposes exactly the intended instruction resources", async () => {
+    const result = await rpc("resources/list");
+    const uris = (result.resources as { uri: string }[])
+      .map((r) => r.uri)
+      .sort();
+
+    expect(uris).toEqual(
+      [
+        "appsmith://guide/bindings",
+        "appsmith://guide/git",
+        "appsmith://guide/js-objects",
+        "appsmith://guide/naming",
+        "appsmith://guide/placement",
+        "appsmith://guide/screenshot",
+        "appsmith://recipe/conditional-form",
+        "appsmith://recipe/crud",
+        "appsmith://recipe/form",
+        "appsmith://recipe/table-detail",
+        "appsmith://recipe/zip-lookup",
+        "appsmith://recipe/filter-bar",
+        "appsmith://reference/widgets",
+      ].sort(),
+    );
+  });
+
+  it("reads a resource and returns markdown content", async () => {
+    const result = await rpc("resources/read", {
+      uri: "appsmith://reference/widgets",
+    });
+    const [content] = result.contents as { text: string; mimeType: string }[];
+
+    expect(content.mimeType).toBe("text/markdown");
+    expect(content.text).toContain("# Widget reference");
+  });
+
+  it("exposes the guided-workflow prompts", async () => {
+    const result = await rpc("prompts/list");
+    const names = (result.prompts as { name: string }[]).map((p) => p.name);
+
+    expect(names).toContain("scaffold_crud");
+    expect(names).toContain("scaffold_form");
+    expect(names).toContain("recreate_from_screenshot");
+  });
+
+  it("renders the screenshot prompt with the three-pass method and the app name", async () => {
+    const result = await rpc("prompts/get", {
+      name: "recreate_from_screenshot",
+      arguments: { appName: "Task Tracker" },
+    });
+    const [message] = result.messages as {
+      role: string;
+      content: { type: string; text: string };
+    }[];
+
+    expect(message.role).toBe("user");
+    expect(message.content.text).toContain("Task Tracker");
+    expect(message.content.text).toContain("get_guide");
+    expect(message.content.text).toContain("layout skeleton");
+    expect(message.content.text).toContain("build_application");
+  });
+
+  it("renders a scaffold prompt as a user message referencing real tools", async () => {
+    const result = await rpc("prompts/get", {
+      name: "scaffold_crud",
+      arguments: { entity: "Customer", fields: "email:EMAIL" },
+    });
+    const [message] = result.messages as {
+      role: string;
+      content: { type: string; text: string };
+    }[];
+
+    expect(message.role).toBe("user");
+    expect(message.content.text).toContain("CustomerTable");
+    expect(message.content.text).toContain("build_application");
+    expect(message.content.text).not.toContain("create_query");
+  });
+
+  // The always-on tool mirror of the resources above: tools-only clients (e.g. ChatGPT) cannot read MCP
+  // resources, so the same InstructionDoc registry must be reachable through get_guide — no forked content.
+  describe("get_guide — the tool mirror of the instruction resources", () => {
+    async function callGuide(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      server: any,
+      sessionId: string,
+      slug: string,
+    ): Promise<Record<string, unknown>> {
+      const response = await supertest(server)
+        .post("/mcp")
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", "Bearer mcp_user-token")
+        .set("mcp-session-id", sessionId)
+        .send({
+          jsonrpc: "2.0",
+          id: 12,
+          method: "tools/call",
+          params: { name: "get_guide", arguments: { slug } },
+        });
+
+      return JSON.parse(parseJsonRpc(response).result.content[0].text);
+    }
+
+    it("returns the SAME rendered markdown as the resource for every registry slug", async () => {
+      const { server, sessionId } = await session();
+
+      for (const doc of INSTRUCTION_DOCS) {
+        const body = await callGuide(server, sessionId, doc.slug);
+
+        expect(body.slug).toBe(doc.slug);
+        expect(body.title).toBe(doc.title);
+        // Byte-identical to the resource content: one registry, no forked copy.
+        expect(body.markdown).toBe(doc.render());
+      }
+    });
+
+    it("rejects an unknown slug with the full slug list", async () => {
+      const { server, sessionId } = await session();
+      const body = await callGuide(server, sessionId, "no-such-guide");
+
+      expect(String(body.error)).toContain("unknown guide");
+      expect(body.available).toEqual(INSTRUCTION_DOCS.map((doc) => doc.slug));
+    });
+
+    it("enumerates every registry slug in the tool description (drift guard)", async () => {
+      const { server, sessionId } = await session();
+      const listed = await supertest(server)
+        .post("/mcp")
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", "Bearer mcp_user-token")
+        .set("mcp-session-id", sessionId)
+        .send({ jsonrpc: "2.0", id: 14, method: "tools/list" });
+      const tools = parseJsonRpc(listed).result.tools as unknown as {
+        name: string;
+        description?: string;
+      }[];
+      const guideTool = tools.find((tool) => tool.name === "get_guide");
+
+      expect(guideTool).toBeDefined();
+
+      for (const doc of INSTRUCTION_DOCS) {
+        expect(guideTool?.description).toContain(doc.slug);
+      }
+    });
+  });
+});
+
+describe("M4 data layer — sub-flag gates the data tools", () => {
+  async function toolNames(dataEnabled: boolean): Promise<string[]> {
+    const server = createMcpHttpServer(API_BASE_URL, createApi(), {
+      dataEnabled,
+    });
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const listed = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", id: 7, method: "tools/list" });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = parseJsonRpc(listed).result as any;
+
+    return (result.tools as { name: string }[]).map((t) => t.name);
+  }
+
+  it("hides the data tools when the sub-flag is off (default)", async () => {
+    const names = await toolNames(false);
+
+    expect(names).not.toContain("list_datasources");
+    expect(names).not.toContain("create_datasource");
+    expect(names).not.toContain("get_datasource_structure");
+    // The build/authoring tools are still present.
+    expect(names).toContain("build_application");
+    // Raw artifact-import tools remain absent regardless.
+    expect(names).not.toContain("import_application_artifact");
+  });
+
+  it("exposes the data tools when the sub-flag is on", async () => {
+    const names = await toolNames(true);
+
+    expect(names).toContain("list_datasources");
+    expect(names).toContain("create_datasource");
+    expect(names).toContain("get_datasource_structure");
+    expect(names).not.toContain("import_application_artifact");
+  });
+
+  // Spin a data-enabled server with a custom api, handshake, call a tool, return the parsed result body.
+  async function callTool(
+    api: AppsmithApi,
+    name: string,
+    args: unknown,
+  ): Promise<Record<string, unknown>> {
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+    });
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: { name, arguments: args },
+      });
+
+    const text = parseJsonRpc(call).result.content[0].text;
+
+    // Tools with typed input schemas are rejected by the SDK BEFORE the handler runs; surface that protocol-level
+    // rejection ("MCP error -32602: Invalid arguments...") as an error body so tests can assert on it.
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { error: text };
+    }
+  }
+
+  const validQuery = {
+    name: "getUsers",
+    applicationId: "app1",
+    pageId: "p1",
+    datasourceId: "ds1",
+    operation: "SELECT",
+    table: "users",
+  };
+
+  it("create_query appears only when the sub-flag is on", async () => {
+    expect(await toolNames(false)).not.toContain("create_query");
+    expect(await toolNames(true)).toContain("create_query");
+  });
+
+  it("inspect_page reports bindings to queries that do not exist", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: {
+          dsl: {
+            widgetId: "0",
+            widgetName: "MainContainer",
+            type: "CANVAS_WIDGET",
+            topRow: 0,
+            bottomRow: 380,
+            leftColumn: 0,
+            rightColumn: 640,
+            children: [
+              {
+                widgetId: "table1",
+                widgetName: "OrdersTable",
+                type: "TABLE_WIDGET_V2",
+                topRow: 0,
+                bottomRow: 20,
+                leftColumn: 0,
+                rightColumn: 64,
+                tableData: "{{ missingQuery.data }}",
+              },
+            ],
+          },
+        },
+      })),
+      listActions: jest.fn(async () => [{ name: "getOrders", pageId: "p1" }]),
+      listActionCollections: jest.fn(async () => []),
+    };
+
+    const body = await callTool(api, "inspect_page", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+    });
+
+    expect(
+      (body.diagnostics as { issues: { rule: string }[] }).issues.map(
+        (issue) => issue.rule,
+      ),
+    ).toContain("dangling-binding");
+  });
+
+  // APP-16381: a page bound to editor-written JS objects and lodash, read back and linted.
+  function licensePageApi(): AppsmithApi {
+    return {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [{ id: "p1" }],
+        page: { applicationId },
+        layout: {
+          id: "l1",
+          dsl: {
+            widgetId: "0",
+            widgetName: "MainContainer",
+            type: "CANVAS_WIDGET",
+            topRow: 0,
+            bottomRow: 380,
+            leftColumn: 0,
+            rightColumn: 640,
+            children: [
+              {
+                widgetId: "t",
+                widgetName: "Licenses",
+                type: "TABLE_WIDGET_V2",
+                topRow: 0,
+                bottomRow: 20,
+                leftColumn: 0,
+                rightColumn: 64,
+                tableData: "{{ Utils.getLicenseData() }}",
+                primaryColumns: {
+                  customerName: {
+                    id: "customerName",
+                    originalId: "customerName",
+                    label: "Customer",
+                    columnType: "text",
+                    index: 0,
+                    computedValue: "{{ Licenses.processedTableData }}",
+                  },
+                  usage: {
+                    id: "usage",
+                    label: "{{ Variables.label }}",
+                    columnType: "button",
+                    isVisible: false,
+                    index: 1,
+                  },
+                },
+                columnOrder: ["usage", "customerName"],
+              },
+              {
+                widgetId: "x",
+                widgetName: "Total",
+                type: "TEXT_WIDGET",
+                topRow: 20,
+                bottomRow: 24,
+                leftColumn: 0,
+                rightColumn: 16,
+                text: "{{ _.sum(GetUsage.data.map((r) => r.n)) }} for {{ appsmith.user.email }} {{ Licenses.selectedRow.id }}",
+              },
+            ],
+          },
+        },
+      })),
+      listActions: jest.fn(async () => [{ name: "GetUsage", pageId: "p1" }]),
+      listActionCollections: jest.fn(async () => [
+        { name: "Utils" },
+        { name: "Variables" },
+      ]),
+    };
+  }
+
+  it("does not report bindings to editor-written JS objects or lodash as dangling (APP-16381)", async () => {
+    const body = await callTool(licensePageApi(), "inspect_page", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+    });
+
+    expect(
+      (body.diagnostics as { issues: { rule: string }[] }).issues.filter(
+        (issue) => issue.rule === "dangling-binding",
+      ),
+    ).toEqual([]);
+  });
+
+  it.each(["inspect_page", "read_semantic_page"])(
+    "%s keeps structural diagnostics when JS-object names cannot be read",
+    async (tool) => {
+      const api = licensePageApi();
+      const context = (await api.getApplicationContext("app1", "p1", "l1")) as {
+        pages: unknown;
+        page: unknown;
+        layout: { dsl: { children: { topRow: number; bottomRow: number }[] } };
+      };
+
+      context.layout.dsl.children[1].topRow = 0;
+      context.layout.dsl.children[1].bottomRow = 4;
+      api.getApplicationContext = jest.fn(async () => context);
+      api.listActionCollections = jest.fn(async () => {
+        throw new Error("unavailable");
+      });
+      const body = await callTool(api, tool, {
+        applicationId: "app1",
+        pageId: "p1",
+        layoutId: "l1",
+      });
+      const issues = (body.diagnostics as { issues: { rule: string }[] })
+        .issues;
+
+      expect(issues.filter(({ rule }) => rule === "dangling-binding")).toEqual(
+        [],
+      );
+      expect(issues.some(({ rule }) => rule === "overlap")).toBe(true);
+    },
+  );
+
+  it("read_semantic_page lists table columns and summarises hand-written bindings by name only (APP-16381)", async () => {
+    const body = await callTool(licensePageApi(), "read_semantic_page", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+    });
+    const widgets = (body.page as { widgets: Record<string, unknown>[] })
+      .widgets;
+    const table = widgets.find((w) => w.name === "Licenses");
+    const total = widgets.find((w) => w.name === "Total");
+
+    expect(table?.columns).toEqual([
+      { id: "usage", type: "button", visible: false, order: 0 },
+      {
+        id: "customerName",
+        key: "customerName",
+        label: "Customer",
+        type: "text",
+        visible: true,
+        order: 1,
+      },
+    ]);
+    expect(table?.boundProps).toEqual({ tableData: { jsObjects: ["Utils"] } });
+    expect(total?.boundProps).toEqual({
+      text: {
+        queries: ["GetUsage"],
+        widgets: ["Licenses"],
+        user: ["email"],
+      },
+    });
+    // No expression text is returned.
+    expect(JSON.stringify(body.page)).not.toContain("getLicenseData");
+    expect(JSON.stringify(body.page)).not.toContain("processedTableData");
+  });
+
+  it("get_application_context narrows to the named sections and one widget's subtree (APP-16381)", async () => {
+    const body = await callTool(licensePageApi(), "get_application_context", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      include: ["layout"],
+      widget: "Total",
+    });
+
+    expect(body.pages).toBeUndefined();
+    expect(body.page).toBeUndefined();
+    expect(
+      (body.layout as { id: string; dsl: { widgetName: string } }).dsl
+        .widgetName,
+    ).toBe("Total");
+    expect((body.layout as { id: string }).id).toBe("l1");
+
+    const missing = await callTool(
+      licensePageApi(),
+      "get_application_context",
+      { applicationId: "app1", pageId: "p1", layoutId: "l1", widget: "Nope" },
+    );
+
+    expect(missing.error).toMatch(/widget "Nope" was not found/);
+  });
+
+  it("create_query creates a parameterized query when the datasource is accessible", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act1" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_query", {
+      query: {
+        ...validQuery,
+        filters: [{ column: "id", op: "eq", value: { literal: 1 } }],
+      },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.body).toBe('SELECT * FROM users WHERE "id" = {{ 1 }};');
+    expect(createAction).toHaveBeenCalledTimes(1);
+    const dto = createAction.mock.calls[0][0] as { datasource: { id: string } };
+
+    expect(dto.datasource).toEqual({ id: "ds1" });
+  });
+
+  it("create_query stores an Oracle query where the Oracle plugin reads it, and get_action reads it back", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act1" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "DB", pluginId: "oracle-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const created = await callTool(api, "create_query", { query: validQuery });
+
+    expect(created.created).toBe(true);
+    const dto = createAction.mock.calls[0][0] as {
+      actionConfiguration: {
+        body?: unknown;
+        formData: {
+          body: { data: string };
+          preparedStatement: { data: boolean };
+        };
+      };
+    };
+
+    expect(dto.actionConfiguration.body).toBeUndefined();
+    expect(dto.actionConfiguration.formData.preparedStatement.data).toBe(true);
+    expect(dto.actionConfiguration.formData.body.data).toContain(
+      created.body as string,
+    );
+
+    const read = await callTool(
+      {
+        ...api,
+        getAction: jest.fn(async () => ({
+          id: "act1",
+          name: "GetUsers",
+          pageId: "p1",
+          datasource: { id: "ds1" },
+          pluginType: "DB",
+          actionConfiguration: dto.actionConfiguration,
+        })),
+      },
+      "get_action",
+      { applicationId: "app1", actionId: "act1" },
+    );
+
+    expect(read.authoredBy).toBe("mcp");
+    expect(read.body).toBe(created.body);
+  });
+
+  it.each([
+    ["postgres-plugin", true],
+    ["mysql-plugin", false],
+  ])(
+    "APP-16164: create_query compiles inList only on a PostgreSQL datasource (%s)",
+    async (pluginId, allowed) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: {
+          ...validQuery,
+          filters: [
+            {
+              column: "tag",
+              op: "inList",
+              value: { widget: "TagsSelect", property: "selectedOptionValues" },
+              skipWhenEmpty: true,
+            },
+          ],
+        },
+      });
+
+      if (allowed) {
+        expect(body.created).toBe(true);
+        expect(body.body).toContain('CAST("tag" AS TEXT) = ANY(');
+      } else {
+        expect(body.valid).toBe(false);
+        expect(JSON.stringify(body.errors)).toMatch(
+          /only available on a PostgreSQL datasource/,
+        );
+        expect(createAction).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each([
+    ["postgres-plugin", 'SELECT * FROM users WHERE "email" IS NULL;'],
+    ["mysql-plugin", "SELECT * FROM users WHERE users.email <=> NULL;"],
+  ])(
+    "APP-16324: create_query compiles isNull for the datasource's database (%s)",
+    async (pluginId, sql) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: {
+          ...validQuery,
+          filters: [{ column: "email", op: "isNull" }],
+        },
+      });
+
+      expect(body.created).toBe(true);
+      expect(body.body).toBe(sql);
+    },
+  );
+
+  it("APP-16324 F1.2: create_query compiles an anyOf group and refuses skipWhenEmpty inside it", async () => {
+    const createAction = jest.fn(async () => ({ id: "act1" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction: createAction as never,
+    };
+    const created = await callTool(api, "create_query", {
+      query: {
+        ...validQuery,
+        filters: [
+          {
+            anyOf: [
+              { column: "email", op: "isNull" },
+              { column: "email", op: "eq", value: { literal: "" } },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(created.created).toBe(true);
+    expect(created.body).toBe(
+      'SELECT * FROM users WHERE ("email" IS NULL OR "email" = {{ "" }});',
+    );
+
+    const refused = await callTool(api, "create_query", {
+      query: {
+        ...validQuery,
+        name: "getUsers2",
+        filters: [
+          {
+            anyOf: [
+              {
+                column: "email",
+                op: "eq",
+                value: { widget: "EmailInput", property: "text" },
+                skipWhenEmpty: true,
+              },
+              { column: "email", op: "isNull" },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(refused.valid).toBe(false);
+    expect(JSON.stringify(refused.errors)).toContain(
+      "skipWhenEmpty cannot be used inside anyOf",
+    );
+    expect(createAction).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [
+      "postgres-plugin",
+      true,
+      'SELECT * FROM users WHERE "email" ILIKE {{ "%" + (SearchInput.text ?? "") + "%" }};',
+    ],
+    ["mysql-plugin", false, undefined],
+  ])(
+    "APP-16324 F1.3: create_query compiles ilike with a contains match only on PostgreSQL (%s)",
+    async (pluginId, allowed, sql) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: {
+          ...validQuery,
+          filters: [
+            {
+              column: "email",
+              op: "ilike",
+              match: "contains",
+              value: { widget: "SearchInput", property: "text" },
+            },
+          ],
+        },
+      });
+
+      if (allowed) {
+        expect(body.created).toBe(true);
+        expect(body.body).toBe(sql);
+      } else {
+        expect(body.valid).toBe(false);
+        expect(JSON.stringify(body.errors)).toMatch(
+          /ilike \(filter on email\) is only available on a PostgreSQL datasource/,
+        );
+        expect(createAction).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("APP-16324 F1.4: create_query coalesces a grouped column", async () => {
+    const createAction = jest.fn(async () => ({ id: "act1" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction: createAction as never,
+    };
+    const body = await callTool(api, "create_query", {
+      query: {
+        ...validQuery,
+        groupBy: [{ column: "role", coalesce: { literal: "none" } }],
+        aggregate: { fn: "count" },
+      },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.body).toBe(
+      'SELECT COALESCE("role", {{ "none" }}) AS "role", COUNT(*) AS count FROM users GROUP BY "role";',
+    );
+  });
+
+  it("APP-16324 F1.5: create_query compiles having and refuses an unknown having column", async () => {
+    const createAction = jest.fn(async () => ({ id: "act1" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction: createAction as never,
+    };
+    const created = await callTool(api, "create_query", {
+      query: {
+        ...validQuery,
+        groupBy: ["role"],
+        aggregate: { fn: "count" },
+        having: [{ column: "count", op: "gte", value: { literal: 2 } }],
+      },
+    });
+
+    expect(created.created).toBe(true);
+    expect(created.body).toBe(
+      'SELECT "role", COUNT(*) AS count FROM users GROUP BY "role" HAVING COUNT(*) >= {{ 2 }};',
+    );
+
+    const refused = await callTool(api, "create_query", {
+      query: {
+        ...validQuery,
+        name: "getUsers2",
+        groupBy: ["role"],
+        aggregate: { fn: "count" },
+        having: [{ column: "email", op: "eq", value: { literal: "x" } }],
+      },
+    });
+
+    expect(refused.valid).toBe(false);
+    expect(JSON.stringify(refused.errors)).toContain("or a groupBy column");
+    expect(createAction).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["postgres-plugin", true],
+    ["mysql-plugin", false],
+  ])(
+    "APP-16324 F1.6: create_query compiles a split group column only on PostgreSQL (%s)",
+    async (pluginId, allowed) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: {
+          ...validQuery,
+          groupBy: [{ column: "roles", split: "," }],
+          aggregate: { fn: "count" },
+        },
+      });
+
+      if (allowed) {
+        expect(body.created).toBe(true);
+        expect(body.body).toBe(
+          'SELECT TRIM(mcp_split.mcp_split_value) AS "roles", COUNT(*) AS count FROM users CROSS JOIN LATERAL unnest(string_to_array("roles", {{ "," }})) AS mcp_split(mcp_split_value) GROUP BY TRIM(mcp_split.mcp_split_value);',
+        );
+      } else {
+        expect(body.valid).toBe(false);
+        expect(JSON.stringify(body.errors)).toMatch(
+          /split \(on roles\) is only available on a PostgreSQL datasource/,
+        );
+        expect(createAction).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each([
+    ["postgres-plugin", true],
+    ["redshift-plugin", true],
+    ["mysql-plugin", false],
+    ["oracle-plugin", false],
+    ["mssql-plugin", false],
+  ])(
+    "APP-16495: create_query compiles a date bucket with aggregates only on PostgreSQL or Redshift (%s)",
+    async (pluginId, allowed) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: {
+          ...validQuery,
+          groupBy: [{ column: "created_at", bucket: "week", as: "week" }],
+          aggregates: [{ fn: "count" }],
+          orderBy: [{ column: "week", direction: "ASC" }],
+        },
+      });
+
+      if (allowed) {
+        expect(body.created).toBe(true);
+        expect(body.body).toBe(
+          "SELECT DATE_TRUNC('week', \"created_at\") AS week, COUNT(*) AS count FROM users GROUP BY DATE_TRUNC('week', \"created_at\") ORDER BY week ASC;",
+        );
+      } else {
+        expect(body.valid).toBe(false);
+        expect(body.errors).toContainEqual(
+          expect.objectContaining({
+            message:
+              "bucket (on created_at) is only available on a PostgreSQL or Redshift datasource, which have DATE_TRUNC",
+            path: "",
+          }),
+        );
+        expect(createAction).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  // APP-16507: Redshift and Snowflake run SQL as plain text, so the server would paste a viewer's widget value into
+  // the query. create_query refuses any value there and stores nothing. A query with no values still works.
+  it.each([
+    ["redshift-plugin", "Redshift"],
+    ["snowflake-plugin", "Snowflake"],
+  ])(
+    "APP-16507: create_query refuses a widget-valued filter on %s and creates nothing",
+    async (pluginId, database) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: {
+          ...validQuery,
+          filters: [
+            {
+              column: "email",
+              op: "eq",
+              value: { widget: "EmailInput", property: "text" },
+            },
+          ],
+        },
+      });
+
+      expect(body.valid).toBe(false);
+      expect(JSON.stringify(body.errors)).toContain(
+        `the ${database} plugin does not use prepared statements`,
+      );
+      expect(createAction).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["redshift-plugin", "snowflake-plugin"])(
+    "APP-16507: create_query still creates a query with no values on %s",
+    async (pluginId) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: {
+          ...validQuery,
+          columns: ["id", "email"],
+          filters: [{ column: "deleted_at", op: "isNull" }],
+          limit: 50,
+        },
+      });
+
+      expect(body.created).toBe(true);
+      expect(body.body).not.toContain("{{");
+      expect(createAction).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  // Oracle "weekly resolution time", end to end: the stored body is the compiled SQL behind the MCP marker.
+  it("APP-16495: create_query compiles the Oracle weekly shape and stores it", async () => {
+    const createAction = jest.fn(async () => ({ id: "act1" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction: createAction as never,
+    };
+    const body = await callTool(api, "create_query", {
+      query: {
+        ...validQuery,
+        table: "public.oracle_support_ticket",
+        groupBy: [
+          { column: "created_at", bucket: "week", as: "week" },
+          "status",
+          "severity",
+          "support_level",
+        ],
+        aggregates: [
+          { fn: "avg", column: "resolution_time", abs: true, round: "floor" },
+          { fn: "count" },
+        ],
+        orderBy: [{ column: "week", direction: "ASC" }],
+      },
+    });
+    const sql =
+      'SELECT DATE_TRUNC(\'week\', "created_at") AS week, "status", "severity", "support_level", FLOOR(AVG(ABS("resolution_time"))) AS avg, COUNT(*) AS count FROM public.oracle_support_ticket GROUP BY DATE_TRUNC(\'week\', "created_at"), "status", "severity", "support_level" ORDER BY week ASC;';
+
+    expect(body.created).toBe(true);
+    expect(body.body).toBe(sql);
+    expect(
+      mcpAuthoredBody(
+        (
+          (createAction.mock.calls[0] as unknown[])[0] as {
+            actionConfiguration: { body: string };
+          }
+        ).actionConfiguration.body,
+      ),
+    ).toBe(sql);
+  });
+
+  it.each([
+    [
+      "aggregates",
+      {
+        operation: "DELETE",
+        filters: [{ column: "id", op: "eq", value: { literal: 1 } }],
+        aggregates: [{ fn: "count" }],
+      },
+    ],
+    [
+      "distinct",
+      {
+        operation: "UPDATE",
+        values: [{ column: "name", value: { literal: "x" } }],
+        filters: [{ column: "id", op: "eq", value: { literal: 1 } }],
+        distinct: true,
+      },
+    ],
+  ])(
+    "APP-16495: create_query refuses %s on a write before any API write",
+    async (field, query) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: { ...validQuery, ...query },
+      });
+
+      expect(body.valid).toBe(false);
+      expect(body.errors).toContainEqual({
+        path: field,
+        message: `${field} is only valid on a SELECT query`,
+      });
+      expect(createAction).not.toHaveBeenCalled();
+    },
+  );
+
+  // SQL Server spells these CEILING and ROUND(x, n), so ceil and round are refused there before any API write.
+  it.each([
+    ["mssql-plugin", "ceil", false],
+    ["mssql-plugin", "round", false],
+    ["mssql-plugin", "floor", true],
+    ["mysql-plugin", "ceil", true],
+  ])(
+    "APP-16495: create_query on %s with round %s",
+    async (pluginId, round, allowed) => {
+      const createAction = jest.fn(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction: createAction as never,
+      };
+      const body = await callTool(api, "create_query", {
+        query: {
+          ...validQuery,
+          aggregates: [{ fn: "avg", column: "age", round }],
+        },
+      });
+
+      if (allowed) {
+        expect(body.created).toBe(true);
+        expect(createAction).toHaveBeenCalledTimes(1);
+      } else {
+        expect(body.valid).toBe(false);
+        expect(body.errors).toContainEqual(
+          expect.objectContaining({
+            message: `round "${round}" (on age) is only available on a PostgreSQL, Redshift, MySQL or Oracle datasource; on other databases use round "floor" or no round`,
+            path: "",
+          }),
+        );
+        expect(createAction).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("create_query refuses a datasource the caller cannot access (IDOR guard)", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      // The caller's accessible datasources do NOT include ds1.
+      listDatasources: jest.fn(async () => [{ id: "other", name: "X" }]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_query", { query: validQuery });
+
+    expect(body.error).toMatch(/not accessible/);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_query refuses non-SQL datasources", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Users API", pluginId: "rest-api-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_query", { query: validQuery });
+
+    expect(body.error).toMatch(/supports only/i);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_query resolves the workspace from the application, not the agent (cross-tenant guard)", async () => {
+    const createAction = jest.fn();
+    // ds1 exists only in workspace A; the app resolves to workspace B, so the lookup there returns nothing.
+    const listDatasources = jest.fn(async (workspaceId: string) =>
+      workspaceId === "wsA" ? [{ id: "ds1" }] : [],
+    );
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({ workspaceId: "wsB" })),
+      listDatasources,
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_query", { query: validQuery });
+
+    // Datasource is looked up in the app's OWN workspace (wsB), where ds1 is absent → refused, no POST.
+    expect(listDatasources).toHaveBeenCalledWith("wsB");
+    expect(body.error).toMatch(/not accessible/);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_query is idempotent: returns the existing query instead of duplicating", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", pluginId: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => [{ name: "getUsers", pageId: "p1" }]),
+      createAction,
+    };
+    const body = await callTool(api, "create_query", { query: validQuery });
+
+    expect(body.created).toBe(false);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_query rejects a spec that could inject before any API call", async () => {
+    const listDatasources = jest.fn(async () => [{ id: "ds1" }]);
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources,
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_query", {
+      query: { ...validQuery, table: "users; DROP TABLE users" },
+    });
+
+    expect(body.valid).toBe(false);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_query resolves plugin DOCUMENT ids through the workspace plugin list", async () => {
+    // Real servers return the plugin's Mongo id on the datasource, not the packageName; the family check must
+    // resolve it via listPlugins(workspaceId).
+    const createAction = jest.fn(async () => ({ id: "act1" }));
+    const listPlugins = jest.fn(async () => [
+      { id: "656f00000000000000000001", packageName: "postgres-plugin" },
+    ]);
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "DB", pluginId: "656f00000000000000000001" },
+      ]),
+      listPlugins,
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_query", { query: validQuery });
+
+    expect(body.created).toBe(true);
+    expect(listPlugins).toHaveBeenCalledWith("ws1");
+    expect(createAction).toHaveBeenCalledTimes(1);
+  });
+
+  const mongoQuery = {
+    name: "getOrders",
+    applicationId: "app1",
+    pageId: "p1",
+    datasourceId: "ds1",
+    collection: "orders",
+    operation: "FIND",
+    filter: [{ field: "status", value: { literal: "open" } }],
+  };
+
+  it("create_mongo_query creates a Mongo find action against a Mongo datasource", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-m" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Mongo", pluginId: "656f00000000000000000009" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000009", packageName: "mongo-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_mongo_query", {
+      query: mongoQuery,
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.command).toBe("FIND");
+    expect(createAction).toHaveBeenCalledTimes(1);
+
+    const dto = createAction.mock.calls[0][0] as {
+      actionConfiguration: {
+        formData: {
+          command: { data: string };
+          find: { query: { data: string } };
+          smartSubstitution: { data: boolean };
+        };
+      };
+    };
+
+    expect(dto.actionConfiguration.formData.command.data).toBe("FIND");
+    expect(dto.actionConfiguration.formData.find.query.data).toBe(
+      '{ "status": "open" }',
+    );
+    expect(dto.actionConfiguration.formData.smartSubstitution.data).toBe(true);
+  });
+
+  it("create_mongo_query pins a query that reads this.params to MANUAL through the run-behaviour route", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-p" }));
+    const setActionRunBehaviour = jest.fn<Promise<unknown>, [string, string]>(
+      async () => ({}),
+    );
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Mongo", pluginId: "656f00000000000000000009" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000009", packageName: "mongo-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+      setActionRunBehaviour,
+    };
+    const withParam = {
+      ...mongoQuery,
+      name: "findByOwner",
+      filter: [{ field: "owner", value: { param: "owner" } }],
+    };
+
+    const body = await callTool(api, "create_mongo_query", {
+      query: withParam,
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.runBehaviour).toBe("MANUAL");
+    expect(setActionRunBehaviour).toHaveBeenCalledWith("act-p", "MANUAL");
+
+    // A plain query is left alone.
+    setActionRunBehaviour.mockClear();
+    await callTool(api, "create_mongo_query", { query: mongoQuery });
+    expect(setActionRunBehaviour).not.toHaveBeenCalled();
+
+    // A failed pin fails CLOSED: the query is removed again (an unpinned params query would be auto-switched onto
+    // page load), and the agent is told so.
+    const deleteAction = api.deleteAction as jest.Mock;
+
+    setActionRunBehaviour.mockRejectedValueOnce(
+      new Error("Appsmith API request failed (403)"),
+    );
+    const removed = await callTool(api, "create_mongo_query", {
+      query: { ...withParam, name: "findByOwner2" },
+    });
+
+    expect(removed.created).toBe(false);
+    expect(removed.code).toBe("run_behaviour_not_pinned");
+    expect(String(removed.error)).toContain("so it was removed again");
+    expect(deleteAction).toHaveBeenCalledWith("act-p");
+
+    // Only when the removal itself fails is the query reported as still present, with the manual remediation.
+    setActionRunBehaviour.mockRejectedValueOnce(
+      new Error("Appsmith API request failed (403)"),
+    );
+    deleteAction.mockRejectedValueOnce(
+      new Error("Appsmith API request failed (500)"),
+    );
+    const partial = await callTool(api, "create_mongo_query", {
+      query: { ...withParam, name: "findByOwner3" },
+    });
+
+    expect(partial.created).toBe(true);
+    expect(partial.code).toBe("run_behaviour_not_pinned");
+    expect(String(partial.error)).toContain("could not be removed either");
+
+    // A create response without an id cannot be cleaned up: the query is reported as present, never as removed.
+    createAction.mockResolvedValueOnce({} as never);
+    deleteAction.mockClear();
+    const noId = await callTool(api, "create_mongo_query", {
+      query: { ...withParam, name: "findByOwner4" },
+    });
+
+    expect(noId.created).toBe(true);
+    expect(noId.code).toBe("run_behaviour_not_pinned");
+    expect(String(noId.error)).toContain("carried no action id");
+    expect(deleteAction).not.toHaveBeenCalled();
+  });
+
+  it("create_mongo_query creates a targeted UPDATE ($set, SINGLE, manual)", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-mu" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Mongo", pluginId: "656f00000000000000000009" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000009", packageName: "mongo-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_mongo_query", {
+      query: {
+        ...mongoQuery,
+        name: "closeOrder",
+        operation: "UPDATE",
+        update: [{ field: "status", value: { literal: "closed" } }],
+      },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.command).toBe("UPDATE");
+
+    const dto = createAction.mock.calls[0][0] as {
+      executeOnLoad: boolean;
+      actionConfiguration: {
+        formData: {
+          command: { data: string };
+          updateMany: {
+            query: { data: string };
+            update: { data: string };
+            limit: { data: string };
+          };
+        };
+      };
+    };
+
+    expect(dto.actionConfiguration.formData.command.data).toBe("UPDATE");
+    expect(dto.actionConfiguration.formData.updateMany.query.data).toBe(
+      '{ "status": "open" }',
+    );
+    expect(dto.actionConfiguration.formData.updateMany.update.data).toBe(
+      '{ "$set": { "status": "closed" } }',
+    );
+    expect(dto.actionConfiguration.formData.updateMany.limit.data).toBe(
+      "SINGLE",
+    );
+    expect(dto.executeOnLoad).toBe(false);
+  });
+
+  it("create_redis_query creates a single-command action against a Redis datasource", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-r" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Redis", pluginId: "656f00000000000000000010" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000010", packageName: "redis-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_redis_query", {
+      query: {
+        name: "SetGreeting",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        command: "SET",
+        key: "greeting",
+        value: { widget: "Input1", property: "text" },
+      },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.command).toBe("SET greeting {{ Input1.text }}");
+
+    const dto = createAction.mock.calls[0][0] as {
+      actionConfiguration: {
+        body: string;
+        dynamicBindingPathList?: { key: string }[];
+      };
+    };
+
+    expect(dto.actionConfiguration.body).toBe("SET greeting {{ Input1.text }}");
+    expect(dto.actionConfiguration.dynamicBindingPathList).toEqual([
+      { key: "body" },
+    ]);
+  });
+
+  it("create_ai_query creates a chat action and resolves the provider from the datasource plugin", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-ai" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Claude", pluginId: "656f00000000000000000020" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000020", packageName: "anthropic-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_ai_query", {
+      query: {
+        name: "Ask",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        model: "claude-3-5-sonnet-20241022",
+        messages: [
+          { role: "user", content: { widget: "Prompt", property: "text" } },
+        ],
+      },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.provider).toBe("Anthropic");
+
+    const dto = createAction.mock.calls[0][0] as {
+      actionConfiguration: {
+        formData: { command: { data: string }; chatModel: { data: string } };
+        dynamicBindingPathList?: { key: string }[];
+      };
+    };
+
+    expect(dto.actionConfiguration.formData.command.data).toBe("CHAT");
+    expect(dto.actionConfiguration.formData.chatModel.data).toBe(
+      "claude-3-5-sonnet-20241022",
+    );
+    expect(dto.actionConfiguration.dynamicBindingPathList).toEqual([
+      { key: "formData.messages.data" },
+    ]);
+  });
+
+  it("create_s3_query creates a file action against an S3 datasource", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-s3" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "S3", pluginId: "656f00000000000000000030" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000030", packageName: "amazons3-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_s3_query", {
+      query: {
+        name: "Upload",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        operation: "upload",
+        bucket: "my-bucket",
+        path: { literal: "docs/a.txt" },
+        body: { widget: "Editor", property: "text" },
+      },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.command).toBe("UPLOAD_FILE_FROM_BODY");
+
+    const dto = createAction.mock.calls[0][0] as {
+      actionConfiguration: {
+        formData: {
+          command: { data: string };
+          bucket: { data: string };
+          smartSubstitution: { data: boolean };
+          body: { data: string };
+        };
+        dynamicBindingPathList?: { key: string }[];
+      };
+    };
+
+    expect(dto.actionConfiguration.formData.command.data).toBe(
+      "UPLOAD_FILE_FROM_BODY",
+    );
+    expect(dto.actionConfiguration.formData.smartSubstitution.data).toBe(true);
+    expect(dto.actionConfiguration.formData.body.data).toBe(
+      "{{ Editor.text }}",
+    );
+    expect(dto.actionConfiguration.dynamicBindingPathList).toEqual([
+      { key: "formData.body.data" },
+    ]);
+  });
+
+  it("create_graphql_query creates a POST action with parameterized variables", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-gql" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "GQL", pluginId: "656f00000000000000000040" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000040", packageName: "graphql-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_graphql_query", {
+      query: {
+        name: "GetUser",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        query: "query($id: ID!) { user(id: $id) { id name } }",
+        variables: [
+          {
+            name: "id",
+            value: { widget: "Table", property: "selectedRow.id" },
+          },
+        ],
+      },
+    });
+
+    expect(body.created).toBe(true);
+
+    const dto = createAction.mock.calls[0][0] as {
+      actionConfiguration: {
+        httpMethod: string;
+        body: string;
+        pluginSpecifiedTemplates: { value: unknown }[];
+        dynamicBindingPathList?: { key: string }[];
+      };
+    };
+
+    expect(dto.actionConfiguration.httpMethod).toBe("POST");
+    expect(dto.actionConfiguration.body).toContain("user(id: $id)");
+    expect(dto.actionConfiguration.pluginSpecifiedTemplates[1].value).toBe(
+      '{ "id": {{ Table.selectedRow.id }} }',
+    );
+    expect(dto.actionConfiguration.dynamicBindingPathList).toEqual([
+      { key: "pluginSpecifiedTemplates[1].value" },
+    ]);
+  });
+
+  it("create_graphql_query is idempotent — returns the existing query, no duplicate write", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "GQL", pluginId: "656f00000000000000000040" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000040", packageName: "graphql-plugin" },
+      ]),
+      listActions: jest.fn(async () => [
+        { id: "existing", name: "GetUser", pageId: "p1" },
+      ]),
+      createAction,
+    };
+    const body = await callTool(api, "create_graphql_query", {
+      query: {
+        name: "GetUser",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        query: "query { a }",
+      },
+    });
+
+    expect(body.created).toBe(false);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_graphql_query refuses a non-GraphQL datasource", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "PG", pluginId: "656f00000000000000000001" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000001", packageName: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_graphql_query", {
+      query: {
+        name: "Q",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        query: "query { a }",
+      },
+    });
+
+    expect(body.error).toMatch(/requires an existing GraphQL datasource/);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_s3_query refuses a non-S3 datasource", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "PG", pluginId: "656f00000000000000000001" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000001", packageName: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_s3_query", {
+      query: {
+        name: "List",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        operation: "list",
+        bucket: "b",
+      },
+    });
+
+    expect(body.error).toMatch(/requires an existing Amazon S3 datasource/);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_ai_query is idempotent — returns the existing query, no duplicate write", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "OpenAI", pluginId: "656f00000000000000000021" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000021", packageName: "openai-plugin" },
+      ]),
+      listActions: jest.fn(async () => [
+        { id: "existing", name: "Ask", pageId: "p1" },
+      ]),
+      createAction,
+    };
+    const body = await callTool(api, "create_ai_query", {
+      query: {
+        name: "Ask",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        model: "gpt-4o",
+        messages: [{ role: "user", content: { literal: "hi" } }],
+      },
+    });
+
+    expect(body.created).toBe(false);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_ai_query refuses a non-AI datasource", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "PG", pluginId: "656f00000000000000000001" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000001", packageName: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_ai_query", {
+      query: {
+        name: "Ask",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        model: "gpt-4o",
+        messages: [{ role: "user", content: { literal: "hi" } }],
+      },
+    });
+
+    expect(body.error).toMatch(/OpenAI, Anthropic, or Google AI datasource/);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_redis_query is idempotent — returns the existing query, no duplicate write", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Redis", pluginId: "656f00000000000000000010" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000010", packageName: "redis-plugin" },
+      ]),
+      listActions: jest.fn(async () => [
+        { id: "existing", name: "GetK", pageId: "p1" },
+      ]),
+      createAction,
+    };
+    const body = await callTool(api, "create_redis_query", {
+      query: {
+        name: "GetK",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        command: "GET",
+        key: "k",
+      },
+    });
+
+    expect(body.created).toBe(false);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_redis_query refuses a non-Redis datasource", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "PG", pluginId: "656f00000000000000000001" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000001", packageName: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_redis_query", {
+      query: {
+        name: "GetK",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        command: "GET",
+        key: "k",
+      },
+    });
+
+    expect(body.error).toMatch(/requires an existing Redis datasource/);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_mongo_query refuses a non-Mongo (SQL) datasource", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "PG", pluginId: "postgres-plugin" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "postgres-plugin", packageName: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_mongo_query", {
+      query: mongoQuery,
+    });
+
+    expect(String(body.error)).toMatch(/requires an existing MongoDB/);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_mongo_query rejects an injecting collection/field before any write", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [{ id: "ds1" }]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_mongo_query", {
+      query: { ...mongoQuery, collection: "orders; drop" },
+    });
+
+    expect(body.valid).toBe(false);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  const sheetsAppend = {
+    name: "addRow",
+    applicationId: "app1",
+    pageId: "p1",
+    datasourceId: "ds1",
+    sheetUrl: "https://docs.google.com/spreadsheets/d/1AbC_dEf-123/edit",
+    sheetName: "Sheet1",
+    operation: "append",
+    row: [{ column: "name", value: { widget: "NameInput", property: "text" } }],
+  };
+
+  it("create_sheets_query appends a row to an authorized Sheets datasource", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-s" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Sheet", pluginId: "656f00000000000000000010" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000010", packageName: "google-sheets-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_sheets_query", {
+      query: sheetsAppend,
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.command).toBe("INSERT_ONE");
+
+    const dto = createAction.mock.calls[0][0] as {
+      actionConfiguration: {
+        formData: { rowObjects: { data: string }; command: { data: string } };
+      };
+    };
+
+    expect(dto.actionConfiguration.formData.command.data).toBe("INSERT_ONE");
+    expect(dto.actionConfiguration.formData.rowObjects.data).toBe(
+      '{ "name": {{ NameInput.text }} }',
+    );
+  });
+
+  it("create_sheets_query updates a row in place (UPDATE_ONE with a rowIndex-addressed row)", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-u" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Sheet", pluginId: "656f00000000000000000010" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000010", packageName: "google-sheets-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_sheets_query", {
+      query: {
+        ...sheetsAppend,
+        name: "editRow",
+        operation: "update",
+        rowIndex: { widget: "Table1", property: "selectedRow.rowIndex" },
+        row: [
+          {
+            column: "status",
+            value: { widget: "StatusInput", property: "text" },
+          },
+        ],
+      },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.command).toBe("UPDATE_ONE");
+
+    const dto = createAction.mock.calls[0][0] as {
+      executeOnLoad: boolean;
+      actionConfiguration: {
+        formData: { rowObjects: { data: string }; command: { data: string } };
+      };
+    };
+
+    expect(dto.actionConfiguration.formData.command.data).toBe("UPDATE_ONE");
+    expect(dto.actionConfiguration.formData.rowObjects.data).toBe(
+      '{ "rowIndex": {{ Table1.selectedRow.rowIndex }}, "status": {{ StatusInput.text }} }',
+    );
+    // A mutation is manual, never on page load.
+    expect(dto.executeOnLoad).toBe(false);
+  });
+
+  it("create_sheets_query threads a widget-bound filter into the where clause and eval path", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-f" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Sheet", pluginId: "656f00000000000000000010" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000010", packageName: "google-sheets-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    // A read spec is strict and has no `row`; drop the append fixture's row before reusing its base fields.
+    const filterQuery: Record<string, unknown> = {
+      ...sheetsAppend,
+      name: "completedTasks",
+      operation: "read",
+      filter: [
+        {
+          column: "Status",
+          op: "eq",
+          value: { widget: "StatusSelect", property: "selectedOptionValue" },
+        },
+      ],
+    };
+
+    delete filterQuery.row;
+    const body = await callTool(api, "create_sheets_query", {
+      query: filterQuery,
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.command).toBe("FETCH_MANY");
+
+    const dto = createAction.mock.calls[0][0] as {
+      executeOnLoad: boolean;
+      actionConfiguration: {
+        formData: { where: { data: string; viewType: string } };
+        dynamicBindingPathList: { key: string }[];
+      };
+    };
+
+    expect(JSON.parse(dto.actionConfiguration.formData.where.data)).toEqual({
+      condition: "AND",
+      children: [
+        {
+          condition: "EQ",
+          key: "Status",
+          value:
+            "{{ JSON.stringify(String(StatusSelect.selectedOptionValue ?? '')).slice(1, -1) }}",
+        },
+      ],
+    });
+    // A widget-bound filter is resolved by client eval — the where field is registered for it.
+    expect(dto.actionConfiguration.dynamicBindingPathList).toEqual([
+      { key: "formData.where.data" },
+    ]);
+    // A read runs on page load.
+    expect(dto.executeOnLoad).toBe(true);
+  });
+
+  // Regression: a widget-bound filter value must not be able to restructure the where clause. The where field is not
+  // one of the plugin's smart-substituted jsonFields, so eval splices the RESOLVED value into the JSON document
+  // textually. Compile-time escaping only covers the `{{ }}` placeholder, so the binding has to escape its own value.
+  it("create_sheets_query filter binding cannot inject into the where JSON", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-f" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Sheet", pluginId: "656f00000000000000000010" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000010", packageName: "google-sheets-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const filterQuery: Record<string, unknown> = {
+      ...sheetsAppend,
+      name: "FilterInject",
+      operation: "read",
+      filter: [
+        {
+          column: "Status",
+          op: "eq",
+          value: { widget: "StatusSelect", property: "selectedOptionValue" },
+        },
+      ],
+    };
+
+    delete filterQuery.row;
+    await callTool(api, "create_sheets_query", { query: filterQuery });
+
+    const dto = createAction.mock.calls[0][0] as {
+      actionConfiguration: { formData: { where: { data: string } } };
+    };
+    const emitted = dto.actionConfiguration.formData.where.data;
+
+    // The value must carry its own escaping, not sit in the document as a bare binding.
+    expect(emitted).toContain("JSON.stringify");
+    expect(emitted).not.toContain('"{{ StatusSelect.selectedOptionValue }}"');
+
+    // Reproduce what eval does: evaluate the binding against a hostile widget value and splice the result in.
+    const hostile = 'x","key":"Salary","value":"';
+    const binding = emitted.match(/\{\{(.+?)\}\}/);
+
+    expect(binding).not.toBeNull();
+
+    const resolved = new Function("StatusSelect", `return (${binding![1]});`)({
+      selectedOptionValue: hostile,
+    });
+    const afterEval = emitted.replace(/\{\{.+?\}\}/, String(resolved));
+
+    // Still one condition, still on the intended column, and the hostile text stayed inside the value.
+    const parsed = JSON.parse(afterEval);
+
+    expect(parsed.children).toHaveLength(1);
+    expect(parsed.children[0].key).toBe("Status");
+    expect(parsed.children[0].value).toBe(hostile);
+  });
+
+  it("create_sheets_query deletes a row (DELETE_ONE, widget-bound rowIndex + eval path)", async () => {
+    const createAction = jest.fn<
+      Promise<{ id: string }>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "act-d" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "Sheet", pluginId: "656f00000000000000000010" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000010", packageName: "google-sheets-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const deleteQuery: Record<string, unknown> = {
+      ...sheetsAppend,
+      name: "deleteRow",
+      operation: "delete",
+      rowIndex: { widget: "Table1", property: "selectedRow.rowIndex" },
+    };
+
+    delete deleteQuery.row;
+    const body = await callTool(api, "create_sheets_query", {
+      query: deleteQuery,
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.command).toBe("DELETE_ONE");
+
+    const dto = createAction.mock.calls[0][0] as {
+      executeOnLoad: boolean;
+      actionConfiguration: {
+        formData: { command: { data: string }; rowIndex: { data: string } };
+        dynamicBindingPathList: { key: string }[];
+      };
+    };
+
+    expect(dto.actionConfiguration.formData.command.data).toBe("DELETE_ONE");
+    expect(dto.actionConfiguration.formData.rowIndex.data).toBe(
+      "{{ Table1.selectedRow.rowIndex }}",
+    );
+    expect(dto.actionConfiguration.dynamicBindingPathList).toEqual([
+      { key: "formData.rowIndex.data" },
+    ]);
+    expect(dto.executeOnLoad).toBe(false);
+  });
+
+  it("create_sheets_query refuses a non-Sheets datasource", async () => {
+    const createAction = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "PG", pluginId: "postgres-plugin" },
+      ]),
+      listPlugins: jest.fn(async () => [
+        { id: "postgres-plugin", packageName: "postgres-plugin" },
+      ]),
+      listActions: jest.fn(async () => []),
+      createAction,
+    };
+    const body = await callTool(api, "create_sheets_query", {
+      query: sheetsAppend,
+    });
+
+    expect(String(body.error)).toMatch(/Google Sheets datasource/);
+    expect(createAction).not.toHaveBeenCalled();
+  });
+
+  it("create_mongo_query and create_sheets_query appear only when the data flag is on", async () => {
+    const off = await toolNames(false);
+    const on = await toolNames(true);
+
+    expect(off).not.toContain("create_mongo_query");
+    expect(off).not.toContain("create_sheets_query");
+    expect(off).not.toContain("create_redis_query");
+    expect(off).not.toContain("create_ai_query");
+    expect(off).not.toContain("create_s3_query");
+    expect(off).not.toContain("create_graphql_query");
+    expect(on).toContain("create_mongo_query");
+    expect(on).toContain("create_sheets_query");
+    expect(on).toContain("create_redis_query");
+    expect(on).toContain("create_ai_query");
+    expect(on).toContain("create_s3_query");
+    expect(on).toContain("create_graphql_query");
+  });
+
+  it("create_datasource creates an UNCONFIGURED datasource with no credential fields", async () => {
+    const createDatasource = jest.fn<
+      Promise<Record<string, unknown>>,
+      [Record<string, unknown>]
+    >(async () => ({
+      id: "ds9",
+      name: "My Postgres",
+      pluginId: "656f00000000000000000001",
+      workspaceId: "ws1",
+    }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "656f00000000000000000001", packageName: "postgres-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+    const body = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "My Postgres",
+      plugin: "postgresql",
+      connection: {
+        host: "db.internal",
+        databaseName: "appdb",
+        username: "app_user",
+      },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.needsCredentials).toBe(true);
+    expect(typeof body.nextStep).toBe("string");
+    expect(createDatasource).toHaveBeenCalledTimes(1);
+
+    const dto = createDatasource.mock.calls[0][0] as unknown as {
+      pluginId: string;
+      datasourceStorages: Record<
+        string,
+        {
+          isConfigured: boolean;
+          datasourceConfiguration: {
+            endpoints: { host: string; port: number }[];
+            authentication: Record<string, unknown>;
+          };
+        }
+      >;
+    };
+
+    // Plugin document id resolved from the packageName; storage keyed by the fixed CE environment.
+    expect(dto.pluginId).toBe("656f00000000000000000001");
+    const storage = dto.datasourceStorages.unused_env;
+
+    expect(storage.isConfigured).toBe(false);
+    expect(storage.datasourceConfiguration.endpoints).toEqual([
+      { host: "db.internal", port: 5432 },
+    ]);
+    // The credential invariant: no password anywhere in the outbound DTO.
+    expect(JSON.stringify(dto)).not.toContain("password");
+    expect(storage.datasourceConfiguration.authentication).toEqual({
+      authenticationType: "dbAuth",
+      databaseName: "appdb",
+      username: "app_user",
+    });
+  });
+
+  it("create_datasource maps family default ports, explicit overrides, and omits an absent username", async () => {
+    const createDatasource = jest.fn<
+      Promise<Record<string, unknown>>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "ds9" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p-mysql", packageName: "mysql-plugin" },
+        { id: "p-mssql", packageName: "mssql-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+
+    // mysql defaults to 3306, and with no username the key is absent (not null/empty).
+    await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "MySQL DB",
+      plugin: "mysql",
+      connection: { host: "db", databaseName: "appdb" },
+    });
+
+    const mysqlConfig = (
+      createDatasource.mock.calls[0][0] as {
+        datasourceStorages: Record<
+          string,
+          {
+            datasourceConfiguration: {
+              endpoints: unknown;
+              authentication: Record<string, unknown>;
+            };
+          }
+        >;
+      }
+    ).datasourceStorages.unused_env.datasourceConfiguration;
+
+    expect(mysqlConfig.endpoints).toEqual([{ host: "db", port: 3306 }]);
+    expect(mysqlConfig.authentication).toEqual({
+      authenticationType: "dbAuth",
+      databaseName: "appdb",
+    });
+    expect("username" in mysqlConfig.authentication).toBe(false);
+
+    // mssql with an explicit port override wins over the family default (1433).
+    await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "MSSQL DB",
+      plugin: "mssql",
+      connection: { host: "sqlserver", port: 14330, databaseName: "appdb" },
+    });
+
+    const mssqlConfig = (
+      createDatasource.mock.calls[1][0] as {
+        datasourceStorages: Record<
+          string,
+          { datasourceConfiguration: { endpoints: unknown } }
+        >;
+      }
+    ).datasourceStorages.unused_env.datasourceConfiguration;
+
+    expect(mssqlConfig.endpoints).toEqual([{ host: "sqlserver", port: 14330 }]);
+  });
+
+  it("create_datasource provisions oracle and redshift on the shared host/port/dbAuth shape (D1)", async () => {
+    const createDatasource = jest.fn<
+      Promise<Record<string, unknown>>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "ds-sql" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p-oracle", packageName: "oracle-plugin" },
+        { id: "p-redshift", packageName: "redshift-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+
+    // oracle -> its plugin id + default port 1521, same dbAuth shape as the other databases.
+    const oracle = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "Oracle DB",
+      plugin: "oracle",
+      connection: {
+        host: "oracle-host",
+        databaseName: "ORCL",
+        username: "app",
+      },
+    });
+
+    expect(oracle).toMatchObject({ needsCredentials: true });
+    const oracleCall = createDatasource.mock.calls[0][0] as {
+      pluginId: string;
+      datasourceStorages: Record<
+        string,
+        {
+          isConfigured: boolean;
+          datasourceConfiguration: {
+            endpoints: unknown;
+            authentication: Record<string, unknown>;
+          };
+        }
+      >;
+    };
+
+    expect(oracleCall.pluginId).toBe("p-oracle");
+    const oracleConfig =
+      oracleCall.datasourceStorages.unused_env.datasourceConfiguration;
+
+    expect(oracleConfig.endpoints).toEqual([
+      { host: "oracle-host", port: 1521 },
+    ]);
+    expect(oracleConfig.authentication).toEqual({
+      authenticationType: "dbAuth",
+      databaseName: "ORCL",
+      username: "app",
+    });
+    // Databases are created UNCONFIGURED — the password is completed in the UI.
+    expect(oracleCall.datasourceStorages.unused_env.isConfigured).toBe(false);
+
+    // redshift -> default port 5439.
+    await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "Redshift DB",
+      plugin: "redshift",
+      connection: { host: "rs-host", databaseName: "dev" },
+    });
+
+    const redshiftConfig = (
+      createDatasource.mock.calls[1][0] as {
+        pluginId: string;
+        datasourceStorages: Record<
+          string,
+          { datasourceConfiguration: { endpoints: unknown } }
+        >;
+      }
+    ).datasourceStorages.unused_env.datasourceConfiguration;
+
+    expect(redshiftConfig.endpoints).toEqual([{ host: "rs-host", port: 5439 }]);
+  });
+
+  it("create_datasource rejects credential/injection input at the schema", async () => {
+    const createDatasource = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p1", packageName: "postgres-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+
+    // Strict schema: a password (or any unknown key) is rejected outright, never forwarded.
+    const withPassword = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "DB",
+      plugin: "postgresql",
+      connection: {
+        host: "db",
+        databaseName: "appdb",
+        password: "hunter2",
+      },
+    });
+
+    expect(JSON.stringify(withPassword)).toMatch(/error|invalid/i);
+
+    const badHost = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "DB",
+      plugin: "postgresql",
+      connection: { host: "db/../{{evil}}", databaseName: "appdb" },
+    });
+
+    expect(JSON.stringify(badHost)).toMatch(/error|invalid/i);
+    expect(createDatasource).not.toHaveBeenCalled();
+  });
+
+  it("create_datasource is idempotent by workspace + name", async () => {
+    const createDatasource = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p1", packageName: "postgres-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => [
+        { id: "ds1", name: "My Postgres", pluginId: "p1", workspaceId: "ws1" },
+      ]),
+      createDatasource,
+    };
+    const body = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "My Postgres",
+      plugin: "postgresql",
+      connection: { host: "db", databaseName: "appdb" },
+    });
+
+    expect(body.created).toBe(false);
+    expect(createDatasource).not.toHaveBeenCalled();
+  });
+
+  it("create_datasource errors clearly when the plugin is not installed", async () => {
+    const createDatasource = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p1", packageName: "restapi-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+    const body = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "DB",
+      plugin: "mssql",
+      connection: { host: "db", databaseName: "appdb" },
+    });
+
+    expect(body.error).toMatch(/not installed/);
+    expect(createDatasource).not.toHaveBeenCalled();
+  });
+
+  it("create_datasource provisions an UNCONFIGURED Mongo datasource from non-secret fields", async () => {
+    const createDatasource = jest.fn<
+      Promise<Record<string, unknown>>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "ds-mongo", name: "Orders", pluginId: "p-mongo" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p-mongo", packageName: "mongo-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+    const body = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "Orders",
+      plugin: "mongodb",
+      connection: { host: "mongo.internal", databaseName: "orders" },
+    });
+
+    expect(body.created).toBe(true);
+    expect(body.needsCredentials).toBe(true);
+    expect(createDatasource).toHaveBeenCalledTimes(1);
+
+    const dto = createDatasource.mock.calls[0][0] as unknown as {
+      pluginId: string;
+      datasourceStorages: Record<
+        string,
+        {
+          isConfigured: boolean;
+          datasourceConfiguration: {
+            endpoints: { host: string; port: number }[];
+            authentication: Record<string, unknown>;
+          };
+        }
+      >;
+    };
+
+    expect(dto.pluginId).toBe("p-mongo");
+    const storage = dto.datasourceStorages.unused_env;
+
+    // Created unconfigured (password completed in the UI), Mongo's default port, and NO credential in the DTO.
+    expect(storage.isConfigured).toBe(false);
+    expect(storage.datasourceConfiguration.endpoints).toEqual([
+      { host: "mongo.internal", port: 27017 },
+    ]);
+    expect(storage.datasourceConfiguration.authentication).toEqual({
+      authenticationType: "dbAuth",
+      databaseName: "orders",
+    });
+    expect(JSON.stringify(dto)).not.toMatch(/password/i);
+  });
+
+  it("create_datasource rejects a credential field on a Mongo datasource at the schema", async () => {
+    const createDatasource = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p-mongo", packageName: "mongo-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+    const withPassword = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "Orders",
+      plugin: "mongodb",
+      connection: {
+        host: "mongo.internal",
+        databaseName: "orders",
+        password: "hunter2",
+      },
+    });
+
+    expect(JSON.stringify(withPassword)).toMatch(/error|invalid/i);
+    expect(createDatasource).not.toHaveBeenCalled();
+  });
+
+  it("create_datasource refuses Google Sheets and hands the user off to the UI OAuth flow", async () => {
+    const createDatasource = jest.fn();
+    const listPlugins = jest.fn(async () => [
+      { id: "p-sheets", packageName: "google-sheets-plugin" },
+    ]);
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins,
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+    const body = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "My Sheet",
+      plugin: "googlesheets",
+    });
+
+    expect(body.code).toBe("needs_ui_oauth");
+    expect(String(body.error)).toMatch(/OAuth/i);
+    expect(String(body.error)).toMatch(/create_sheets_query/);
+    // Rejected before touching any datasource/plugin API — no credential path is even reachable.
+    expect(createDatasource).not.toHaveBeenCalled();
+    expect(listPlugins).not.toHaveBeenCalled();
+  });
+
+  it("create_datasource creates a CONFIGURED, ready-to-use REST datasource from a base URL", async () => {
+    const createDatasource = jest.fn<
+      Promise<Record<string, unknown>>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "ds-rest", name: "Zippopotam", pluginId: "p-rest" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p-rest", packageName: "restapi-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+    const body = await callTool(api, "create_datasource", {
+      workspaceId: "ws1",
+      name: "Zippopotam",
+      plugin: "rest",
+      url: "https://api.zippopotam.us",
+    });
+
+    expect(body.created).toBe(true);
+    // A no-auth REST datasource is complete — no credential hand-off.
+    expect(body.needsCredentials).toBe(false);
+    expect(createDatasource).toHaveBeenCalledTimes(1);
+
+    const dto = createDatasource.mock.calls[0][0] as unknown as {
+      pluginId: string;
+      datasourceStorages: Record<
+        string,
+        {
+          isConfigured: boolean;
+          datasourceConfiguration: { url?: string; endpoints?: unknown };
+        }
+      >;
+    };
+
+    expect(dto.pluginId).toBe("p-rest");
+    const storage = dto.datasourceStorages.unused_env;
+
+    // REST is created configured (usable immediately), carries the base URL, and has no DB endpoints/auth.
+    expect(storage.isConfigured).toBe(true);
+    expect(storage.datasourceConfiguration.url).toBe(
+      "https://api.zippopotam.us",
+    );
+    expect(storage.datasourceConfiguration.endpoints).toBeUndefined();
+    expect(JSON.stringify(dto)).not.toContain("dbAuth");
+  });
+
+  // On EE a workspace has real environments, and naming CE's fixed "unused_env" made the server refuse the create
+  // ("You do not have access to this environment"). With no environmentId, CE uses its fixed environment and EE the
+  // workspace's default one.
+  it.each([
+    ["rest", { url: "https://api.zippopotam.us" }],
+    [
+      "postgresql",
+      { connection: { host: "db.internal", databaseName: "appdb" } },
+    ],
+  ])(
+    "create_datasource (%s) leaves the storage's environment to the server",
+    async (plugin, target) => {
+      const createDatasource = jest.fn<
+        Promise<Record<string, unknown>>,
+        [Record<string, unknown>]
+      >(async () => ({ id: "ds1", name: "Env", pluginId: "p1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listPlugins: jest.fn(async () => [
+          { id: "p1", packageName: "restapi-plugin" },
+          { id: "p2", packageName: "postgres-plugin" },
+        ]),
+        listDatasources: jest.fn(async () => []),
+        createDatasource,
+      };
+
+      const body = await callTool(api, "create_datasource", {
+        workspaceId: "ws1",
+        name: "Env",
+        plugin,
+        ...target,
+      });
+
+      expect(body.created).toBe(true);
+
+      const storages = (
+        createDatasource.mock.calls[0][0] as {
+          datasourceStorages: Record<string, Record<string, unknown>>;
+        }
+      ).datasourceStorages;
+
+      expect(Object.values(storages)).toHaveLength(1);
+      expect(Object.values(storages)[0]).not.toHaveProperty("environmentId");
+    },
+  );
+
+  it("create_datasource enforces url-vs-connection per plugin family and rejects unsafe URLs", async () => {
+    const createDatasource = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listPlugins: jest.fn(async () => [
+        { id: "p-rest", packageName: "restapi-plugin" },
+        { id: "p-pg", packageName: "postgres-plugin" },
+      ]),
+      listDatasources: jest.fn(async () => []),
+      createDatasource,
+    };
+
+    // REST without a url.
+    expect(
+      JSON.stringify(
+        await callTool(api, "create_datasource", {
+          workspaceId: "ws1",
+          name: "R",
+          plugin: "rest",
+        }),
+      ),
+    ).toMatch(/requires 'url'/);
+
+    // REST with a database-style connection.
+    expect(
+      JSON.stringify(
+        await callTool(api, "create_datasource", {
+          workspaceId: "ws1",
+          name: "R",
+          plugin: "rest",
+          url: "https://api.example.com",
+          connection: { host: "db", databaseName: "x" },
+        }),
+      ),
+    ).toMatch(/'connection' is only for database/);
+
+    // Database with a url instead of a connection.
+    expect(
+      JSON.stringify(
+        await callTool(api, "create_datasource", {
+          workspaceId: "ws1",
+          name: "D",
+          plugin: "postgresql",
+          url: "https://api.example.com",
+        }),
+      ),
+    ).toMatch(/'url' is only for REST/);
+
+    // Unsafe URLs rejected at the schema (non-http scheme, whitespace, template syntax).
+    for (const url of [
+      "ftp://api.example.com",
+      "https://api.example.com/{{evil}}",
+      "https://api example.com",
+      "javascript:alert(1)",
+    ]) {
+      expect(
+        JSON.stringify(
+          await callTool(api, "create_datasource", {
+            workspaceId: "ws1",
+            name: "R",
+            plugin: "rest",
+            url,
+          }),
+        ),
+      ).toMatch(/error|invalid|url must be/i);
+    }
+
+    expect(createDatasource).not.toHaveBeenCalled();
+  });
+
+  it("list_datasources projects to non-secret fields only, even if upstream leaks", async () => {
+    // Simulate a (hypothetical) upstream response that carries credential material — the tool must strip it.
+    const listDatasources = jest.fn(async () => [
+      {
+        id: "ds1",
+        name: "Prod DB",
+        pluginId: "postgres",
+        workspaceId: "ws1",
+        datasourceStorages: {
+          default: {
+            datasourceConfiguration: {
+              authentication: { password: "hunter2", token: "secret-oauth" },
+            },
+          },
+        },
+      },
+    ]);
+    const api: AppsmithApi = { ...createApi()(), listDatasources };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+    });
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 8,
+        method: "tools/call",
+        params: { name: "list_datasources", arguments: { workspaceId: "ws1" } },
+      });
+    const text = parseJsonRpc(call).result.content[0].text;
+
+    expect(text).toContain("Prod DB");
+    expect(text).not.toContain("hunter2");
+    expect(text).not.toContain("secret-oauth");
+    expect(text).not.toContain("password");
+    expect(text).not.toContain("datasourceStorages");
+  });
+});
+
+describe("governance-wrapped layout mutations", () => {
+  class MemoryGovernanceStore implements McpGovernanceStore {
+    readonly changes: McpChangeRecord[] = [];
+    readonly confirmations = new Map<string, PreparedConfirmation>();
+    locked = new Set<string>();
+
+    async acquireLock(entityKey: string): Promise<string | undefined> {
+      if (this.locked.has(entityKey)) return undefined;
+
+      this.locked.add(entityKey);
+
+      return `lock:${entityKey}`;
+    }
+    async releaseLock(entityKey: string): Promise<void> {
+      this.locked.delete(entityKey);
+    }
+    async createConfirmation(c: PreparedConfirmation): Promise<void> {
+      this.confirmations.set(c.id, c);
+    }
+    async consumeConfirmation(
+      id: string,
+    ): Promise<PreparedConfirmation | undefined> {
+      const c = this.confirmations.get(id);
+
+      this.confirmations.delete(id);
+
+      return c;
+    }
+    async peekConfirmation(
+      id: string,
+    ): Promise<PreparedConfirmation | undefined> {
+      return this.confirmations.get(id);
+    }
+    async saveChange(change: McpChangeRecord): Promise<void> {
+      this.changes.push(change);
+    }
+    async getChange(
+      id: string,
+      actorId: string,
+      organizationId: string,
+    ): Promise<McpChangeRecord | undefined> {
+      return this.changes.find(
+        (c) =>
+          c.id === id &&
+          c.actorId === actorId &&
+          c.organizationId === organizationId,
+      );
+    }
+    async listChanges(
+      actorId: string,
+      organizationId: string,
+      limit: number,
+    ): Promise<McpChangeRecord[]> {
+      return this.changes
+        .filter(
+          (c) => c.actorId === actorId && c.organizationId === organizationId,
+        )
+        .slice(-limit)
+        .reverse();
+    }
+    async getAnyChange(
+      id: string,
+      organizationId: string,
+    ): Promise<McpChangeRecord | undefined> {
+      return this.changes.find(
+        (c) => c.id === id && c.organizationId === organizationId,
+      );
+    }
+    async listAllChanges(
+      organizationId: string,
+      limit: number,
+    ): Promise<McpChangeRecord[]> {
+      return this.changes
+        .filter((c) => c.organizationId === organizationId)
+        .slice(-limit)
+        .reverse();
+    }
+  }
+
+  const ROOT_DSL = {
+    widgetId: "0",
+    widgetName: "MainContainer",
+    type: "CANVAS_WIDGET",
+    topRow: 0,
+    bottomRow: 380,
+    leftColumn: 0,
+    rightColumn: 640,
+    children: [],
+  };
+
+  async function initSession(server: ReturnType<typeof createMcpHttpServer>) {
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    return sessionId;
+  }
+
+  function makeServer(store: McpGovernanceStore) {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: ROOT_DSL },
+      })),
+      updateLayout: jest.fn(async () => ({ ok: true })),
+    };
+
+    return createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store, {
+        now: () => new Date("2026-07-12T00:00:00.000Z"),
+      }),
+    });
+  }
+
+  async function editPage(
+    server: ReturnType<typeof createMcpHttpServer>,
+    args: Record<string, unknown>,
+  ) {
+    const sessionId = await initSession(server);
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: { name: "edit_page", arguments: args },
+      });
+
+    return JSON.parse(parseJsonRpc(call).result.content[0].text);
+  }
+
+  const baseArgs = {
+    applicationId: "app1",
+    pageId: "p1",
+    layoutId: "l1",
+    edit: { add: [{ type: "button", text: "Go" }] },
+  };
+
+  it("requires a revision when governance is enabled", async () => {
+    const store = new MemoryGovernanceStore();
+    const body = await editPage(makeServer(store), baseArgs);
+
+    expect(body.code).toBe("revision_required");
+    expect(store.changes).toHaveLength(0);
+  });
+
+  it("commits a governed edit, returns a changeId, and records an audit change", async () => {
+    const store = new MemoryGovernanceStore();
+    const revision = fingerprintDsl(ROOT_DSL as never);
+    const body = await editPage(makeServer(store), { ...baseArgs, revision });
+
+    expect(typeof body.changeId).toBe("string");
+    expect(body.revision).toMatch(/^[a-f0-9]{64}$/);
+    expect(store.changes).toHaveLength(1);
+    expect(store.changes[0].operation).toBe("edit_page");
+    expect(store.changes[0].actorId).toBe("user@appsmith.com");
+    // Rollback snapshot captures the prior DSL.
+    expect(store.changes[0].rollback).toHaveProperty("dsl");
+  });
+
+  it("rejects a stale revision with a revision_conflict code", async () => {
+    const store = new MemoryGovernanceStore();
+    const body = await editPage(makeServer(store), {
+      ...baseArgs,
+      revision: "0".repeat(64),
+    });
+
+    expect(body.code).toBe("revision_conflict");
+    expect(store.changes).toHaveLength(0);
+  });
+
+  const THEME = {
+    config: { colorMode: "LIGHT" },
+    stylesheet: { BUTTON_WIDGET: {} },
+    properties: {
+      colors: { primaryColor: "#553DE9" },
+      borderRadius: { appBorderRadius: "0.375rem" },
+      fontFamily: { appFont: "Nunito Sans" },
+    },
+  };
+
+  async function callTool(
+    server: ReturnType<typeof createMcpHttpServer>,
+    name: string,
+    args: Record<string, unknown>,
+  ) {
+    const sessionId = await initSession(server);
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 13,
+        method: "tools/call",
+        params: { name, arguments: args },
+      });
+    const text = parseJsonRpc(call).result.content[0].text;
+
+    return { body: JSON.parse(text), text };
+  }
+
+  const RAW_WORKSPACES = [
+    { id: "ws1", name: "Marketing", email: "x@y.com", plan: "free" },
+    { id: "ws2", name: "Marketing Ops", userPermissions: ["read"] },
+    { id: "ws3", name: "Engineering" },
+  ];
+
+  it("list_workspaces returns only { id, name } pairs (no other org metadata)", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, () => ({
+      ...createApi()(),
+      listWorkspaces: jest.fn(async () => RAW_WORKSPACES),
+    }));
+    const { body, text } = await callTool(server, "list_workspaces", {});
+
+    expect(body.workspaces).toEqual([
+      { id: "ws1", name: "Marketing" },
+      { id: "ws2", name: "Marketing Ops" },
+      { id: "ws3", name: "Engineering" },
+    ]);
+    // Other workspace fields are not surfaced.
+    expect(text).not.toContain("plan");
+    expect(text).not.toContain("userPermissions");
+  });
+
+  it("resolve_workspace matches by exact name, else partial, else empty", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, () => ({
+      ...createApi()(),
+      listWorkspaces: jest.fn(async () => RAW_WORKSPACES),
+    }));
+
+    // Exact (case-insensitive) match wins even though a partial one also exists.
+    const exact = await callTool(server, "resolve_workspace", {
+      name: "marketing",
+    });
+
+    expect(exact.body.matches).toEqual([{ id: "ws1", name: "Marketing" }]);
+
+    // No exact match -> partial (substring) matches.
+    const partial = await callTool(server, "resolve_workspace", {
+      name: "market",
+    });
+
+    expect(partial.body.matches).toEqual([
+      { id: "ws1", name: "Marketing" },
+      { id: "ws2", name: "Marketing Ops" },
+    ]);
+
+    // No match -> empty list (the agent should show candidates, not guess).
+    const none = await callTool(server, "resolve_workspace", { name: "Sales" });
+
+    expect(none.body.matches).toEqual([]);
+  });
+
+  it("resolve_workspace returns all candidates when several share an exact name", async () => {
+    const dupServer = createMcpHttpServer(API_BASE_URL, () => ({
+      ...createApi()(),
+      listWorkspaces: jest.fn(async () => [
+        { id: "a", name: "Support" },
+        { id: "b", name: "support" },
+        { id: "c", name: "Sales" },
+      ]),
+    }));
+
+    const dup = await callTool(dupServer, "resolve_workspace", {
+      name: "Support",
+    });
+
+    expect(dup.body.matches).toEqual([
+      { id: "a", name: "Support" },
+      { id: "b", name: "support" },
+    ]);
+  });
+
+  it("workspace tools degrade to empty when the API returns a non-array", async () => {
+    const badServer = createMcpHttpServer(API_BASE_URL, () => ({
+      ...createApi()(),
+      listWorkspaces: jest.fn(async () => ({ unexpected: "shape" })),
+    }));
+
+    const list = await callTool(badServer, "list_workspaces", {});
+
+    expect(list.body.workspaces).toEqual([]);
+
+    const resolved = await callTool(badServer, "resolve_workspace", {
+      name: "anything",
+    });
+
+    expect(resolved.body.matches).toEqual([]);
+  });
+
+  it("read_theme returns only safe tokens and a revision (no stylesheet/config)", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getCurrentTheme: jest.fn(async () => THEME),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const { body, text } = await callTool(server, "read_theme", {
+      applicationId: "app1",
+    });
+
+    expect(body.theme.primaryColor).toBe("#553DE9");
+    expect(body.theme.fontFamily).toBe("Nunito Sans");
+    expect(body.theme.revision).toMatch(/^[a-f0-9]{64}$/);
+    expect(text).not.toContain("stylesheet");
+    expect(text).not.toContain("colorMode");
+  });
+
+  it("update_theme commits a governed token change and records an audit", async () => {
+    const store = new MemoryGovernanceStore();
+    const updateTheme = jest.fn<
+      Promise<unknown>,
+      [string, Record<string, unknown>]
+    >(async () => ({
+      ...THEME,
+      properties: {
+        ...THEME.properties,
+        colors: { primaryColor: "#0A66C2" },
+      },
+    }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getCurrentTheme: jest.fn(async () => THEME),
+      updateTheme,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+    // Discover the current revision first (as an agent would via read_theme).
+    const read = await callTool(server, "read_theme", {
+      applicationId: "app1",
+    });
+    const update = await callTool(server, "update_theme", {
+      applicationId: "app1",
+      revision: read.body.theme.revision,
+      patch: { primaryColor: "#0A66C2" },
+    });
+
+    expect(updateTheme).toHaveBeenCalledTimes(1);
+    expect(update.body.theme.primaryColor).toBe("#0A66C2");
+    expect(typeof update.body.changeId).toBe("string");
+    expect(store.changes).toHaveLength(1);
+    expect(store.changes[0].operation).toBe("update_theme");
+    // The safe update payload must never smuggle stylesheet edits from the agent.
+    const sentBody = updateTheme.mock.calls[0][1];
+
+    expect(sentBody).toHaveProperty("properties");
+  });
+
+  it("update_theme is unavailable when governance is not configured", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getCurrentTheme: jest.fn(async () => THEME),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const sessionId = await initSession(server);
+    const listed = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", id: 14, method: "tools/list" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const names = (parseJsonRpc(listed).result as any).tools.map(
+      (t: { name: string }) => t.name,
+    );
+
+    expect(names).toContain("read_theme");
+    expect(names).not.toContain("update_theme");
+  });
+
+  const APP_ID = "a".repeat(24);
+  const PAGE_ID = "b".repeat(24);
+  const PAGES = { pages: [{ id: PAGE_ID, name: "Extra", slug: "extra" }] };
+
+  function pageServer(store: McpGovernanceStore, deletePage = jest.fn()) {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => PAGES),
+      deletePage,
+    };
+
+    return createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+  }
+
+  it("prepare_delete_page then confirm_delete_page deletes with a bound one-time token", async () => {
+    const store = new MemoryGovernanceStore();
+    const deletePage = jest.fn(async () => ({ ok: true }));
+    const server = pageServer(store, deletePage);
+
+    const read = await callTool(server, "read_pages", {
+      applicationId: APP_ID,
+    });
+    const revision = read.body.revision;
+
+    const prepared = await callTool(server, "prepare_delete_page", {
+      spec: { applicationId: APP_ID, pageId: PAGE_ID, revision },
+    });
+
+    expect(typeof prepared.body.confirmationId).toBe("string");
+
+    const confirmed = await callTool(server, "confirm_delete_page", {
+      spec: { applicationId: APP_ID, pageId: PAGE_ID, revision },
+      confirmationId: prepared.body.confirmationId,
+    });
+
+    expect(confirmed.body.deleted).toBe(true);
+    expect(deletePage).toHaveBeenCalledWith(PAGE_ID);
+    expect(typeof confirmed.body.changeId).toBe("string");
+    expect(store.changes.some((c) => c.operation === "delete_page")).toBe(true);
+
+    // Replay: the one-time token cannot be used again.
+    const replay = await callTool(server, "confirm_delete_page", {
+      spec: { applicationId: APP_ID, pageId: PAGE_ID, revision },
+      confirmationId: prepared.body.confirmationId,
+    });
+
+    expect(replay.body.code).toBe("confirmation_invalid");
+    expect(deletePage).toHaveBeenCalledTimes(1);
+  });
+
+  it("confirm_delete_page rejects a token that was never prepared (and replay)", async () => {
+    const store = new MemoryGovernanceStore();
+    const deletePage = jest.fn();
+    const server = pageServer(store, deletePage);
+    const read = await callTool(server, "read_pages", {
+      applicationId: APP_ID,
+    });
+
+    const confirmed = await callTool(server, "confirm_delete_page", {
+      spec: {
+        applicationId: APP_ID,
+        pageId: PAGE_ID,
+        revision: read.body.revision,
+      },
+      confirmationId: "unprepared-token",
+    });
+
+    expect(confirmed.body.code).toBe("confirmation_invalid");
+    expect(deletePage).not.toHaveBeenCalled();
+  });
+
+  describe("APP-16324 F7: removing widgets needs approval", () => {
+    // A leftover card (container + text on its inner canvas) and a lone text, like Oracle's "Card title" leftovers.
+    function removalDsl(): Record<string, unknown> {
+      const base = {
+        topRow: 0,
+        bottomRow: 4,
+        leftColumn: 0,
+        rightColumn: 16,
+        parentRowSpace: 10,
+        parentColumnSpace: 10,
+      };
+
+      return {
+        widgetId: "0",
+        widgetName: "MainContainer",
+        type: "CANVAS_WIDGET",
+        ...base,
+        bottomRow: 400,
+        rightColumn: 64,
+        children: [
+          {
+            widgetId: "greet",
+            widgetName: "Greeting",
+            type: "TEXT_WIDGET",
+            text: "Hi",
+            parentId: "0",
+            ...base,
+          },
+          {
+            widgetId: "card",
+            widgetName: "Card1",
+            type: "CONTAINER_WIDGET",
+            parentId: "0",
+            ...base,
+            topRow: 10,
+            bottomRow: 30,
+            children: [
+              {
+                widgetId: "cardCanvas",
+                widgetName: "CardCanvas",
+                type: "CANVAS_WIDGET",
+                parentId: "card",
+                ...base,
+                bottomRow: 200,
+                rightColumn: 64,
+                children: [
+                  {
+                    widgetId: "cardTitle",
+                    widgetName: "CardTitle",
+                    type: "TEXT_WIDGET",
+                    text: "Card title",
+                    parentId: "cardCanvas",
+                    ...base,
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    }
+
+    function removalServer(store: McpGovernanceStore) {
+      let current = removalDsl();
+      const updateLayout = jest.fn<
+        Promise<{ ok: boolean }>,
+        [string, string, string, Record<string, unknown>]
+      >(async (_app, _page, _layout, dsl) => {
+        current = dsl;
+
+        return { ok: true };
+      });
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getApplicationContext: jest.fn(async (applicationId: string) => ({
+          pages: [],
+          page: { applicationId },
+          layout: { dsl: current },
+        })),
+        getApplicationPages: jest.fn(async () => ({
+          application: { id: "app1", name: "Support" },
+          pages: [{ id: "p1", name: "Home" }],
+        })),
+        listActions: jest.fn(async () => []),
+        updateLayout: updateLayout as never,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        governance: new McpGovernanceCoordinator(store),
+      });
+
+      return {
+        api,
+        server,
+        updateLayout,
+        dsl: () => current,
+        // An edit made outside MCP, such as in the editor.
+        setDsl: (next: typeof current) => {
+          current = next;
+        },
+      };
+    }
+
+    const SPEC = {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+    };
+
+    it("prepare lists everything that will go; confirm removes it once, and the token cannot be replayed", async () => {
+      const store = new MemoryGovernanceStore();
+      const { dsl, server, updateLayout } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const spec = { ...SPEC, revision, names: ["Card1"] };
+
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec,
+      });
+
+      expect(prepared.body.removed).toEqual([
+        { name: "Card1", type: "CONTAINER_WIDGET", contains: ["CardTitle"] },
+      ]);
+      expect(prepared.body.relay).toContain('"Card1" (with 1 widget inside)');
+      expect(updateLayout).not.toHaveBeenCalled();
+
+      const confirmed = await callTool(server, "confirm_remove_widgets", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(confirmed.body.removed).toEqual(prepared.body.removed);
+      expect(updateLayout).toHaveBeenCalledTimes(1);
+      expect(
+        (dsl().children as { widgetName: string }[]).map(
+          (child) => child.widgetName,
+        ),
+      ).toEqual(["Greeting"]);
+      expect(store.changes.some((c) => c.operation === "remove_widgets")).toBe(
+        true,
+      );
+
+      // A replay is refused: the removal changed the page, so the revision check stops it before the (already
+      // spent) token is even read.
+      const replay = await callTool(server, "confirm_remove_widgets", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(replay.body.code).toBe("revision_conflict");
+      expect(updateLayout).toHaveBeenCalledTimes(1);
+    });
+
+    it("prepare names the widgets whose bindings the removal breaks", async () => {
+      const store = new MemoryGovernanceStore();
+      const { server, setDsl } = removalServer(store);
+      const dsl = removalDsl();
+      const greeting = (dsl.children as Record<string, unknown>[]).find(
+        (child) => child.widgetName === "Greeting",
+      )!;
+
+      greeting.text = "{{ CardTitle.text }}";
+      setDsl(dsl);
+
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec: {
+          ...SPEC,
+          revision: fingerprintDsl(dsl as never),
+          names: ["Card1"],
+        },
+      });
+
+      expect(prepared.body.brokenReferences).toEqual([
+        { widget: "Greeting", refersTo: ["CardTitle"] },
+      ]);
+      expect(prepared.body.relay).toContain(
+        'Bindings on "Greeting" (uses "CardTitle") may stop working.',
+      );
+    });
+
+    it("confirm writes nothing when the page read reports another application", async () => {
+      const store = new MemoryGovernanceStore();
+      const { api, server, updateLayout } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const spec = { ...SPEC, revision, names: ["Card1"] };
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec,
+      });
+
+      api.getApplicationContext = jest.fn(async () => ({
+        pages: [],
+        page: { applicationId: "other-app" },
+        layout: { dsl: removalDsl() },
+      }));
+
+      const confirmed = await callTool(server, "confirm_remove_widgets", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(confirmed.body.code).toBe("page_not_found");
+      expect(updateLayout).not.toHaveBeenCalled();
+    });
+
+    // APP-16100: a layoutId that does not belong to the page is replaced by the page's own. The token is bound to the
+    // page's own layoutId, so confirm accepts either the original or the corrected one.
+    it.each([["l-guessed"], ["l1"]])(
+      "re-resolves a guessed layoutId; confirm with %s writes to the page's own layout",
+      async (confirmLayoutId) => {
+        const store = new MemoryGovernanceStore();
+        const { api, dsl, server, updateLayout } = removalServer(store);
+        const readContext = api.getApplicationContext;
+
+        api.getApplicationContext = jest.fn(
+          async (app: string, page: string, layoutId: string) => {
+            if (layoutId !== "l1") {
+              throw new LayoutRequestError(400, "AE-APP-4000");
+            }
+
+            return readContext(app, page, layoutId);
+          },
+        );
+        api.getPage = jest.fn(async () => ({
+          id: "p1",
+          layouts: [{ id: "l1" }],
+        })) as never;
+
+        const revision = fingerprintDsl(removalDsl() as never);
+        const spec = {
+          ...SPEC,
+          layoutId: "l-guessed",
+          revision,
+          names: ["Greeting"],
+        };
+        const prepared = await callTool(server, "prepare_remove_widgets", {
+          spec,
+        });
+
+        expect(prepared.body.correctedLayoutId).toBe("l1");
+
+        const confirmed = await callTool(server, "confirm_remove_widgets", {
+          spec: { ...spec, layoutId: confirmLayoutId },
+          confirmationId: prepared.body.confirmationId,
+        });
+
+        expect(confirmed.body.error).toBeUndefined();
+        expect(updateLayout).toHaveBeenCalledTimes(1);
+        expect(updateLayout.mock.calls[0][2]).toBe("l1");
+        expect(
+          (dsl().children as { widgetName: string }[]).map(
+            (child) => child.widgetName,
+          ),
+        ).toEqual(["Card1"]);
+      },
+    );
+
+    // The revision is checked before the token is spent, so a page that changed after prepare is refused cleanly.
+    it("refuses to confirm after the page changed since prepare, and removes nothing", async () => {
+      const store = new MemoryGovernanceStore();
+      const { dsl, server, updateLayout } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const spec = { ...SPEC, revision, names: ["Greeting"] };
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec,
+      });
+
+      // Someone edits the page between prepare and confirm.
+      await callTool(server, "patch_widgets", {
+        ...SPEC,
+        revision,
+        patch: {
+          operations: [
+            { kind: "update", name: "Greeting", props: { text: "Hello" } },
+          ],
+        },
+      });
+      expect(updateLayout).toHaveBeenCalledTimes(1);
+
+      const confirmed = await callTool(server, "confirm_remove_widgets", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(confirmed.body.code).toBe("revision_conflict");
+      expect(updateLayout).toHaveBeenCalledTimes(1);
+      expect(
+        (dsl().children as { widgetName: string }[]).map(
+          (child) => child.widgetName,
+        ),
+      ).toEqual(["Greeting", "Card1"]);
+      // Refused before the token is spent: it is still in the store. (commitLayout would also refuse a stale page,
+      // but only after spending the token.)
+      expect(
+        store.confirmations.has(prepared.body.confirmationId as string),
+      ).toBe(true);
+    });
+
+    it(`refuses more than ${WIDGET_REMOVAL_MAX} names`, async () => {
+      const store = new MemoryGovernanceStore();
+      const { server } = removalServer(store);
+      const names = (count: number) =>
+        Array.from({ length: count }, (_, i) => `W${i}`);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const tooMany = await callTool(server, "prepare_remove_widgets", {
+        spec: { ...SPEC, revision, names: names(WIDGET_REMOVAL_MAX + 1) },
+      });
+
+      // A schema refusal on `names` itself, not the unknown-widget refusal that would follow.
+      expect(tooMany.body.valid).toBe(false);
+      expect(
+        (tooMany.body.errors as { path: string; message: string }[])[0],
+      ).toMatchObject({ path: "names" });
+      expect(store.confirmations.size).toBe(0);
+
+      // At the cap the spec is valid; these widgets do not exist, so the refusal is about the names, not the count.
+      const atCap = await callTool(server, "prepare_remove_widgets", {
+        spec: { ...SPEC, revision, names: names(WIDGET_REMOVAL_MAX) },
+      });
+
+      expect(JSON.stringify(atCap.body)).toMatch(/not found|unknown|W0/i);
+    });
+
+    // Copilot review: the page is read before the lock. An editor edit that lands between that read and the lock
+    // would be overwritten by the whole-layout write, so commitLayout reads the page again under the lock.
+    it("refuses when the page changes between the last read and the lock, and writes nothing", async () => {
+      const store = new MemoryGovernanceStore();
+      const { dsl, server, setDsl, updateLayout } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const spec = { ...SPEC, revision, names: ["Greeting"] };
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec,
+      });
+      const acquireLock = store.acquireLock.bind(store);
+      const edited = {
+        ...removalDsl(),
+        children: [
+          ...(removalDsl().children as unknown[]),
+          {
+            widgetId: "added",
+            widgetName: "AddedInEditor",
+            type: "TEXT_WIDGET",
+            text: "new",
+            parentId: "0",
+            topRow: 40,
+            bottomRow: 44,
+            leftColumn: 0,
+            rightColumn: 8,
+          },
+        ],
+      };
+
+      // The editor saves just as MCP takes the page lock.
+      jest
+        .spyOn(store, "acquireLock")
+        .mockImplementation(async (...args: Parameters<typeof acquireLock>) => {
+          setDsl(edited as never);
+
+          return acquireLock(...args);
+        });
+
+      const confirmed = await callTool(server, "confirm_remove_widgets", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(confirmed.body.code).toBe("revision_conflict");
+      expect(updateLayout).not.toHaveBeenCalled();
+      expect(
+        (dsl().children as { widgetName: string }[]).map(
+          (child) => child.widgetName,
+        ),
+      ).toContain("AddedInEditor");
+    });
+
+    // Copilot review: the layout is read and written by page id, while the git gate, the labels and the lock use the
+    // application id, so a page of another application is refused before any token is issued or spent.
+    it("refuses a page that is not in the application, at prepare and at confirm", async () => {
+      const store = new MemoryGovernanceStore();
+      const { server, updateLayout } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const foreign = { ...SPEC, pageId: "p9", revision, names: ["Greeting"] };
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec: foreign,
+      });
+
+      expect(prepared.body.code).toBe("page_not_found");
+      expect(store.confirmations.size).toBe(0);
+
+      const ok = await callTool(server, "prepare_remove_widgets", {
+        spec: { ...SPEC, revision, names: ["Greeting"] },
+      });
+      const confirmed = await callTool(server, "confirm_remove_widgets", {
+        spec: foreign,
+        confirmationId: ok.body.confirmationId,
+      });
+
+      expect(confirmed.body.code).toBe("page_not_found");
+      expect(store.confirmations.has(ok.body.confirmationId as string)).toBe(
+        true,
+      );
+      expect(updateLayout).not.toHaveBeenCalled();
+    });
+
+    // CodeRabbit review: a read that fails after approval must not spend the token, so the same token can retry.
+    it("keeps the token when the page read after approval fails", async () => {
+      const store = new MemoryGovernanceStore();
+      const { api, server, updateLayout } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const spec = { ...SPEC, revision, names: ["Greeting"] };
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec,
+      });
+      const read = api.getApplicationContext as jest.Mock;
+      const realRead = read.getMockImplementation()!;
+      let confirmReads = 0;
+
+      // The first confirm read (the stale-revision check) succeeds; the read after approval returns no layout.
+      read.mockImplementation(async (...args: unknown[]) => {
+        confirmReads += 1;
+
+        return confirmReads === 2 ? { pages: [], page: {} } : realRead(...args);
+      });
+
+      const failed = await callTool(server, "confirm_remove_widgets", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(failed.body.error).toMatch(
+        /could not read the current page layout/,
+      );
+      expect(updateLayout).not.toHaveBeenCalled();
+      expect(
+        store.confirmations.has(prepared.body.confirmationId as string),
+      ).toBe(true);
+
+      read.mockImplementation(realRead);
+
+      const retried = await callTool(server, "confirm_remove_widgets", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(updateLayout).toHaveBeenCalledTimes(1);
+      expect(retried.body.code).toBeUndefined();
+    });
+
+    // CodeRabbit review: a change that lands while the user answers the prompt is refused before the token is spent.
+    it("refuses a page that changed during approval, without spending the token", async () => {
+      const store = new MemoryGovernanceStore();
+      const { api, server, updateLayout } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const spec = { ...SPEC, revision, names: ["Greeting"] };
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec,
+      });
+      const read = api.getApplicationContext as jest.Mock;
+      const realRead = read.getMockImplementation()!;
+      let confirmReads = 0;
+
+      // The read before the prompt sees the prepared page; the read after approval sees an edited one.
+      read.mockImplementation(async (...args: unknown[]) => {
+        confirmReads += 1;
+        const context = await realRead(...args);
+
+        if (confirmReads !== 2) return context;
+
+        const dslNow = context.layout.dsl as { children: unknown[] };
+
+        return {
+          ...context,
+          layout: {
+            dsl: {
+              ...dslNow,
+              children: [
+                ...dslNow.children,
+                {
+                  widgetId: "late",
+                  widgetName: "LateEdit",
+                  type: "TEXT_WIDGET",
+                  text: "x",
+                  parentId: "0",
+                  topRow: 60,
+                  bottomRow: 64,
+                  leftColumn: 0,
+                  rightColumn: 8,
+                },
+              ],
+            },
+          },
+        };
+      });
+
+      const refused = await callTool(server, "confirm_remove_widgets", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(refused.body.code).toBe("revision_conflict");
+      expect(refused.body.error).toMatch(/while awaiting approval/);
+      expect(updateLayout).not.toHaveBeenCalled();
+      expect(
+        store.confirmations.has(prepared.body.confirmationId as string),
+      ).toBe(true);
+    });
+
+    it("refuses a token prepared for other widgets, and writes nothing", async () => {
+      const store = new MemoryGovernanceStore();
+      const { server, updateLayout } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec: { ...SPEC, revision, names: ["Greeting"] },
+      });
+      const confirmed = await callTool(server, "confirm_remove_widgets", {
+        spec: { ...SPEC, revision, names: ["Card1"] },
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(confirmed.body.code).toBe("confirmation_invalid");
+      expect(updateLayout).not.toHaveBeenCalled();
+    });
+
+    it("refuses to prepare against a stale revision", async () => {
+      const store = new MemoryGovernanceStore();
+      const { server } = removalServer(store);
+      const prepared = await callTool(server, "prepare_remove_widgets", {
+        spec: { ...SPEC, revision: "f".repeat(64), names: ["Greeting"] },
+      });
+
+      expect(prepared.body.code).toBe("revision_conflict");
+      expect(prepared.body.confirmationId).toBeUndefined();
+    });
+
+    it("refuses an inner canvas or an unknown widget at prepare", async () => {
+      const store = new MemoryGovernanceStore();
+      const { server } = removalServer(store);
+      const revision = fingerprintDsl(removalDsl() as never);
+
+      for (const [names, message] of [
+        [["CardCanvas"], /inner canvas cannot be removed on its own/],
+        [["Ghost"], /"Ghost" was not found/],
+      ] as const) {
+        const prepared = await callTool(server, "prepare_remove_widgets", {
+          spec: { ...SPEC, revision, names },
+        });
+
+        expect(prepared.body.errors?.[0]?.message).toMatch(message);
+        expect(prepared.body.confirmationId).toBeUndefined();
+      }
+    });
+
+    it("patch_widgets refuses a remove operation and writes nothing", async () => {
+      const store = new MemoryGovernanceStore();
+      const { server, updateLayout } = removalServer(store);
+      const refused = await callTool(server, "patch_widgets", {
+        ...SPEC,
+        revision: fingerprintDsl(removalDsl() as never),
+        patch: { operations: [{ kind: "remove", name: "Greeting" }] },
+      });
+
+      expect(refused.body.code).toBe("confirmation_required");
+      expect(refused.body.error).toMatch(/prepare_remove_widgets/);
+      expect(updateLayout).not.toHaveBeenCalled();
+    });
+  });
+
+  it("page CRUD tools are unavailable without governance", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => PAGES),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const sessionId = await initSession(server);
+    const listed = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", id: 15, method: "tools/list" });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const names = (parseJsonRpc(listed).result as any).tools.map(
+      (t: { name: string }) => t.name,
+    );
+
+    expect(names).toContain("read_pages");
+
+    for (const tool of [
+      "create_page",
+      "rename_page",
+      "set_page_visibility",
+      "prepare_delete_page",
+      "confirm_delete_page",
+      "prepare_remove_widgets",
+      "confirm_remove_widgets",
+    ]) {
+      expect(names).not.toContain(tool);
+    }
+  });
+
+  describe("APP-16324 F4: set_page_visibility", () => {
+    const APP = "a".repeat(24);
+    const HOME = "b".repeat(24);
+    const DETAILS = "c".repeat(24);
+
+    function pagesServer() {
+      const pages = [
+        {
+          id: HOME,
+          name: "Home",
+          slug: "home",
+          isDefault: true,
+          isHidden: false,
+        },
+        {
+          id: DETAILS,
+          name: "Ticket Details",
+          slug: "ticket-details",
+          isDefault: false,
+          isHidden: false,
+        },
+      ];
+      const updatePage = jest.fn(
+        async (pageId: string, body: Record<string, unknown>) => {
+          const page = pages.find((entry) => entry.id === pageId);
+
+          if (page && typeof body.isHidden === "boolean") {
+            page.isHidden = body.isHidden;
+          }
+
+          return page;
+        },
+      );
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getApplicationPages: jest.fn(async () => ({
+          workspaceId: "ws1",
+          pages: pages.map((page) => ({ ...page })),
+        })),
+        updatePage: updatePage as never,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+      });
+
+      return { server, updatePage };
+    }
+
+    async function revisionOf(server: ReturnType<typeof createMcpHttpServer>) {
+      return (await callTool(server, "read_pages", { applicationId: APP })).body
+        .revision as string;
+    }
+
+    it("hides and then unhides a page, each with the current revision", async () => {
+      const { server, updatePage } = pagesServer();
+      const hidden = await callTool(server, "set_page_visibility", {
+        spec: {
+          applicationId: APP,
+          pageId: DETAILS,
+          revision: await revisionOf(server),
+          hidden: true,
+        },
+      });
+
+      expect(hidden.body.updated).toBe(true);
+      expect(hidden.body.changeId).toEqual(expect.any(String));
+      expect(updatePage).toHaveBeenLastCalledWith(DETAILS, { isHidden: true });
+      expect(
+        (hidden.body.pages as { id: string; isHidden?: boolean }[]).find(
+          (page) => page.id === DETAILS,
+        )?.isHidden,
+      ).toBe(true);
+
+      const shown = await callTool(server, "set_page_visibility", {
+        spec: {
+          applicationId: APP,
+          pageId: DETAILS,
+          revision: await revisionOf(server),
+          hidden: false,
+        },
+      });
+
+      expect(shown.body.updated).toBe(true);
+      expect(updatePage).toHaveBeenLastCalledWith(DETAILS, { isHidden: false });
+    });
+
+    it("refuses to hide the default (home) page", async () => {
+      const { server, updatePage } = pagesServer();
+      const refused = await callTool(server, "set_page_visibility", {
+        spec: {
+          applicationId: APP,
+          pageId: HOME,
+          revision: await revisionOf(server),
+          hidden: true,
+        },
+      });
+
+      expect(refused.body.error).toMatch(/home page and cannot be hidden/);
+      expect(updatePage).not.toHaveBeenCalled();
+    });
+
+    it("allows showing the home page, and records the change in the audit log", async () => {
+      const { server, updatePage } = pagesServer();
+      const shown = await callTool(server, "set_page_visibility", {
+        spec: {
+          applicationId: APP,
+          pageId: HOME,
+          revision: await revisionOf(server),
+          hidden: false,
+        },
+      });
+
+      expect(shown.body.updated).toBe(true);
+      expect(updatePage).toHaveBeenCalledWith(HOME, { isHidden: false });
+
+      const list = await callTool(server, "list_changes", {});
+      const change = list.body.changes.find(
+        (entry: { operation: string }) =>
+          entry.operation === "set_page_visibility",
+      );
+
+      expect(change).toBeDefined();
+      expect(change.id).toBe(shown.body.changeId);
+    });
+
+    // The revision does not cover which page is the default, so a page made the home page after the first read is
+    // refused under the lock.
+    it("refuses to hide a page that became the home page after the first read", async () => {
+      const pages = [
+        { id: HOME, name: "Home", isDefault: true, isHidden: false },
+        {
+          id: DETAILS,
+          name: "Ticket Details",
+          isDefault: false,
+          isHidden: false,
+        },
+      ];
+      let reads = 0;
+      const updatePage = jest.fn();
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getApplicationPages: jest.fn(async () => {
+          reads += 1;
+
+          // The third read is the one inside the lock (after read_pages and the handler's own read).
+          return {
+            workspaceId: "ws1",
+            pages: pages.map((page) =>
+              reads >= 3 ? { ...page, isDefault: page.id === DETAILS } : page,
+            ),
+          };
+        }),
+        updatePage: updatePage as never,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+      });
+      const refused = await callTool(server, "set_page_visibility", {
+        spec: {
+          applicationId: APP,
+          pageId: DETAILS,
+          revision: await revisionOf(server),
+          hidden: true,
+        },
+      });
+
+      // The same result as the check before the lock, so an agent sees one refusal either way.
+      expect(refused.body.code).toBe("home_page");
+      expect(refused.body.error).toMatch(/home page and cannot be hidden/);
+      expect(updatePage).not.toHaveBeenCalled();
+    });
+
+    it("refuses a page that is not in the application", async () => {
+      const { server, updatePage } = pagesServer();
+      const refused = await callTool(server, "set_page_visibility", {
+        spec: {
+          applicationId: APP,
+          pageId: "d".repeat(24),
+          revision: await revisionOf(server),
+          hidden: true,
+        },
+      });
+
+      expect(refused.body.error).toMatch(/not a page of application/);
+      expect(updatePage).not.toHaveBeenCalled();
+    });
+
+    it("refuses a stale revision", async () => {
+      const { server, updatePage } = pagesServer();
+      const refused = await callTool(server, "set_page_visibility", {
+        spec: {
+          applicationId: APP,
+          pageId: DETAILS,
+          revision: "e".repeat(64),
+          hidden: true,
+        },
+      });
+
+      expect(JSON.stringify(refused.body)).toMatch(/stale|revision/i);
+      expect(updatePage).not.toHaveBeenCalled();
+    });
+  });
+
+  it("F3: read_pages includes each page's layoutId (per-page GET /pages/{pageId}, N+1)", async () => {
+    const getPage = jest.fn(async (pageId: string) => ({
+      id: pageId,
+      layouts: [{ id: `layout-${pageId}` }],
+    }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => PAGES),
+      getPage: getPage as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callTool(server, "read_pages", {
+      applicationId: APP_ID,
+    });
+
+    // One page fetch per listed page (the N+1 the pages-LIST DTO forces), and the layoutId is surfaced per page.
+    expect(getPage).toHaveBeenCalledWith(PAGE_ID);
+    expect(read.body.pages).toEqual([
+      {
+        id: PAGE_ID,
+        name: "Extra",
+        slug: "extra",
+        layoutId: `layout-${PAGE_ID}`,
+      },
+    ]);
+  });
+
+  it("F3: read_pages reports layoutError (never fails) when a page fetch throws", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => PAGES),
+      getPage: jest.fn(async () => {
+        throw new Error("network");
+      }) as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callTool(server, "read_pages", {
+      applicationId: APP_ID,
+    });
+
+    // A network failure is tried twice (APP-16324 F13) before the page reports layoutError.
+    expect(api.getPage).toHaveBeenCalledTimes(2);
+    expect(read.body.pages).toEqual([
+      {
+        id: PAGE_ID,
+        name: "Extra",
+        slug: "extra",
+        layoutError: { reason: "fetch_failed" },
+      },
+    ]);
+  });
+
+  it("APP-16100: read_pages carries the upstream status + error code of a failed page fetch, never the body", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => PAGES),
+      getPage: jest.fn(async () => {
+        throw new AppsmithApiError(404, "AE-ACL-4004");
+      }) as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callTool(server, "read_pages", {
+      applicationId: APP_ID,
+    });
+
+    expect(read.body.pages[0]).not.toHaveProperty("layoutId");
+    expect(read.body.pages[0].layoutError).toEqual({
+      reason: "fetch_failed",
+      status: 404,
+      code: "AE-ACL-4004",
+    });
+  });
+
+  describe("APP-16324 F13: read_pages retries a transient page fetch failure once", () => {
+    const TWO_PAGES = {
+      pages: [
+        { id: "p1", name: "One", slug: "one" },
+        { id: "p2", name: "Two", slug: "two" },
+      ],
+    };
+
+    async function readWith(getPage: jest.Mock) {
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getApplicationPages: jest.fn(async () => TWO_PAGES),
+        getPage: getPage as never,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api);
+
+      return (await callTool(server, "read_pages", { applicationId: APP_ID }))
+        .body;
+    }
+
+    it.each([[401], [429], [503]])(
+      "a %i on the first try is retried after the parallel pass and the page gets its layoutId",
+      async (status) => {
+        const calls: string[] = [];
+        let failed = false;
+        const getPage = jest.fn(async (pageId: string) => {
+          calls.push(pageId);
+
+          if (pageId === "p1" && !failed) {
+            failed = true;
+            throw new AppsmithApiError(status);
+          }
+
+          return { id: pageId, layouts: [{ id: `l-${pageId}` }] };
+        });
+        const body = await readWith(getPage);
+
+        expect(
+          body.pages.map((page: { layoutId?: string }) => page.layoutId),
+        ).toEqual(["l-p1", "l-p2"]);
+        expect(body.pages[0]).not.toHaveProperty("layoutError");
+        // The retry runs once, after both first reads.
+        expect(calls).toEqual(["p1", "p2", "p1"]);
+      },
+    );
+
+    it("a network failure is retried too", async () => {
+      const getPage = jest
+        .fn()
+        .mockRejectedValueOnce(new Error("network"))
+        .mockImplementation(async (pageId: string) => ({
+          id: pageId,
+          layouts: [{ id: `l-${pageId}` }],
+        }));
+      const body = await readWith(getPage);
+
+      expect(
+        body.pages.map((page: { layoutId?: string }) => page.layoutId),
+      ).toEqual(["l-p1", "l-p2"]);
+    });
+
+    it("no retry starts once the retry pass has run for REQUEST_TIMEOUT_MS", async () => {
+      let now = 1_000_000;
+      const clock = jest.spyOn(Date, "now").mockImplementation(() => now);
+      const getPage = jest.fn(async (pageId: string) => {
+        const tries = getPage.mock.calls.filter(([id]) => id === pageId).length;
+
+        // p1's retry is slow: the clock passes the deadline before it fails.
+        if (pageId === "p1" && tries === 2) now += REQUEST_TIMEOUT_MS;
+
+        throw new AppsmithApiError(503);
+      });
+
+      try {
+        const body = await readWith(getPage);
+
+        expect(getPage.mock.calls.map(([id]) => id)).toEqual([
+          "p1",
+          "p2",
+          "p1",
+        ]);
+        expect(body.pages[1].layoutError).toEqual({
+          reason: "fetch_failed",
+          status: 503,
+        });
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    it("a timeout is not retried", async () => {
+      const getPage = jest.fn(async (pageId: string) => {
+        if (pageId === "p1") {
+          throw new DOMException("This operation was aborted", "AbortError");
+        }
+
+        return { id: pageId, layouts: [{ id: `l-${pageId}` }] };
+      });
+      const body = await readWith(getPage);
+
+      expect(getPage).toHaveBeenCalledTimes(2);
+      expect(body.pages[0].layoutError).toEqual({ reason: "fetch_failed" });
+      expect(body.pages[1].layoutId).toBe("l-p2");
+    });
+
+    it("a final status such as 404 is not retried", async () => {
+      const getPage = jest.fn(async (pageId: string) => {
+        if (pageId === "p1") throw new AppsmithApiError(404, "AE-ACL-4004");
+
+        return { id: pageId, layouts: [{ id: `l-${pageId}` }] };
+      });
+      const body = await readWith(getPage);
+
+      expect(getPage).toHaveBeenCalledTimes(2);
+      expect(body.pages[0].layoutError).toEqual({
+        reason: "fetch_failed",
+        status: 404,
+        code: "AE-ACL-4004",
+      });
+      expect(body.pages[1].layoutId).toBe("l-p2");
+    });
+
+    it("a page that fails again reports the retry's error and is tried only twice", async () => {
+      const getPage = jest.fn(async (pageId: string) => {
+        if (pageId === "p1") {
+          throw getPage.mock.calls.filter(([id]) => id === "p1").length === 1
+            ? new AppsmithApiError(401)
+            : new AppsmithApiError(503, "AE-APP-5000");
+        }
+
+        return { id: pageId, layouts: [{ id: `l-${pageId}` }] };
+      });
+      const body = await readWith(getPage);
+
+      expect(getPage.mock.calls.filter(([id]) => id === "p1")).toHaveLength(2);
+      expect(body.pages[0].layoutError).toEqual({
+        reason: "fetch_failed",
+        status: 503,
+        code: "AE-APP-5000",
+      });
+    });
+  });
+
+  it("APP-16100: read_pages reports no_layout for a page DTO without layouts", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => PAGES),
+      getPage: jest.fn(async () => ({ id: PAGE_ID, layouts: [] })) as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callTool(server, "read_pages", {
+      applicationId: APP_ID,
+    });
+
+    expect(read.body.pages[0].layoutError).toEqual({ reason: "no_layout" });
+  });
+
+  const LAYOUT_DSL = {
+    ...ROOT_DSL,
+    children: [
+      {
+        widgetId: "b",
+        widgetName: "SaveBtn",
+        type: "BUTTON_WIDGET",
+        topRow: 0,
+        bottomRow: 4,
+        leftColumn: 0,
+        rightColumn: 16,
+      },
+      {
+        widgetId: "m",
+        widgetName: "EditModal",
+        type: "MODAL_WIDGET",
+        topRow: 5,
+        bottomRow: 20,
+        leftColumn: 0,
+        rightColumn: 32,
+      },
+    ],
+  };
+  const LAYOUT_REVISION = fingerprintDsl(LAYOUT_DSL as never);
+
+  // A layout read with a layoutId that does not belong to the page answers 400 INVALID_PARAMETER. Fake that: only
+  // the page's own layoutId reads; anything else is a 400.
+  function layoutReadApi(overrides: Partial<AppsmithApi> = {}) {
+    const getApplicationContext = jest.fn(
+      async (applicationId: string, _page: string, layoutId: string) => {
+        if (layoutId !== "layout-real") {
+          throw new LayoutRequestError(400, "AE-APP-4000");
+        }
+
+        return {
+          pages: [],
+          page: { applicationId },
+          layout: { dsl: LAYOUT_DSL },
+        };
+      },
+    );
+    const getPage = jest.fn(async () => ({
+      id: PAGE_ID,
+      layouts: [{ id: "layout-real" }],
+    }));
+    const updateLayout = jest.fn(async () => ({ ok: true }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: getApplicationContext as never,
+      getPage: getPage as never,
+      updateLayout: updateLayout as never,
+      ...overrides,
+    };
+
+    return { api, getApplicationContext, getPage, updateLayout };
+  }
+
+  async function callToolRaw(
+    server: ReturnType<typeof createMcpHttpServer>,
+    name: string,
+    args: Record<string, unknown>,
+  ) {
+    const sessionId = await initSession(server);
+    const call = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({
+        jsonrpc: "2.0",
+        id: 14,
+        method: "tools/call",
+        params: { name, arguments: args },
+      });
+    const { content, isError } = parseJsonRpc(call).result as {
+      content: { text: string }[];
+      isError?: boolean;
+    };
+
+    return { text: content[0].text, isError: isError === true };
+  }
+
+  it("APP-16100: read_semantic_page re-resolves a layoutId that does not belong to the page and says so", async () => {
+    const { api, getApplicationContext, getPage } = layoutReadApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callTool(server, "read_semantic_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+    });
+
+    expect(getPage).toHaveBeenCalledWith(PAGE_ID);
+    expect(getApplicationContext).toHaveBeenLastCalledWith(
+      APP_ID,
+      PAGE_ID,
+      "layout-real",
+    );
+    expect(read.body.revision).toBe(LAYOUT_REVISION);
+    expect(read.body.correctedLayoutId).toBe("layout-real");
+    expect(read.body.layoutNote).toContain("layout-real");
+  });
+
+  it.each([
+    ["inspect_page", {}],
+    ["get_application_context", {}],
+  ])(
+    "APP-16100: %s reports the corrected layoutId",
+    async (tool, extraArgs) => {
+      const { api } = layoutReadApi();
+      const server = createMcpHttpServer(API_BASE_URL, () => api);
+      const read = await callTool(server, tool, {
+        applicationId: APP_ID,
+        pageId: PAGE_ID,
+        layoutId: "layout-guessed",
+        ...extraArgs,
+      });
+
+      expect(read.body.correctedLayoutId).toBe("layout-real");
+    },
+  );
+
+  it.each([
+    ["edit_page", { edit: { add: [{ type: "button", text: "Go" }] } }],
+    [
+      "patch_widgets",
+      {
+        patch: {
+          operations: [
+            {
+              kind: "move",
+              name: "SaveBtn",
+              position: { topRow: 30, leftColumn: 0 },
+            },
+          ],
+        },
+      },
+    ],
+    [
+      "wire_event",
+      {
+        spec: {
+          widget: "SaveBtn",
+          event: "onClick",
+          action: { showModal: "EditModal" },
+        },
+      },
+    ],
+  ])(
+    "APP-16100: %s writes to the page's own layout after a correction",
+    async (tool, toolArgs) => {
+      const { api, updateLayout } = layoutReadApi();
+      const server = createMcpHttpServer(API_BASE_URL, () => api);
+      const written = await callTool(server, tool, {
+        applicationId: APP_ID,
+        pageId: PAGE_ID,
+        layoutId: "layout-guessed",
+        revision: LAYOUT_REVISION,
+        ...toolArgs,
+      });
+
+      expect(written.body.error).toBeUndefined();
+      expect(updateLayout).toHaveBeenCalledTimes(1);
+      expect(updateLayout.mock.calls[0]).toEqual([
+        APP_ID,
+        PAGE_ID,
+        "layout-real",
+        expect.any(Object),
+      ]);
+      expect(written.body.correctedLayoutId).toBe("layout-real");
+    },
+  );
+
+  // The page DTO names its application. A page of another application, or a read that names none, is refused before
+  // the git gate and the lock, because both use this application's id.
+  const layoutWrites: [string, Record<string, unknown>][] = [
+    ["edit_page", { edit: { add: [{ type: "button", text: "Go" }] } }],
+    [
+      "patch_widgets",
+      {
+        patch: {
+          operations: [
+            {
+              kind: "move",
+              name: "SaveBtn",
+              position: { topRow: 30, leftColumn: 0 },
+            },
+          ],
+        },
+      },
+    ],
+    [
+      "wire_event",
+      {
+        spec: {
+          widget: "SaveBtn",
+          event: "onClick",
+          action: { showModal: "EditModal" },
+        },
+      },
+    ],
+  ];
+
+  it.each(
+    layoutWrites.flatMap(([tool]) => [
+      [tool, "another application", 0, { applicationId: "other-app" }],
+      [tool, "this application", 1, { applicationId: APP_ID }],
+      [tool, "no application", 0, {}],
+    ]) as [string, string, number, Record<string, unknown>][],
+  )(
+    "%s on a page of %s writes %s time(s)",
+    async (tool, _label, writes, page) => {
+      const { api, updateLayout } = layoutReadApi({
+        getApplicationContext: jest.fn(async () => ({
+          pages: [],
+          page,
+          layout: { dsl: LAYOUT_DSL },
+        })) as never,
+      });
+      const server = createMcpHttpServer(API_BASE_URL, () => api);
+      const toolArgs = layoutWrites.find(([name]) => name === tool)![1];
+      const written = await callTool(server, tool, {
+        applicationId: APP_ID,
+        pageId: PAGE_ID,
+        layoutId: "layout-real",
+        revision: LAYOUT_REVISION,
+        ...toolArgs,
+      });
+
+      expect(updateLayout).toHaveBeenCalledTimes(writes);
+      expect(written.body.code).toBe(
+        writes === 0 ? "page_not_found" : undefined,
+      );
+    },
+  );
+
+  // The server's compare-and-set: the layout read carries `revision`, the write sends it back, and the server refuses
+  // a write to a page that changed since that read.
+  describe("APP-16355: the server checks the layout has not changed", () => {
+    function api409(revision: string | undefined, refuse: boolean) {
+      const updateLayout = jest.fn<Promise<unknown>, unknown[]>(async () => {
+        if (refuse) throw new AppsmithApiError(409, STALE_LAYOUT_CODE);
+
+        return { ok: true };
+      });
+
+      return {
+        ...layoutReadApi({
+          getApplicationContext: jest.fn(async (applicationId: string) => ({
+            pages: [],
+            page: { applicationId },
+            layout: {
+              dsl: LAYOUT_DSL,
+              ...(revision !== undefined ? { revision } : {}),
+            },
+          })) as never,
+          updateLayout: updateLayout as never,
+        }),
+        updateLayout,
+      };
+    }
+
+    const edit = {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-real",
+      revision: LAYOUT_REVISION,
+      edit: { add: [{ type: "button", text: "Go" }] },
+    };
+
+    it("sends the read's revision with the write", async () => {
+      const { api, updateLayout } = api409("1700000000123", false);
+      const server = createMcpHttpServer(API_BASE_URL, () => api);
+      const written = await callTool(server, "edit_page", edit);
+
+      expect(written.body.error).toBeUndefined();
+      expect(updateLayout.mock.calls[0][4]).toBe("1700000000123");
+    });
+
+    it("reports the server's stale-layout refusal as revision_conflict", async () => {
+      const { api } = api409("1700000000123", true);
+      const server = createMcpHttpServer(API_BASE_URL, () => api);
+      const written = await callTool(server, "edit_page", edit);
+
+      expect(written.body.code).toBe("revision_conflict");
+    });
+
+    it("writes as before when the server sends no revision", async () => {
+      const { api, updateLayout } = api409(undefined, false);
+      const server = createMcpHttpServer(API_BASE_URL, () => api);
+
+      await callTool(server, "edit_page", edit);
+
+      expect(updateLayout.mock.calls[0]).toHaveLength(4);
+    });
+  });
+
+  it("APP-16100: a corrected write without a revision fails closed and writes nothing", async () => {
+    const { api, updateLayout } = layoutReadApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const edited = await callTool(server, "edit_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+      edit: { add: [{ type: "button", text: "Go" }] },
+    });
+
+    expect(edited.body.code).toBe("layout_corrected");
+    expect(edited.body.correctedLayoutId).toBe("layout-real");
+    expect(updateLayout).not.toHaveBeenCalled();
+  });
+
+  it("APP-16100: a corrected write whose revision is from another page is rejected as stale", async () => {
+    const { api, updateLayout } = layoutReadApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const edited = await callTool(server, "edit_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+      revision: fingerprintDsl(ROOT_DSL as never),
+      edit: { add: [{ type: "button", text: "Go" }] },
+    });
+
+    expect(edited.body.code).toBe("revision_conflict");
+    expect(updateLayout).not.toHaveBeenCalled();
+  });
+
+  it("APP-16100: a governed corrected write snapshots the resolved layoutId and keeps the note out of the audit", async () => {
+    const store = new MemoryGovernanceStore();
+    const { api } = layoutReadApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const edited = await callTool(server, "edit_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+      revision: LAYOUT_REVISION,
+      edit: { add: [{ type: "button", text: "Go" }] },
+    });
+
+    expect(edited.body.changeId).toBeDefined();
+    expect(edited.body.correctedLayoutId).toBe("layout-real");
+    expect(store.changes).toHaveLength(1);
+    expect(store.changes[0].rollback).toMatchObject({
+      layoutId: "layout-real",
+    });
+    expect(JSON.stringify(store.changes[0])).not.toContain("layoutNote");
+  });
+
+  it("APP-16100: a correct layoutId reads once with no page re-fetch or correction", async () => {
+    const { api, getApplicationContext, getPage } = layoutReadApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callTool(server, "inspect_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-real",
+    });
+
+    expect(getApplicationContext).toHaveBeenCalledTimes(1);
+    expect(getPage).not.toHaveBeenCalled();
+    expect(read.body).not.toHaveProperty("correctedLayoutId");
+  });
+
+  it("APP-16100: an unreadable page surfaces its own status + code instead of the misleading 400", async () => {
+    const { api } = layoutReadApi({
+      getPage: jest.fn(async () => {
+        throw new AppsmithApiError(404, "AE-ACL-4004");
+      }) as never,
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callToolRaw(server, "read_semantic_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+    });
+
+    expect(read.isError).toBe(true);
+    expect(read.text).toContain("(404)");
+    expect(read.text).toContain("AE-ACL-4004");
+  });
+
+  it("APP-16100: a page with no layout of its own fails with a legible error", async () => {
+    const { api } = layoutReadApi({
+      getPage: jest.fn(async () => ({ id: PAGE_ID, layouts: [] })) as never,
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callToolRaw(server, "read_semantic_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+    });
+
+    expect(read.isError).toBe(true);
+    expect(read.text).toContain("reports no layout of its own");
+  });
+
+  it("APP-16100: non-400 layout failures are not retried", async () => {
+    const getPage = jest.fn(async () => ({ layouts: [{ id: "layout-real" }] }));
+    const { api } = layoutReadApi({
+      getApplicationContext: jest.fn(async () => {
+        throw new AppsmithApiError(403, "AE-ACL-4003");
+      }) as never,
+      getPage: getPage as never,
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callToolRaw(server, "read_semantic_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+    });
+
+    expect(read.isError).toBe(true);
+    expect(read.text).toContain("(403)");
+    expect(getPage).not.toHaveBeenCalled();
+  });
+
+  it("APP-16100: a 400 that is not INVALID_PARAMETER is not retried", async () => {
+    const getPage = jest.fn(async () => ({ layouts: [{ id: "layout-real" }] }));
+    const { api } = layoutReadApi({
+      getApplicationContext: jest.fn(async () => {
+        throw new LayoutRequestError(400, "AE-APP-4004");
+      }) as never,
+      getPage: getPage as never,
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callToolRaw(server, "read_semantic_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+    });
+
+    expect(read.isError).toBe(true);
+    expect(read.text).toContain("AE-APP-4004");
+    expect(getPage).not.toHaveBeenCalled();
+  });
+
+  it("APP-16100: an INVALID_PARAMETER 400 from the pages-list or page read is not treated as a wrong layoutId", async () => {
+    const getPage = jest.fn(async () => ({ layouts: [{ id: "layout-real" }] }));
+    const getApplicationContext = jest.fn(async () => {
+      // A plain AppsmithApiError: the failure came from a parallel read, not the layout request.
+      throw new AppsmithApiError(400, "AE-APP-4000");
+    });
+    const { api } = layoutReadApi({
+      getApplicationContext: getApplicationContext as never,
+      getPage: getPage as never,
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callToolRaw(server, "read_semantic_page", {
+      applicationId: APP_ID,
+      pageId: PAGE_ID,
+      layoutId: "layout-guessed",
+    });
+
+    expect(read.isError).toBe(true);
+    expect(read.text).toContain("AE-APP-4000");
+    expect(read.text).not.toContain("correctedLayoutId");
+    expect(getPage).not.toHaveBeenCalled();
+    expect(getApplicationContext).toHaveBeenCalledTimes(1);
+  });
+
+  it("F3: read_pages fans out one bounded getPage per page and does not cross-contaminate layoutIds", async () => {
+    // Multi-page fixture (the single-page N+1 test above can't prove per-page mapping): each page must receive its
+    // OWN layoutId, one getPage call per page, even when more pages exist than the bounded-concurrency pool size.
+    const pageCount = READ_PAGES_LAYOUT_CONCURRENCY + 3;
+    const manyPages = {
+      pages: Array.from({ length: pageCount }, (_unused, index) => ({
+        id: `page-${index}`,
+        name: `Page ${index}`,
+        slug: `page-${index}`,
+      })),
+    };
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const getPage = jest.fn(async (pageId: string) => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      await Promise.resolve();
+      inFlight -= 1;
+
+      return { id: pageId, layouts: [{ id: `layout-for-${pageId}` }] };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => manyPages),
+      getPage: getPage as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const read = await callTool(server, "read_pages", {
+      applicationId: APP_ID,
+    });
+
+    expect(getPage).toHaveBeenCalledTimes(pageCount);
+    // Each page carries its own layoutId (no cross-contamination across the fan-out).
+    expect(read.body.pages).toEqual(
+      manyPages.pages.map((page) => ({
+        ...page,
+        layoutId: `layout-for-${page.id}`,
+      })),
+    );
+    // The fan-out is bounded — never more than the pool size in flight at once, despite more pages than the pool.
+    expect(peakInFlight).toBeGreaterThan(0);
+    expect(peakInFlight).toBeLessThanOrEqual(READ_PAGES_LAYOUT_CONCURRENCY);
+  });
+
+  const STORED_ACTION = {
+    id: "act1",
+    name: "OldName",
+    pageId: "p1",
+    pluginType: "DB",
+    updatedAt: "2026-07-12T00:00:00.000Z",
+    datasource: { id: "ds1", pluginId: "postgres" },
+  };
+
+  describe("APP-16375: get_action returns the config of an MCP-authored REST API", () => {
+    async function readRest(actionConfiguration: Record<string, unknown>) {
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...STORED_ACTION,
+          pluginType: "API",
+          actionConfiguration,
+        })),
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        dataEnabled: true,
+      });
+
+      return (
+        await callTool(server, "get_action", {
+          applicationId: "app1",
+          actionId: "act1",
+        })
+      ).body;
+    }
+
+    function written(): Record<string, unknown> {
+      const spec = restApiSpecSchema.parse({
+        name: "getUsers",
+        applicationId: "app1",
+        pageId: "p1",
+        datasourceId: "ds1",
+        method: "GET",
+        path: "/v1/users",
+      });
+
+      return (
+        buildRestActionDto(spec, compileRestApi(spec)) as {
+          actionConfiguration: Record<string, unknown>;
+        }
+      ).actionConfiguration;
+    }
+
+    it("returns the config and authoredBy mcp for an API the MCP wrote", async () => {
+      const read = await readRest(written());
+
+      expect(read.authoredBy).toBe("mcp");
+      expect(read.config).toMatchObject({
+        httpMethod: "GET",
+        path: "/v1/users",
+      });
+    });
+
+    // A GraphQL action is also pluginType API. One the MCP wrote has no REST marker, so nothing is returned.
+    it("returns no config for a GraphQL action", async () => {
+      const read = await readRest({
+        body: "query { users { id } }",
+        formData: { apiContentType: "application/json" },
+        pluginSpecifiedTemplates: [{ value: "{}" }],
+      });
+
+      expect(read.authoredBy).toBe("editor");
+      expect(read.config).toBeUndefined();
+    });
+
+    it("returns no config for an API edited afterwards", async () => {
+      const read = await readRest({ ...written(), path: "/v1/admin" });
+
+      expect(read.authoredBy).toBe("editor");
+      expect(read.config).toBeUndefined();
+    });
+  });
+
+  describe("APP-16324 F9: get_action returns the body of MCP-authored SQL", () => {
+    const compiled = 'SELECT id FROM tickets WHERE status = {{ "open" }};';
+
+    async function readAction(
+      body: unknown,
+      shape: "flat" | "unpublished" | "unpublishedType" = "flat",
+      pluginType = "DB",
+    ) {
+      // "unpublishedType": the plugin type only on unpublishedAction, as some stored NewActions hold it.
+      const withoutType: Record<string, unknown> = { ...STORED_ACTION };
+
+      delete withoutType.pluginType;
+      const stored =
+        shape === "flat"
+          ? { ...STORED_ACTION, pluginType, actionConfiguration: { body } }
+          : shape === "unpublished"
+            ? {
+                ...STORED_ACTION,
+                pluginType,
+                unpublishedAction: { actionConfiguration: { body } },
+              }
+            : {
+                ...withoutType,
+                unpublishedAction: {
+                  pluginType,
+                  actionConfiguration: { body },
+                },
+              };
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getAction: jest.fn(async () => stored),
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        dataEnabled: true,
+      });
+
+      return (
+        await callTool(server, "get_action", {
+          applicationId: "app1",
+          actionId: "act1",
+        })
+      ).body;
+    }
+
+    it("returns the compiled body and authoredBy mcp for a body the MCP wrote", async () => {
+      const read = await readAction(markMcpAuthoredBody(compiled));
+
+      expect(read.authoredBy).toBe("mcp");
+      expect(read.body).toBe(compiled);
+    });
+
+    it("reads the body from unpublishedAction, as a stored NewAction holds it", async () => {
+      const read = await readAction(
+        markMcpAuthoredBody(compiled),
+        "unpublished",
+      );
+
+      expect(read.authoredBy).toBe("mcp");
+      expect(read.body).toBe(compiled);
+    });
+
+    it("reads the plugin type from unpublishedAction when the action has none of its own", async () => {
+      const read = await readAction(
+        markMcpAuthoredBody(compiled),
+        "unpublishedType",
+      );
+
+      expect(read.authoredBy).toBe("mcp");
+      expect(read.body).toBe(compiled);
+
+      const api = await readAction(
+        markMcpAuthoredBody(compiled),
+        "unpublishedType",
+        "API",
+      );
+
+      expect(api.authoredBy).toBe("editor");
+      expect(api.body).toBeUndefined();
+    });
+
+    // Only SQL bodies are marked. A marked body on any other action type is never returned.
+    it("never returns a body for a non-DB action, even with a valid marker", async () => {
+      const read = await readAction(
+        markMcpAuthoredBody('{"token":"secret"}'),
+        "flat",
+        "API",
+      );
+
+      expect(read.authoredBy).toBe("editor");
+      expect(read.body).toBeUndefined();
+      expect(JSON.stringify(read)).not.toContain("secret");
+    });
+
+    it.each([
+      [
+        "an editor-written body",
+        "SELECT * FROM users WHERE api_key = 'secret';",
+      ],
+      [
+        "an MCP body edited afterwards",
+        markMcpAuthoredBody(compiled).replace("open", "open' OR 'x'='x"),
+      ],
+      ["no body", undefined],
+    ])("hides %s and reports authoredBy editor", async (_label, body) => {
+      const read = await readAction(body);
+
+      expect(read.authoredBy).toBe("editor");
+      expect(read.body).toBeUndefined();
+      expect(JSON.stringify(read)).not.toContain("secret");
+      expect(JSON.stringify(read)).not.toContain("SELECT");
+    });
+
+    it("create_query stores the marked body and returns the plain one", async () => {
+      const createAction = jest.fn<
+        Promise<{ id: string }>,
+        [Record<string, unknown>]
+      >(async () => ({ id: "act1" }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+        ]),
+        listActions: jest.fn(async () => []),
+        createAction,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        dataEnabled: true,
+      });
+      const created = (
+        await callTool(server, "create_query", {
+          query: {
+            name: "getUsers",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId: "ds1",
+            operation: "SELECT",
+            table: "users",
+          },
+        })
+      ).body;
+      const stored = (
+        createAction.mock.calls[0][0] as {
+          actionConfiguration: { body: string };
+        }
+      ).actionConfiguration.body;
+
+      expect(created.body).toBe("SELECT * FROM users;");
+      expect(stored.startsWith("-- appsmith-mcp:v1 sha256=")).toBe(true);
+      expect(mcpAuthoredBody(stored)).toBe("SELECT * FROM users;");
+    });
+  });
+
+  // update_action recompiles a SQL spec, so it checks the datasource the same way create_query does. The
+  // datasource must be in the application's workspace, and inList works only on PostgreSQL.
+  // The stored action runs on the first datasource's plugin, as an action created on that datasource would
+  // (APP-16517: a SQL update must keep the action's plugin). Pass storedPluginId to store it on another plugin.
+  function sqlUpdateServer(datasources: unknown[], storedPluginId?: string) {
+    const stored = {
+      ...STORED_ACTION,
+      pluginId:
+        storedPluginId ?? (datasources[0] as { pluginId?: string }).pluginId,
+    };
+    const updateAction = jest.fn(async () => stored);
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getAction: jest.fn(async () => stored),
+      listDatasources: jest.fn(async () => datasources),
+      updateAction: updateAction as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+
+    return { server, updateAction };
+  }
+
+  async function updateWithInList(
+    server: ReturnType<typeof createMcpHttpServer>,
+    filters: unknown[] = [
+      {
+        column: "tag",
+        op: "inList",
+        value: { widget: "TagsSelect", property: "selectedOptionValues" },
+        skipWhenEmpty: true,
+      },
+    ],
+  ) {
+    const read = await callTool(server, "get_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    return callTool(server, "update_action", {
+      spec: {
+        kind: "SQL",
+        actionId: "act1",
+        applicationId: "app1",
+        revision: read.body.revision,
+        query: {
+          name: "OldName",
+          applicationId: "app1",
+          pageId: "p1",
+          datasourceId: "ds1",
+          operation: "SELECT",
+          table: "tickets",
+          filters,
+        },
+      },
+    });
+  }
+
+  it("APP-16164: update_action recompiles an inList filter on a PostgreSQL datasource", async () => {
+    const { server, updateAction } = sqlUpdateServer([
+      { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+    ]);
+    const updated = await updateWithInList(server);
+
+    expect(updated.body.updated).toBe(true);
+    expect(
+      JSON.stringify(
+        (updateAction.mock.calls[0] as unknown[])[1] as Record<string, unknown>,
+      ),
+    ).toContain('CAST(\\"tag\\" AS TEXT) = ANY(');
+  });
+
+  // The MySQL plugin refuses any prepared query with the word IS, so update_action must pick the MySQL form too.
+  it.each([
+    ["postgres-plugin", 'SELECT * FROM tickets WHERE "l2owner" IS NULL;'],
+    ["mysql-plugin", "SELECT * FROM tickets WHERE tickets.l2owner <=> NULL;"],
+  ])(
+    "APP-16324: update_action compiles isNull for the datasource's database (%s)",
+    async (pluginId, sql) => {
+      const { server, updateAction } = sqlUpdateServer([
+        { id: "ds1", name: "DB", pluginId },
+      ]);
+      const updated = await updateWithInList(server, [
+        { column: "l2owner", op: "isNull" },
+      ]);
+
+      expect(updated.body.updated).toBe(true);
+      expect(
+        mcpAuthoredBody(
+          (
+            (updateAction.mock.calls[0] as unknown[])[1] as {
+              actionConfiguration: { body: string };
+            }
+          ).actionConfiguration.body,
+        ),
+      ).toBe(sql);
+    },
+  );
+
+  it("APP-16324 F1.2: update_action compiles an anyOf group", async () => {
+    const { server, updateAction } = sqlUpdateServer([
+      { id: "ds1", name: "DB", pluginId: "mysql-plugin" },
+    ]);
+    const updated = await updateWithInList(server, [
+      {
+        anyOf: [
+          { column: "l2owner", op: "isNull" },
+          { column: "l2owner", op: "eq", value: { literal: "" } },
+        ],
+      },
+    ]);
+
+    expect(updated.body.updated).toBe(true);
+    expect(
+      mcpAuthoredBody(
+        (
+          (updateAction.mock.calls[0] as unknown[])[1] as {
+            actionConfiguration: { body: string };
+          }
+        ).actionConfiguration.body,
+      ),
+    ).toBe(
+      'SELECT * FROM tickets WHERE (tickets.l2owner <=> NULL OR tickets.l2owner = {{ "" }});',
+    );
+  });
+
+  it("APP-16324 F1.4: update_action compiles a coalesced column", async () => {
+    const { server, updateAction } = sqlUpdateServer([
+      { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+    ]);
+    const read = await callTool(server, "get_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+    const updated = await callTool(server, "update_action", {
+      spec: {
+        kind: "SQL",
+        actionId: "act1",
+        applicationId: "app1",
+        revision: read.body.revision,
+        query: {
+          name: "OldName",
+          applicationId: "app1",
+          pageId: "p1",
+          datasourceId: "ds1",
+          operation: "SELECT",
+          table: "tickets",
+          columns: ["id", { column: "owner", coalesce: { literal: "none" } }],
+        },
+      },
+    });
+
+    expect(updated.body.updated).toBe(true);
+    expect(
+      mcpAuthoredBody(
+        (
+          (updateAction.mock.calls[0] as unknown[])[1] as {
+            actionConfiguration: { body: string };
+          }
+        ).actionConfiguration.body,
+      ),
+    ).toBe('SELECT id, COALESCE(owner, {{ "none" }}) AS owner FROM tickets;');
+  });
+
+  it("APP-16324 F1.5: update_action compiles having", async () => {
+    const { server, updateAction } = sqlUpdateServer([
+      { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+    ]);
+    const read = await callTool(server, "get_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+    const updated = await callTool(server, "update_action", {
+      spec: {
+        kind: "SQL",
+        actionId: "act1",
+        applicationId: "app1",
+        revision: read.body.revision,
+        query: {
+          name: "OldName",
+          applicationId: "app1",
+          pageId: "p1",
+          datasourceId: "ds1",
+          operation: "SELECT",
+          table: "tickets",
+          groupBy: ["tag"],
+          aggregate: { fn: "count" },
+          having: [{ column: "count", op: "gt", value: { literal: 1 } }],
+        },
+      },
+    });
+
+    expect(updated.body.updated).toBe(true);
+    expect(
+      mcpAuthoredBody(
+        (
+          (updateAction.mock.calls[0] as unknown[])[1] as {
+            actionConfiguration: { body: string };
+          }
+        ).actionConfiguration.body,
+      ),
+    ).toBe(
+      'SELECT "tag", COUNT(*) AS count FROM tickets GROUP BY "tag" HAVING COUNT(*) > {{ 1 }};',
+    );
+  });
+
+  it.each([
+    ["postgres-plugin", true],
+    ["mysql-plugin", false],
+  ])(
+    "APP-16324 F1.6: update_action compiles a split group column only on PostgreSQL (%s)",
+    async (pluginId, allowed) => {
+      const { server, updateAction } = sqlUpdateServer([
+        { id: "ds1", name: "DB", pluginId },
+      ]);
+      const read = await callTool(server, "get_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+      const updated = await callTool(server, "update_action", {
+        spec: {
+          kind: "SQL",
+          actionId: "act1",
+          applicationId: "app1",
+          revision: read.body.revision,
+          query: {
+            name: "OldName",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId: "ds1",
+            operation: "SELECT",
+            table: "tickets",
+            groupBy: [{ column: "tags", split: "," }],
+            aggregate: { fn: "count" },
+          },
+        },
+      });
+
+      if (allowed) {
+        expect(updated.body.updated).toBe(true);
+        expect(
+          (
+            (updateAction.mock.calls[0] as unknown[])[1] as {
+              actionConfiguration: { body: string };
+            }
+          ).actionConfiguration.body,
+        ).toContain(
+          'CROSS JOIN LATERAL unnest(string_to_array("tags", {{ "," }}))',
+        );
+      } else {
+        expect(JSON.stringify(updated.body)).toMatch(
+          /split \(on tags\) is only available on a PostgreSQL datasource/,
+        );
+        expect(updateAction).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  // update_action reuses querySpecSchema, so the having refusals hold on this path too.
+  it.each([
+    [
+      "on a write",
+      {
+        operation: "DELETE",
+        filters: [{ column: "id", op: "eq", value: { literal: 1 } }],
+        having: [{ column: "count", op: "gt", value: { literal: 1 } }],
+      },
+    ],
+    [
+      "without an aggregate",
+      {
+        operation: "SELECT",
+        groupBy: ["tag"],
+        having: [{ column: "tag", op: "eq", value: { literal: "x" } }],
+      },
+    ],
+  ])(
+    "APP-16324 F1.5: update_action refuses having %s",
+    async (_case, query) => {
+      const { server, updateAction } = sqlUpdateServer([
+        { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+      ]);
+      const read = await callTool(server, "get_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+      const updated = await callTool(server, "update_action", {
+        spec: {
+          kind: "SQL",
+          actionId: "act1",
+          applicationId: "app1",
+          revision: read.body.revision,
+          query: {
+            name: "OldName",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId: "ds1",
+            table: "tickets",
+            ...query,
+          },
+        },
+      });
+
+      expect(updated.body.updated).not.toBe(true);
+      expect(JSON.stringify(updated.body)).toContain("having");
+      expect(updateAction).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["postgres-plugin", true],
+    ["mysql-plugin", false],
+  ])(
+    "APP-16495: update_action compiles a date bucket only on PostgreSQL or Redshift (%s)",
+    async (pluginId, allowed) => {
+      const { server, updateAction } = sqlUpdateServer([
+        { id: "ds1", name: "DB", pluginId },
+      ]);
+      const read = await callTool(server, "get_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+      const updated = await callTool(server, "update_action", {
+        spec: {
+          kind: "SQL",
+          actionId: "act1",
+          applicationId: "app1",
+          revision: read.body.revision,
+          query: {
+            name: "OldName",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId: "ds1",
+            operation: "SELECT",
+            table: "tickets",
+            groupBy: [{ column: "created_at", bucket: "month", as: "month" }],
+            aggregates: [{ fn: "count" }],
+          },
+        },
+      });
+
+      if (allowed) {
+        expect(updated.body.updated).toBe(true);
+        expect(
+          mcpAuthoredBody(
+            (
+              (updateAction.mock.calls[0] as unknown[])[1] as {
+                actionConfiguration: { body: string };
+              }
+            ).actionConfiguration.body,
+          ),
+        ).toBe(
+          "SELECT DATE_TRUNC('month', \"created_at\") AS month, COUNT(*) AS count FROM tickets GROUP BY DATE_TRUNC('month', \"created_at\");",
+        );
+      } else {
+        expect(updated.body.errors).toContainEqual(
+          expect.objectContaining({
+            message:
+              "bucket (on created_at) is only available on a PostgreSQL or Redshift datasource, which have DATE_TRUNC",
+            path: "",
+          }),
+        );
+        expect(updateAction).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  // APP-16517: the server runs an action on its stored plugin, and an update keeps it. So update_action must not
+  // recompile a query for a datasource of another plugin.
+  describe("APP-16517: update_action keeps an action on its plugin", () => {
+    const PLUGIN_ERROR =
+      "an update must keep the action on a datasource of the same plugin, such as PostgreSQL to PostgreSQL. To use a datasource of another plugin, create a new query with create_query or create_rest_api";
+    const PG = [{ id: "dspg", name: "PG", pluginId: "postgres-plugin" }];
+
+    function storedServer(
+      stored: unknown,
+      datasources: unknown[],
+      store = new MemoryGovernanceStore(),
+    ) {
+      const updateAction = jest.fn(async () => stored);
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getAction: jest.fn(async () => stored),
+        listDatasources: jest.fn(async () => datasources),
+        updateAction: updateAction as never,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        dataEnabled: true,
+        governance: new McpGovernanceCoordinator(store),
+      });
+
+      return { server, updateAction, store };
+    }
+
+    async function sqlTo(
+      server: ReturnType<typeof createMcpHttpServer>,
+      datasourceId: string,
+      revision?: string,
+    ) {
+      const read = await callTool(server, "get_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+
+      return callTool(server, "update_action", {
+        spec: {
+          kind: "SQL",
+          actionId: "act1",
+          applicationId: "app1",
+          revision: revision ?? read.body.revision,
+          query: {
+            name: "OldName",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId,
+            operation: "SELECT",
+            table: "tickets",
+          },
+        },
+      });
+    }
+
+    async function restTo(
+      server: ReturnType<typeof createMcpHttpServer>,
+      datasourceId: string,
+    ) {
+      const read = await callTool(server, "get_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+
+      return callTool(server, "update_action", {
+        spec: {
+          kind: "REST",
+          actionId: "act1",
+          applicationId: "app1",
+          revision: read.body.revision,
+          rest: {
+            name: "OldName",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId,
+            method: "GET",
+            path: "/v1/users",
+          },
+        },
+      });
+    }
+
+    it("should_refuse_when_only_the_edit_copy_names_a_redshift_plugin", async () => {
+      // Given
+      const { server, updateAction } = storedServer(
+        {
+          id: "act1",
+          name: "OldName",
+          pageId: "p1",
+          pluginType: "DB",
+          unpublishedAction: {
+            name: "OldName",
+            pageId: "p1",
+            pluginId: "redshift-plugin",
+            datasource: { id: "dsrs" },
+          },
+        },
+        PG,
+      );
+
+      // When
+      const updated = await sqlTo(server, "dspg");
+
+      // Then
+      expect(updated.body.error).toBe(PLUGIN_ERROR);
+      expect(updateAction).not.toHaveBeenCalled();
+    });
+
+    it("should_use_the_action_plugin_over_its_datasource_plugin", async () => {
+      // Given: the action runs on Redshift although its stored datasource reference says PostgreSQL.
+      const { server, updateAction } = storedServer(
+        {
+          ...STORED_ACTION,
+          pluginId: "redshift-plugin",
+          datasource: { id: "dspg", pluginId: "postgres-plugin" },
+        },
+        PG,
+      );
+
+      // When
+      const updated = await sqlTo(server, "dspg");
+
+      // Then
+      expect(updated.body.error).toBe(PLUGIN_ERROR);
+      expect(updateAction).not.toHaveBeenCalled();
+    });
+
+    it("should_refuse_before_governance_records_anything", async () => {
+      // Given: a stale revision, so governance would also refuse if it ran first.
+      const store = new MemoryGovernanceStore();
+      const { server, updateAction } = storedServer(
+        { ...STORED_ACTION, pluginId: "redshift-plugin" },
+        PG,
+        store,
+      );
+
+      // When
+      const updated = await sqlTo(server, "dspg", "0".repeat(64));
+
+      // Then
+      expect(updated.body.error).toBe(PLUGIN_ERROR);
+      expect(updateAction).not.toHaveBeenCalled();
+      expect(store.changes).toHaveLength(0);
+    });
+
+    it("should_refuse_a_SQL_spec_on_an_action_stored_on_the_REST_plugin", async () => {
+      // Given
+      const { server, updateAction } = storedServer(
+        { ...STORED_ACTION, pluginType: "API", pluginId: "restapi-plugin" },
+        PG,
+      );
+
+      // When
+      const updated = await sqlTo(server, "dspg");
+
+      // Then
+      expect(updated.body.error).toBe(PLUGIN_ERROR);
+      expect(updateAction).not.toHaveBeenCalled();
+    });
+
+    it("should_refuse_when_the_new_datasource_has_no_plugin", async () => {
+      // Given: the workspace lists the datasource without a pluginId.
+      const { server, updateAction } = storedServer(
+        { ...STORED_ACTION, pluginId: "postgres-plugin" },
+        [{ id: "dspg", name: "PG" }],
+      );
+
+      // When
+      const updated = await sqlTo(server, "dspg");
+
+      // Then
+      expect(updated.body.updated).not.toBe(true);
+      expect(updateAction).not.toHaveBeenCalled();
+    });
+
+    it("should_refuse_a_REST_spec_that_names_a_SQL_datasource", async () => {
+      // Given: a PostgreSQL action, and a REST spec naming the same PostgreSQL datasource, so the plugins match.
+      const { server, updateAction } = storedServer(
+        { ...STORED_ACTION, pluginId: "postgres-plugin" },
+        PG,
+      );
+
+      // When
+      const updated = await restTo(server, "dspg");
+
+      // Then
+      expect(updated.body.error).toBe(
+        "a REST update needs a REST API datasource",
+      );
+      expect(updateAction).not.toHaveBeenCalled();
+    });
+
+    it("should_update_a_REST_action_on_a_REST_datasource", async () => {
+      // Given
+      const { server, updateAction } = storedServer(
+        { ...STORED_ACTION, pluginType: "API", pluginId: "restapi-plugin" },
+        [{ id: "dsrest", name: "API", pluginId: "restapi-plugin" }],
+      );
+
+      // When
+      const updated = await restTo(server, "dsrest");
+
+      // Then
+      expect(updated.body.updated).toBe(true);
+      expect(updateAction).toHaveBeenCalledTimes(1);
+    });
+
+    it("should_refuse_a_REST_datasource_outside_the_workspace", async () => {
+      // Given
+      const { server, updateAction } = storedServer(
+        { ...STORED_ACTION, pluginType: "API", pluginId: "restapi-plugin" },
+        [{ id: "other", name: "API", pluginId: "restapi-plugin" }],
+      );
+
+      // When
+      const updated = await restTo(server, "dsrest");
+
+      // Then
+      expect(updated.body.error).toBe(
+        "datasource dsrest is not accessible in this application's workspace",
+      );
+      expect(updateAction).not.toHaveBeenCalled();
+    });
+
+    async function updateTo(
+      server: ReturnType<typeof createMcpHttpServer>,
+      datasourceId: string,
+    ) {
+      const read = await callTool(server, "get_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+
+      return callTool(server, "update_action", {
+        spec: {
+          kind: "SQL",
+          actionId: "act1",
+          applicationId: "app1",
+          revision: read.body.revision,
+          query: {
+            name: "OldName",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId,
+            operation: "SELECT",
+            table: "tickets",
+            filters: [
+              {
+                column: "owner",
+                op: "eq",
+                value: { widget: "OwnerInput", property: "text" },
+              },
+            ],
+          },
+        },
+      });
+    }
+
+    it.each(["redshift-plugin", "snowflake-plugin"])(
+      "should_refuse_before_any_write_when_a_%s_action_is_moved_to_a_postgres_datasource",
+      async (storedPluginId) => {
+        // Given: the action runs on Redshift or Snowflake; the spec names a PostgreSQL datasource.
+        const { server, updateAction } = sqlUpdateServer(
+          [{ id: "dspg", name: "PG", pluginId: "postgres-plugin" }],
+          storedPluginId,
+        );
+
+        // When
+        const updated = await updateTo(server, "dspg");
+
+        // Then
+        expect(updated.body.updated).not.toBe(true);
+        expect(updated.body.error).toBe(
+          "an update must keep the action on a datasource of the same plugin, such as PostgreSQL to PostgreSQL. To use a datasource of another plugin, create a new query with create_query or create_rest_api",
+        );
+        expect(updateAction).not.toHaveBeenCalled();
+      },
+    );
+
+    // A REST body carries widget values. On a SQL action the SQL plugin would run it as SQL.
+    it.each(["redshift-plugin", "postgres-plugin"])(
+      "should_refuse_before_any_write_when_a_REST_spec_targets_a_%s_action",
+      async (storedPluginId) => {
+        // Given: the action runs on a SQL plugin; the spec is REST on a REST datasource.
+        const { server, updateAction } = sqlUpdateServer(
+          [{ id: "dsrest", name: "API", pluginId: "restapi-plugin" }],
+          storedPluginId,
+        );
+        const read = await callTool(server, "get_action", {
+          applicationId: "app1",
+          actionId: "act1",
+        });
+
+        // When
+        const updated = await callTool(server, "update_action", {
+          spec: {
+            kind: "REST",
+            actionId: "act1",
+            applicationId: "app1",
+            revision: read.body.revision,
+            rest: {
+              name: "OldName",
+              applicationId: "app1",
+              pageId: "p1",
+              datasourceId: "dsrest",
+              method: "GET",
+              path: "/v1/users",
+              queryParameters: [
+                {
+                  key: "q",
+                  value: { widget: "SearchInput", property: "text" },
+                },
+              ],
+            },
+          },
+        });
+
+        // Then
+        expect(updated.body.updated).not.toBe(true);
+        expect(updated.body.error).toBe(
+          "an update must keep the action on a datasource of the same plugin, such as PostgreSQL to PostgreSQL. To use a datasource of another plugin, create a new query with create_query or create_rest_api",
+        );
+        expect(updateAction).not.toHaveBeenCalled();
+      },
+    );
+
+    it("should_refuse_when_the_stored_action_has_no_plugin", async () => {
+      // Given: neither the action nor its stored datasource names a plugin.
+      const updateAction = jest.fn();
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...STORED_ACTION,
+          datasource: { id: "ds1" },
+        })),
+        listDatasources: jest.fn(async () => [
+          { id: "ds1", name: "PG", pluginId: "postgres-plugin" },
+        ]),
+        updateAction: updateAction as never,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        dataEnabled: true,
+        governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+      });
+
+      // When
+      const updated = await updateTo(server, "ds1");
+
+      // Then
+      expect(updated.body.updated).not.toBe(true);
+      expect(updated.body.error).toBe(
+        "could not find the plugin this action runs on, so its body cannot be rewritten. Create a new query instead",
+      );
+      expect(updateAction).not.toHaveBeenCalled();
+    });
+
+    it("should_update_when_the_query_moves_to_another_datasource_of_the_same_plugin", async () => {
+      // Given: two PostgreSQL datasources; the action runs on the PostgreSQL plugin.
+      const { server, updateAction } = sqlUpdateServer([
+        { id: "ds1", name: "PG one", pluginId: "postgres-plugin" },
+        { id: "ds2", name: "PG two", pluginId: "postgres-plugin" },
+      ]);
+
+      // When
+      const updated = await updateTo(server, "ds2");
+
+      // Then
+      expect(updated.body.updated).toBe(true);
+      expect(updateAction).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // APP-16507: Redshift and Snowflake paste each {{ }} value into the SQL text, so update_action must not store one.
+  it.each([
+    ["redshift-plugin", "Redshift"],
+    ["snowflake-plugin", "Snowflake"],
+  ])(
+    "APP-16507: update_action refuses a widget-valued filter on %s before any API write",
+    async (pluginId, database) => {
+      const { server, updateAction } = sqlUpdateServer([
+        { id: "ds1", name: "DB", pluginId },
+      ]);
+      const read = await callTool(server, "get_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+      const updated = await callTool(server, "update_action", {
+        spec: {
+          kind: "SQL",
+          actionId: "act1",
+          applicationId: "app1",
+          revision: read.body.revision,
+          query: {
+            name: "OldName",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId: "ds1",
+            operation: "SELECT",
+            table: "tickets",
+            filters: [
+              {
+                column: "owner",
+                op: "eq",
+                value: { widget: "OwnerInput", property: "text" },
+              },
+            ],
+          },
+        },
+      });
+
+      expect(updated.body.updated).not.toBe(true);
+      expect(JSON.stringify(updated.body.errors)).toContain(
+        `the ${database} plugin does not use prepared statements`,
+      );
+      expect(updateAction).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [
+      "aggregates",
+      {
+        operation: "DELETE",
+        filters: [{ column: "id", op: "eq", value: { literal: 1 } }],
+        aggregates: [{ fn: "count" }],
+      },
+    ],
+    [
+      "distinct",
+      {
+        operation: "INSERT",
+        values: [{ column: "name", value: { literal: "x" } }],
+        distinct: true,
+      },
+    ],
+  ])(
+    "APP-16495: update_action refuses %s on a write before any API write",
+    async (field, query) => {
+      const { server, updateAction } = sqlUpdateServer([
+        { id: "ds1", name: "DB", pluginId: "postgres-plugin" },
+      ]);
+      const read = await callTool(server, "get_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+      const updated = await callTool(server, "update_action", {
+        spec: {
+          kind: "SQL",
+          actionId: "act1",
+          applicationId: "app1",
+          revision: read.body.revision,
+          query: {
+            name: "OldName",
+            applicationId: "app1",
+            pageId: "p1",
+            datasourceId: "ds1",
+            table: "tickets",
+            ...query,
+          },
+        },
+      });
+
+      expect(updated.body.updated).not.toBe(true);
+      expect(updated.body.errors).toContainEqual(
+        expect.objectContaining({
+          message: `${field} is only valid on a SELECT query`,
+          path: `query.${field}`,
+        }),
+      );
+      expect(updateAction).not.toHaveBeenCalled();
+    },
+  );
+
+  it("APP-16164: update_action refuses a SQL spec on a datasource outside the application's workspace", async () => {
+    const { server, updateAction } = sqlUpdateServer([
+      { id: "other", name: "X", pluginId: "postgres-plugin" },
+    ]);
+    const updated = await updateWithInList(server);
+
+    expect(updated.body.error).toMatch(/not accessible/);
+    expect(updateAction).not.toHaveBeenCalled();
+  });
+
+  it("get_action returns safe metadata + revision, and update_action commits a governed rename", async () => {
+    const store = new MemoryGovernanceStore();
+    const updateAction = jest.fn<
+      Promise<unknown>,
+      [string, Record<string, unknown>]
+    >(async () => ({ ...STORED_ACTION, name: "NewName" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getAction: jest.fn(async () => STORED_ACTION),
+      updateAction,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const read = await callTool(server, "get_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(read.body.action.name).toBe("OldName");
+    expect(read.text).not.toContain("actionConfiguration");
+    expect(read.body.revision).toMatch(/^[a-f0-9]{64}$/);
+
+    const updated = await callTool(server, "update_action", {
+      spec: {
+        kind: "SQL",
+        actionId: "act1",
+        applicationId: "app1",
+        revision: read.body.revision,
+        name: "NewName",
+      },
+    });
+
+    expect(updated.body.updated).toBe(true);
+    expect(updateAction).toHaveBeenCalledTimes(1);
+    // The DTO sent to the server carries only id + safe fields, never a raw body from the caller.
+    expect(updateAction.mock.calls[0][1]).toEqual({
+      id: "act1",
+      name: "NewName",
+    });
+    expect(typeof updated.body.changeId).toBe("string");
+    expect(store.changes.some((c) => c.operation === "update_action")).toBe(
+      true,
+    );
+  });
+
+  it("records an audit change and rolls a layout edit back to its prior snapshot", async () => {
+    const store = new MemoryGovernanceStore();
+    let current: Record<string, unknown> = ROOT_DSL;
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async (_app, _page, _layout, dsl) => {
+      current = dsl;
+
+      return { ok: true };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: current },
+      })),
+      updateLayout: updateLayout as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const before = fingerprintDsl(ROOT_DSL as never);
+    const edited = await callTool(server, "edit_page", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: before,
+      edit: { add: [{ type: "button", text: "Go" }] },
+    });
+
+    expect(edited.body.changeId).toBeDefined();
+    expect(current).not.toBe(ROOT_DSL); // an edit was applied
+
+    const list = await callTool(server, "list_changes", {});
+    const change = list.body.changes.find(
+      (c: { operation: string }) => c.operation === "edit_page",
+    );
+
+    expect(change.rollbackAvailable).toBe(true);
+    // History never leaks the snapshot DSL.
+    expect(list.text).not.toContain("MainContainer");
+
+    const prepared = await callTool(server, "prepare_rollback", {
+      changeId: change.id,
+    });
+    const rolled = await callTool(server, "confirm_rollback", {
+      changeId: change.id,
+      confirmationId: prepared.body.confirmationId,
+    });
+
+    expect(rolled.body.rolledBack).toBe(true);
+    expect(rolled.body.revision).toBe(before); // restored to the original snapshot
+  });
+
+  it("list_all_changes: an admin sees cross-actor records; a non-admin is refused (M2-T2)", async () => {
+    const store = new MemoryGovernanceStore();
+    const mk = (
+      id: string,
+      actorId: string,
+      organizationId: string,
+      ms: number,
+    ): McpChangeRecord => ({
+      id,
+      actorId,
+      organizationId,
+      entityKey: "e",
+      operation: "op",
+      revisionBefore: "",
+      revisionAfter: "",
+      createdAt: new Date(ms),
+      rollback: {},
+      summary: {},
+    });
+
+    // Two records in org "acme" and one in a DIFFERENT tenant "globex" — the acme admin must never see globex.
+    await store.saveChange(mk("c1", "alice@appsmith.com", "acme", 1000));
+    await store.saveChange(mk("c2", "bob@appsmith.com", "acme", 2000));
+    await store.saveChange(mk("c3", "carol@globex.com", "globex", 3000));
+
+    // Non-admin (default validateToken reports no isSuperUser) -> refused, no records leaked.
+    const nonAdmin = createMcpHttpServer(API_BASE_URL, createApi(), {
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const denied = await callTool(nonAdmin, "list_all_changes", {});
+
+    expect(denied.body.code).toBe("admin_required");
+    expect(denied.body.changes).toBeUndefined();
+
+    // Admin of org "acme" (isSuperUser is a PER-ORG signal in EE) -> sees acme's cross-actor records ONLY.
+    const adminServer = createMcpHttpServer(
+      API_BASE_URL,
+      createApi(
+        jest.fn(async () => ({
+          username: "admin@appsmith.com",
+          isAnonymous: false,
+          isSuperUser: true,
+          organizationId: "acme",
+        })),
+      ),
+      { governance: new McpGovernanceCoordinator(store) },
+    );
+    const all = await callTool(adminServer, "list_all_changes", {});
+
+    expect(all.body.changes.map((c: { id: string }) => c.id).sort()).toEqual([
+      "c1",
+      "c2",
+    ]);
+    // Cross-tenant isolation: globex's record is NEVER returned to the acme admin (the reported vulnerability).
+    expect(all.body.changes.some((c: { id: string }) => c.id === "c3")).toBe(
+      false,
+    );
+    // Cross-actor audit MUST attribute each record to its actor.
+    const byId = Object.fromEntries(
+      all.body.changes.map((c: { id: string; actorId: string }) => [
+        c.id,
+        c.actorId,
+      ]),
+    );
+
+    expect(byId.c1).toBe("alice@appsmith.com");
+    expect(byId.c2).toBe("bob@appsmith.com");
+    // The rollback SNAPSHOT object is never exposed even to an admin (only the rollbackAvailable boolean is).
+    expect(all.body.changes[0].rollback).toBeUndefined();
+
+    // get_any_change: acme admin can fetch an acme record but NOT globex's, even knowing its id.
+    const anyChange = await callTool(adminServer, "get_any_change", {
+      changeId: "c2",
+    });
+
+    expect(anyChange.body.change.actorId).toBe("bob@appsmith.com");
+
+    const crossTenant = await callTool(adminServer, "get_any_change", {
+      changeId: "c3",
+    });
+
+    expect(crossTenant.body.change).toBeUndefined();
+    expect(crossTenant.body.error).toBe("change not found");
+
+    const deniedGet = await callTool(nonAdmin, "get_any_change", {
+      changeId: "c2",
+    });
+
+    expect(deniedGet.body.code).toBe("admin_required");
+
+    // The admin's own actor-scoped list_changes still sees only its own records (none here).
+    const own = await callTool(adminServer, "list_changes", {});
+
+    expect(own.body.changes).toEqual([]);
+  });
+
+  it("list_all_changes / get_any_change fail closed when the caller's organization is unknown (M2-T2 tenant isolation)", async () => {
+    const store = new MemoryGovernanceStore();
+
+    await store.saveChange({
+      id: "c1",
+      actorId: "alice@appsmith.com",
+      organizationId: "acme",
+      entityKey: "e",
+      operation: "op",
+      revisionBefore: "",
+      revisionAfter: "",
+      createdAt: new Date(1000),
+      rollback: {},
+      summary: {},
+    });
+
+    // Admin WITHOUT an organization on the profile (e.g. an older server that does not report it). The audit read
+    // cannot be tenant-scoped, so it must refuse rather than run an unscoped cross-tenant query.
+    const adminNoOrg = createMcpHttpServer(
+      API_BASE_URL,
+      createApi(
+        jest.fn(async () => ({
+          username: "admin@appsmith.com",
+          isAnonymous: false,
+          isSuperUser: true,
+        })),
+      ),
+      { governance: new McpGovernanceCoordinator(store) },
+    );
+
+    const listed = await callTool(adminNoOrg, "list_all_changes", {});
+
+    expect(listed.body.code).toBe("organization_scope_unavailable");
+    expect(listed.body.changes).toBeUndefined();
+
+    const fetched = await callTool(adminNoOrg, "get_any_change", {
+      changeId: "c1",
+    });
+
+    expect(fetched.body.code).toBe("organization_scope_unavailable");
+    expect(fetched.body.change).toBeUndefined();
+
+    // The ACTOR-scoped reads fail closed too: without an org they cannot be tenant-bounded, so two tenants could
+    // otherwise alias on the empty-org sentinel (colliding email is only per-org unique).
+    const noOrg = createMcpHttpServer(
+      API_BASE_URL,
+      createApi(
+        jest.fn(async () => ({
+          username: "alice@appsmith.com",
+          isAnonymous: false,
+        })),
+      ),
+      { governance: new McpGovernanceCoordinator(store) },
+    );
+
+    const ownList = await callTool(noOrg, "list_changes", {});
+
+    expect(ownList.body.code).toBe("organization_scope_unavailable");
+    expect(ownList.body.changes).toBeUndefined();
+
+    const ownGet = await callTool(noOrg, "get_change", { changeId: "c1" });
+
+    expect(ownGet.body.code).toBe("organization_scope_unavailable");
+  });
+
+  it("get_capabilities advertises EXACTLY the registered tools (no drift), under all gates", async () => {
+    for (const gate of [
+      { dataEnabled: false, governed: false, js: false },
+      { dataEnabled: true, governed: false, js: false },
+      { dataEnabled: true, governed: true, js: false },
+      { dataEnabled: true, governed: true, js: true },
+      { dataEnabled: false, governed: true, js: true },
+    ]) {
+      const server = createMcpHttpServer(API_BASE_URL, () => createApi()(), {
+        dataEnabled: gate.dataEnabled,
+        jsEnabled: gate.js,
+        governance: gate.governed
+          ? new McpGovernanceCoordinator(new MemoryGovernanceStore())
+          : undefined,
+      });
+      const sessionId = await initSession(server);
+      const listed = await supertest(server)
+        .post("/mcp")
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", "Bearer mcp_user-token")
+        .set("mcp-session-id", sessionId)
+        .send({ jsonrpc: "2.0", id: 20, method: "tools/list" });
+      const registered = new Set<string>(
+        parseJsonRpc(listed).result.tools.map((t) => t.name),
+      );
+
+      const caps = await callTool(server, "get_capabilities", {});
+      const advertised = new Set<string>(
+        (caps.body.tools as string[]).map((line) => line.split(" — ")[0]),
+      );
+
+      expect([...advertised].sort()).toEqual([...registered].sort());
+    }
+  });
+
+  it("get_capabilities carries the build identity (version), matching /health", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, () => createApi()());
+    const caps = await callTool(server, "get_capabilities", {});
+    const build = caps.body.build as { version: string; buildTime?: string };
+
+    expect(build.version).toBe(MCP_BUILD_INFO.version);
+
+    const health = await supertest(server).get("/health");
+
+    // Both surfaces answer "which build is this instance running" identically.
+    expect(health.body.version).toBe(build.version);
+  });
+
+  it("documents the patch vocabulary (tableData vs source) and exposes real schemas for patch/wire tools", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, () => createApi()());
+    const caps = await callTool(server, "get_capabilities", {});
+    const patchSpec = caps.body.patchSpec as {
+      updateProps: Record<string, string>;
+    };
+
+    // The one naming trap that broke real agents: a table's data binding is `tableData` on the patch path,
+    // while `source` there means a selected-row ref. Both must be documented, distinctly.
+    expect(patchSpec.updateProps.tableData).toContain("query");
+    expect(patchSpec.updateProps.source).toContain("selected-row");
+
+    // The machine-readable inputSchema must expose real structure, not an opaque record.
+    const sessionId = await initSession(server);
+    const listed = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", id: 21, method: "tools/list" });
+    const tools = parseJsonRpc(listed).result.tools as unknown as {
+      name: string;
+      inputSchema: {
+        properties?: Record<string, { properties?: Record<string, unknown> }>;
+      };
+    }[];
+    const patchTool = tools.find((tool) => tool.name === "patch_widgets");
+    const wireTool = tools.find((tool) => tool.name === "wire_event");
+
+    expect(
+      patchTool?.inputSchema.properties?.patch?.properties?.operations,
+    ).toBeDefined();
+    expect(
+      wireTool?.inputSchema.properties?.spec?.properties?.event,
+    ).toBeDefined();
+  });
+
+  it("get_capabilities advertises disabled capability groups with how to enable them", async () => {
+    // Data + JS off: the agent must still SEE those capabilities and the setting that unlocks them.
+    const offServer = createMcpHttpServer(API_BASE_URL, () => createApi()(), {
+      dataEnabled: false,
+      jsEnabled: false,
+    });
+    const off = await callTool(offServer, "get_capabilities", {});
+    const groups = off.body.disabledCapabilities.groups as {
+      requires: string;
+      provides: string;
+      tools: string[];
+    }[];
+
+    // Every enablement instruction is phrased for a human (not a bare env var) and names the real setting.
+    expect(
+      groups.every((group) =>
+        group.requires.startsWith("ask your Appsmith administrator"),
+      ),
+    ).toBe(true);
+    expect(
+      groups.some((group) =>
+        group.requires.includes("APPSMITH_MCP_DATA_ENABLED"),
+      ),
+    ).toBe(true);
+    expect(
+      groups.some((group) =>
+        group.requires.includes("APPSMITH_MCP_JS_ENABLED"),
+      ),
+    ).toBe(true);
+
+    // The data group names the real tools it would add.
+    const dataGroup = groups.find((group) =>
+      group.tools.includes("create_query"),
+    );
+
+    expect(dataGroup?.requires).toContain("APPSMITH_MCP_DATA_ENABLED");
+
+    // Everything on -> nothing disabled.
+    const onServer = createMcpHttpServer(API_BASE_URL, () => createApi()(), {
+      dataEnabled: true,
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+    const on = await callTool(onServer, "get_capabilities", {});
+
+    expect(on.body.disabledCapabilities.groups).toEqual([]);
+  });
+
+  it("returns server instructions in the initialize response (visible to every client)", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, createApi());
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .send(initializeRequest);
+    const { instructions } = parseJsonRpc(initialized).result as {
+      instructions?: string;
+    };
+
+    expect(typeof instructions).toBe("string");
+    // The instructions steer the agent to discover capabilities and resolve workspaces by name.
+    expect(instructions).toContain("get_capabilities");
+    expect(instructions).toContain("resolve_workspace");
+  });
+
+  it("wire_event binds a widget event via the closed vocabulary and is governed", async () => {
+    const store = new MemoryGovernanceStore();
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "b",
+          widgetName: "SaveBtn",
+          type: "BUTTON_WIDGET",
+          topRow: 0,
+          bottomRow: 4,
+          leftColumn: 0,
+          rightColumn: 16,
+        },
+        {
+          widgetId: "m",
+          widgetName: "EditModal",
+          type: "MODAL_WIDGET",
+          topRow: 5,
+          bottomRow: 20,
+          leftColumn: 0,
+          rightColumn: 32,
+        },
+      ],
+    };
+    let current: Record<string, unknown> = DSL;
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async (_app, _page, _layout, dsl) => {
+      current = dsl;
+
+      return { ok: true };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: current },
+      })),
+      updateLayout: updateLayout as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const wired = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "SaveBtn",
+        event: "onClick",
+        action: { showModal: "EditModal" },
+      },
+    });
+
+    expect(wired.body.changeId).toBeDefined();
+    const written = updateLayout.mock.calls[0][3] as {
+      children: { widgetName: string; onClick?: string }[];
+    };
+    const button = written.children.find((w) => w.widgetName === "SaveBtn");
+
+    expect(button?.onClick).toBe("{{ showModal('EditModal') }}");
+  });
+
+  it("wire_event wires a select's onOptionChange end-to-end (new event vocabulary)", async () => {
+    const store = new MemoryGovernanceStore();
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "s",
+          widgetName: "Region",
+          type: "SELECT_WIDGET",
+          topRow: 0,
+          bottomRow: 7,
+          leftColumn: 0,
+          rightColumn: 24,
+        },
+      ],
+    };
+    let current: Record<string, unknown> = DSL;
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async (_app, _page, _layout, dsl) => {
+      current = dsl;
+
+      return { ok: true };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: current },
+      })),
+      listActions: jest.fn(async () => [{ name: "getCities" }]),
+      updateLayout: updateLayout as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const wired = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "Region",
+        event: "onOptionChange",
+        action: { run: "getCities" },
+      },
+    });
+
+    expect(wired.body.changeId).toBeDefined();
+    const written = updateLayout.mock.calls[0][3] as {
+      children: {
+        widgetName: string;
+        onOptionChange?: string;
+        dynamicTriggerPathList?: { key: string }[];
+      }[];
+    };
+    const select = written.children.find((w) => w.widgetName === "Region");
+
+    expect(wired.body).not.toHaveProperty("column");
+    expect(select?.onOptionChange).toBe("{{ getCities.run() }}");
+    expect(select?.dynamicTriggerPathList).toEqual([{ key: "onOptionChange" }]);
+  });
+
+  it("wire_event rejects an action targeting a missing modal", async () => {
+    const store = new MemoryGovernanceStore();
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "b",
+          widgetName: "SaveBtn",
+          type: "BUTTON_WIDGET",
+          topRow: 0,
+          bottomRow: 4,
+          leftColumn: 0,
+          rightColumn: 16,
+        },
+      ],
+    };
+    const updateLayout = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: DSL },
+      })),
+      updateLayout: updateLayout as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const wired = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "SaveBtn",
+        event: "onClick",
+        action: { showModal: "Ghost" },
+      },
+    });
+
+    expect(wired.body.error).toMatch(/was not found/);
+    expect(updateLayout).not.toHaveBeenCalled();
+  });
+
+  it("wire_event writes a primary showAlert action (no entity references to validate)", async () => {
+    const store = new MemoryGovernanceStore();
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "b",
+          widgetName: "InfoBtn",
+          type: "BUTTON_WIDGET",
+          topRow: 0,
+          bottomRow: 4,
+          leftColumn: 0,
+          rightColumn: 16,
+        },
+      ],
+    };
+    let current: Record<string, unknown> = DSL;
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async (_app, _page, _layout, dsl) => {
+      current = dsl;
+
+      return { ok: true };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: current },
+      })),
+      // No queries exist anywhere — a showAlert action needs no entity to resolve against.
+      listActions: jest.fn(async () => []),
+      updateLayout: updateLayout as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const wired = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "InfoBtn",
+        event: "onClick",
+        action: { showAlert: "Heads up", style: "warning" },
+      },
+    });
+
+    expect(wired.body.changeId).toBeDefined();
+    const written = updateLayout.mock.calls[0][3] as {
+      children: { widgetName: string; onClick?: string }[];
+    };
+
+    expect(written.children[0].onClick).toBe(
+      "{{ showAlert('Heads up', 'warning') }}",
+    );
+  });
+
+  it("wire_event validates and compiles a chained onSuccess follow-up (refresh + close + alert)", async () => {
+    const store = new MemoryGovernanceStore();
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "b",
+          widgetName: "SaveBtn",
+          type: "BUTTON_WIDGET",
+          topRow: 0,
+          bottomRow: 4,
+          leftColumn: 0,
+          rightColumn: 16,
+        },
+        {
+          widgetId: "m",
+          widgetName: "AddUserModal",
+          type: "MODAL_WIDGET",
+          topRow: 5,
+          bottomRow: 20,
+          leftColumn: 0,
+          rightColumn: 32,
+        },
+      ],
+    };
+    let current: Record<string, unknown> = DSL;
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async (_app, _page, _layout, dsl) => {
+      current = dsl;
+
+      return { ok: true };
+    });
+    const listActions = jest.fn(async () => [
+      { name: "insertUser", pageId: "p1" },
+      { name: "getUsers", pageId: "p1" },
+    ]);
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: current },
+      })),
+      listActions,
+      updateLayout: updateLayout as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    // A follow-up referencing an unknown query is rejected before any write.
+    const dangling = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "SaveBtn",
+        event: "onClick",
+        action: { run: "insertUser", onSuccess: [{ run: "ghostQuery" }] },
+      },
+    });
+
+    expect(dangling.body.error).toMatch(/"ghostQuery" was not found/);
+    expect(updateLayout).not.toHaveBeenCalled();
+
+    // APP-16324 F11: a navigate param that reads a widget not on the page is refused before any write too.
+    const danglingParam = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "SaveBtn",
+        event: "onClick",
+        action: {
+          navigate: "Details",
+          params: { id: { table: "GhostTable", column: "id" } },
+        },
+      },
+    });
+
+    expect(danglingParam.body.error).toMatch(/"GhostTable" was not found/);
+    expect(updateLayout).not.toHaveBeenCalled();
+
+    const wired = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "SaveBtn",
+        event: "onClick",
+        action: {
+          run: "insertUser",
+          onSuccess: [
+            { run: "getUsers" },
+            { closeModal: "AddUserModal" },
+            { showAlert: "Saved", style: "success" },
+          ],
+        },
+      },
+    });
+
+    expect(wired.body.changeId).toBeDefined();
+    const written = updateLayout.mock.calls[0][3] as {
+      children: { widgetName: string; onClick?: string }[];
+    };
+    const button = written.children.find((w) => w.widgetName === "SaveBtn");
+
+    expect(button?.onClick).toBe(
+      "{{ insertUser.run().then(() => { getUsers.run(); closeModal('AddUserModal'); showAlert('Saved', 'success'); }) }}",
+    );
+  });
+
+  it("commitLayout's overlap gate rejects when repair cannot escape (M6 backstop)", async () => {
+    // A corrupt-tall obstacle extends past MAX_ROW, so pushdown clamps into a still-colliding position — the
+    // one legitimate in-vocabulary way to reach the gate's rejection envelope, which otherwise only backstops
+    // the repair logic.
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "tall",
+          widgetName: "TallCorrupt",
+          type: "CONTAINER_WIDGET",
+          topRow: 100,
+          bottomRow: 6000,
+          leftColumn: 0,
+          rightColumn: 20,
+        },
+        {
+          widgetId: "mv",
+          widgetName: "Mover",
+          type: "TEXT_WIDGET",
+          text: "hi",
+          topRow: 0,
+          bottomRow: 10,
+          leftColumn: 0,
+          rightColumn: 10,
+        },
+      ],
+    };
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: DSL },
+      })),
+      updateLayout: jest.fn(async () => ({ ok: true })),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const rejected = await callTool(server, "patch_widgets", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      patch: {
+        operations: [
+          {
+            kind: "move",
+            name: "Mover",
+            position: { topRow: 200, leftColumn: 0 },
+          },
+        ],
+      },
+    });
+
+    expect(rejected.body.code).toBe("overlap_introduced");
+    expect(JSON.stringify(rejected.body.pairs)).toContain("TallCorrupt");
+    // The rejection carries a ready-to-apply repair payload of closed patch operations.
+    expect(rejected.body.suggestedFix.tool).toBe("patch_widgets");
+    expect(Array.isArray(rejected.body.suggestedFix.operations)).toBe(true);
+    // Nothing was written.
+    expect(api.updateLayout).not.toHaveBeenCalled();
+  });
+
+  it("wire_event polices modal stacking: depth 2 warns, depth 3 rejects, wizard transitions pass (M6)", async () => {
+    const modalNode = (
+      id: string,
+      name: string,
+      buttons: { id: string; name: string; onClick?: string }[],
+    ) => ({
+      widgetId: id,
+      widgetName: name,
+      type: "MODAL_WIDGET",
+      detachFromLayout: true,
+      topRow: 0,
+      bottomRow: 24,
+      leftColumn: 0,
+      rightColumn: 24,
+      children: [
+        {
+          widgetId: `${id}c`,
+          widgetName: `${name}Canvas`,
+          type: "CANVAS_WIDGET",
+          topRow: 0,
+          bottomRow: 24,
+          leftColumn: 0,
+          rightColumn: 24,
+          children: buttons.map((b, i) => ({
+            widgetId: b.id,
+            widgetName: b.name,
+            type: "BUTTON_WIDGET",
+            topRow: i * 5,
+            bottomRow: i * 5 + 4,
+            leftColumn: 0,
+            rightColumn: 16,
+            ...(b.onClick
+              ? {
+                  onClick: b.onClick,
+                  dynamicTriggerPathList: [{ key: "onClick" }],
+                }
+              : {}),
+          })),
+        },
+      ],
+    });
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        modalNode("m1", "EditModal", [
+          {
+            id: "d",
+            name: "DeleteBtn",
+            onClick: "{{ showModal('ConfirmModal') }}",
+          },
+        ]),
+        modalNode("m2", "ConfirmModal", [{ id: "r", name: "ReallyBtn" }]),
+        modalNode("m3", "ThirdModal", [{ id: "w", name: "WizNext" }]),
+      ],
+    };
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: DSL },
+      })),
+      updateLayout: jest.fn(async () => ({ ok: true })),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const revision = fingerprintDsl(DSL as never);
+    const base = {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision,
+    };
+
+    // Depth 3: page -> EditModal -> ConfirmModal -> ThirdModal. Rejected with the chain.
+    const rejected = await callTool(server, "wire_event", {
+      ...base,
+      spec: {
+        widget: "ReallyBtn",
+        event: "onClick",
+        action: { showModal: "ThirdModal" },
+      },
+    });
+
+    expect(rejected.body.code).toBe("modal_stack");
+    expect(rejected.body.error).toContain("stacks 3 modals");
+
+    // Depth 2 (page -> EditModal already wired; ConfirmModal over it when opened from EditModal) — here we wire
+    // a SECOND stacking edge whose resulting depth is 2: allowed, with a warning in the result.
+    const warned = await callTool(server, "wire_event", {
+      ...base,
+      spec: {
+        widget: "WizNext",
+        event: "onClick",
+        action: { showModal: "ConfirmModal" },
+      },
+    });
+
+    expect(warned.body.error).toBeUndefined();
+    expect(warned.body.modalWarning).toContain("depth 2");
+
+    // Wizard transition: close the host in the same action — passes with no warning.
+    const wizard = await callTool(server, "wire_event", {
+      ...base,
+      spec: {
+        widget: "ReallyBtn",
+        event: "onClick",
+        action: [{ closeModal: "ConfirmModal" }, { showModal: "ThirdModal" }],
+      },
+    });
+
+    expect(wizard.body.error).toBeUndefined();
+    expect(wizard.body.modalWarning).toBeUndefined();
+  });
+
+  it("wire_event builds the ZIP-lookup accumulation wiring (M5: appendToStore fields + clearStoreKey/reset list)", async () => {
+    const store = new MemoryGovernanceStore();
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "in",
+          widgetName: "ZipInput",
+          type: "INPUT_WIDGET_V2",
+          topRow: 0,
+          bottomRow: 7,
+          leftColumn: 0,
+          rightColumn: 24,
+        },
+        {
+          widgetId: "b1",
+          widgetName: "LookupButton",
+          type: "BUTTON_WIDGET",
+          topRow: 8,
+          bottomRow: 12,
+          leftColumn: 0,
+          rightColumn: 16,
+        },
+        {
+          widgetId: "b2",
+          widgetName: "ClearButton",
+          type: "BUTTON_WIDGET",
+          topRow: 8,
+          bottomRow: 12,
+          leftColumn: 16,
+          rightColumn: 32,
+        },
+        {
+          widgetId: "t",
+          widgetName: "ZipResults",
+          type: "TABLE_WIDGET_V2",
+          topRow: 13,
+          bottomRow: 40,
+          leftColumn: 0,
+          rightColumn: 40,
+          tableData: "{{ appsmith.store.zipResults ?? [] }}",
+          dynamicBindingPathList: [{ key: "tableData" }],
+        },
+      ],
+    };
+    let current: Record<string, unknown> = DSL;
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async (_app, _page, _layout, dsl) => {
+      current = dsl;
+
+      return { ok: true };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: current },
+      })),
+      listActions: jest.fn(async () => [{ name: "LookupZip", pageId: "p1" }]),
+      updateLayout: updateLayout as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    // An appendToStore whose query doesn't exist is rejected before any write (dangling-reference guard).
+    const dangling = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "LookupButton",
+        event: "onClick",
+        action: {
+          run: "LookupZip",
+          onSuccess: [
+            { appendToStore: { key: "zipResults", query: "GhostZip" } },
+          ],
+        },
+      },
+    });
+
+    expect(dangling.body.error).toMatch(/"GhostZip" was not found/);
+    expect(updateLayout).not.toHaveBeenCalled();
+
+    // The Lookup button: run the query, then append ONE projected row per lookup (space-keyed + indexed paths).
+    const lookup = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(DSL as never),
+      spec: {
+        widget: "LookupButton",
+        event: "onClick",
+        action: {
+          run: "LookupZip",
+          onSuccess: [
+            {
+              appendToStore: {
+                key: "zipResults",
+                query: "LookupZip",
+                fields: [
+                  { as: "zip", path: ["post code"] },
+                  { as: "city", path: ["places", 0, "place name"] },
+                  { as: "state", path: ["places", 0, "state"] },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    expect(lookup.body.changeId).toBeDefined();
+    // M5 telemetry: the audit/changes payload carries the statement verb kinds.
+    expect(lookup.body.actionKinds).toEqual(["run", "appendToStore"]);
+    const afterLookup = updateLayout.mock.calls[0][3] as {
+      children: { widgetName: string; onClick?: string }[];
+    };
+
+    expect(
+      afterLookup.children.find((w) => w.widgetName === "LookupButton")
+        ?.onClick,
+    ).toBe(
+      "{{ LookupZip.run().then(() => { storeValue('zipResults', [].concat(appsmith.store.zipResults ?? [], " +
+        '{ zip: LookupZip.data?.["post code"], city: LookupZip.data?.["places"]?.[0]?.["place name"], state: LookupZip.data?.["places"]?.[0]?.["state"] }' +
+        " ?? []), false); }) }}",
+    );
+
+    // The Clear button: a statement LIST that empties the store key and resets the input in one click.
+    const clear = await callTool(server, "wire_event", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(current as never),
+      spec: {
+        widget: "ClearButton",
+        event: "onClick",
+        action: [
+          { clearStoreKey: { key: "zipResults" } },
+          { reset: "ZipInput" },
+        ],
+      },
+    });
+
+    expect(clear.body.changeId).toBeDefined();
+    expect(clear.body.actionKinds).toEqual(["clearStoreKey", "reset"]);
+    const afterClear = updateLayout.mock.calls[1][3] as {
+      children: { widgetName: string; onClick?: string; tableData?: string }[];
+    };
+
+    expect(
+      afterClear.children.find((w) => w.widgetName === "ClearButton")?.onClick,
+    ).toBe(
+      "{{ storeValue('zipResults', [], false); resetWidget('ZipInput', true) }}",
+    );
+    // The store-bound table rides along untouched, and the page now has a writer for its key.
+    expect(
+      afterClear.children.find((w) => w.widgetName === "ZipResults")?.tableData,
+    ).toBe("{{ appsmith.store.zipResults ?? [] }}");
+  });
+
+  it("create_js_object resolves plugin/workspace and commits a governed, restricted JS object", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const createActionCollection = jest.fn<
+      Promise<unknown>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "coll1", name: "Helpers" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listPlugins: jest.fn(async () => [
+        { id: "p".repeat(24), type: "JS", packageName: "js-plugin" },
+      ]),
+      listActionCollections: jest.fn(async () => []),
+      createActionCollection,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const created = await callTool(server, "create_js_object", {
+      spec: {
+        applicationId: APP,
+        pageId: "b".repeat(24),
+        name: "Helpers",
+        revision: read.body.revision,
+        functions: [{ name: "loadUsers", run: [{ query: "getUsers" }] }],
+      },
+    });
+
+    expect(created.body.created).toBe(true);
+    expect(createActionCollection).toHaveBeenCalledTimes(1);
+    // The compiled JS body is emitted by the compiler (async fn running a named query), not raw agent input.
+    const body = createActionCollection.mock.calls[0][0] as {
+      body?: string;
+      applicationId?: string;
+      actions?: unknown[];
+    };
+
+    expect(body.body).toContain("await getUsers.run();");
+    expect(body.body).not.toMatch(/\$\{|`/);
+    expect(typeof created.body.changeId).toBe("string");
+    // The server rejects a create without applicationId (400 INVALID_PARAMETER) and needs one JSAction per
+    // function for the editor to list it — both were missing before, so every create failed.
+    expect(body.applicationId).toBe(APP);
+    expect(body.actions).toEqual([
+      expect.objectContaining({
+        name: "loadUsers",
+        clientSideExecution: true,
+        actionConfiguration: expect.objectContaining({
+          body: "async function () { await getUsers.run(); }",
+        }),
+      }),
+    ]);
+  });
+
+  it("read_js_object returns each function's parameter names and async flag, never default values (APP-16381)", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listActionCollections: jest.fn(async () => [
+        {
+          id: "c1",
+          name: "Utils",
+          pageId: "p1",
+          body: "export default { getLicenseData (row, opts) { return row; }, sync () {} }",
+          actions: [
+            {
+              name: "getLicenseData",
+              actionConfiguration: {
+                isAsync: true,
+                jsArguments: [
+                  { name: "row", value: "secretDefault()" },
+                  { name: "opts" },
+                  { name: "not an identifier" },
+                ],
+              },
+            },
+            {
+              name: "sync",
+              actionConfiguration: {
+                isAsync: false,
+                jsArguments: Array.from({ length: 30 }, (_, i) => ({
+                  name: `p${i}`,
+                })),
+              },
+            },
+          ],
+        },
+      ]),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: "a".repeat(24),
+    });
+    const signatures = read.body.jsObjects[0].signatures as {
+      name: string;
+      params: string[];
+      async?: boolean;
+    }[];
+
+    expect(signatures[0]).toEqual({
+      name: "getLicenseData",
+      params: ["row", "opts"],
+      async: true,
+    });
+    expect(signatures[1].async).toBe(false);
+    expect(signatures[1].params).toHaveLength(20);
+    expect(JSON.stringify(signatures)).not.toContain("secretDefault");
+  });
+
+  it("read_semantic_page names JS objects a binding refers to when only the JS tools are on (APP-16381)", async () => {
+    const listActions = jest.fn(async () => {
+      throw new Error("the data tools are off");
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: {
+          dsl: {
+            ...ROOT_DSL,
+            children: [
+              {
+                widgetId: "t",
+                widgetName: "Licenses",
+                type: "TABLE_WIDGET_V2",
+                topRow: 0,
+                bottomRow: 20,
+                leftColumn: 0,
+                rightColumn: 64,
+                tableData: "{{ Utils.getLicenseData() }}",
+              },
+            ],
+          },
+        },
+      })),
+      listActions: listActions as never,
+      listActionCollections: jest.fn(async () => [{ name: "Utils" }]),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+    });
+    const read = await callTool(server, "read_semantic_page", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+    });
+    const table = (
+      read.body.page as { widgets: Record<string, unknown>[] }
+    ).widgets.find((w) => w.name === "Licenses");
+
+    expect(table?.boundProps).toEqual({ tableData: { jsObjects: ["Utils"] } });
+    expect(listActions).not.toHaveBeenCalled();
+  });
+
+  describe("patch_widgets checks a binding expression's query leaves against the app (APP-16381)", () => {
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "w",
+          widgetName: "Warning",
+          type: "TEXT_WIDGET",
+          topRow: 0,
+          bottomRow: 4,
+          leftColumn: 0,
+          rightColumn: 16,
+          text: "Careful",
+        },
+      ],
+    };
+    const patch = {
+      operations: [
+        {
+          kind: "update",
+          name: "Warning",
+          props: {
+            visibleWhen: {
+              expr: {
+                op: "gt",
+                args: [{ query: "GetUsage", field: "total" }, 0],
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    function serverWith(listActions: () => Promise<unknown>) {
+      const updateLayout = jest.fn(async () => ({ ok: true }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getApplicationContext: jest.fn(async (applicationId: string) => ({
+          pages: [],
+          page: { applicationId },
+          layout: { dsl: DSL },
+        })),
+        listActions: jest.fn(listActions) as never,
+        updateLayout: updateLayout as never,
+      };
+
+      return {
+        updateLayout,
+        server: createMcpHttpServer(API_BASE_URL, () => api, {
+          dataEnabled: true,
+          governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+        }),
+      };
+    }
+
+    const call = async (server: ReturnType<typeof serverWith>["server"]) =>
+      callTool(server, "patch_widgets", {
+        applicationId: "app1",
+        pageId: "p1",
+        layoutId: "l1",
+        revision: fingerprintDsl(DSL as never),
+        patch,
+      });
+
+    it("writes the binding when the query exists", async () => {
+      const { server, updateLayout } = serverWith(async () => [
+        { name: "GetUsage" },
+      ]);
+      const patched = await call(server);
+
+      expect(patched.body.error).toBeUndefined();
+
+      const written = (updateLayout.mock.calls[0] as unknown[])[3] as {
+        children: { isVisible?: string }[];
+      };
+
+      expect(written.children[0].isVisible).toBe(
+        "{{ Boolean((GetUsage.data?.total > 0)) }}",
+      );
+    });
+
+    it("refuses an unknown query, and a patch whose query list cannot be read", async () => {
+      const unknown = serverWith(async () => [{ name: "Other" }]);
+      const failing = serverWith(async () => {
+        throw new Error("down");
+      });
+
+      expect(JSON.stringify((await call(unknown.server)).body)).toMatch(
+        /query \\"GetUsage\\" was not found/,
+      );
+      expect(JSON.stringify((await call(failing.server)).body)).toMatch(
+        /cannot be checked here/,
+      );
+      expect(unknown.updateLayout).not.toHaveBeenCalled();
+      expect(failing.updateLayout).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("wire_event on a table's button column (APP-16381)", () => {
+    // A table inside modal Outer, with a button column; modal Inner on the page.
+    function dslWith(innerOpensOuter: boolean) {
+      const modal = (name: string, children: unknown[]) => ({
+        widgetId: name,
+        widgetName: name,
+        type: "MODAL_WIDGET",
+        topRow: 0,
+        bottomRow: 40,
+        leftColumn: 0,
+        rightColumn: 24,
+        children: [
+          {
+            widgetId: `${name}Canvas`,
+            widgetName: `${name}Canvas`,
+            type: "CANVAS_WIDGET",
+            topRow: 0,
+            bottomRow: 40,
+            leftColumn: 0,
+            rightColumn: 24,
+            children,
+          },
+        ],
+      });
+
+      return {
+        ...ROOT_DSL,
+        children: [
+          modal("Outer", [
+            {
+              widgetId: "t",
+              widgetName: "Licenses",
+              type: "TABLE_WIDGET_V2",
+              topRow: 0,
+              bottomRow: 20,
+              leftColumn: 0,
+              rightColumn: 24,
+              primaryColumns: {
+                extend: { id: "extend", columnType: "button" },
+                renew: { id: "renew", columnType: "button" },
+              },
+            },
+          ]),
+          modal(
+            "Inner",
+            innerOpensOuter
+              ? [
+                  {
+                    widgetId: "b",
+                    widgetName: "Back",
+                    type: "BUTTON_WIDGET",
+                    topRow: 0,
+                    bottomRow: 4,
+                    leftColumn: 0,
+                    rightColumn: 8,
+                    onClick: "{{ showModal('Outer') }}",
+                    dynamicTriggerPathList: [{ key: "onClick" }],
+                  },
+                ]
+              : [],
+          ),
+        ],
+      };
+    }
+
+    async function wire(dsl: Record<string, unknown>, column = "extend") {
+      const store = new MemoryGovernanceStore();
+      const updateLayout = jest.fn(async () => ({ ok: true }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getApplicationContext: jest.fn(async (applicationId: string) => ({
+          pages: [],
+          page: { applicationId },
+          layout: { dsl },
+        })),
+        listActions: jest.fn(async () => []),
+        updateLayout: updateLayout as never,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        dataEnabled: true,
+        governance: new McpGovernanceCoordinator(store),
+      });
+      const wired = await callTool(server, "wire_event", {
+        applicationId: "app1",
+        pageId: "p1",
+        layoutId: "l1",
+        revision: fingerprintDsl(dsl as never),
+        spec: {
+          widget: "Licenses",
+          column,
+          event: "onClick",
+          action: { showModal: "Inner" },
+        },
+      });
+
+      return { wired, updateLayout, store };
+    }
+
+    it("writes the column's onClick, registers the nested path and warns at stack depth 2", async () => {
+      const { updateLayout, wired } = await wire(dslWith(false));
+
+      expect(wired.body.error).toBeUndefined();
+      expect(String(wired.body.modalWarning)).toMatch(/stack depth 2/);
+
+      const written = (updateLayout.mock.calls[0] as unknown[])[3] as {
+        children: {
+          children: {
+            children: {
+              primaryColumns?: Record<string, { onClick?: string }>;
+              dynamicTriggerPathList?: { key: string }[];
+            }[];
+          }[];
+        }[];
+      };
+      const table = written.children[0].children[0].children[0];
+
+      expect(table.primaryColumns?.extend.onClick).toBe(
+        "{{ showModal('Inner') }}",
+      );
+      expect(table.dynamicTriggerPathList).toEqual([
+        { key: "primaryColumns.extend.onClick" },
+      ]);
+    });
+
+    it.each(["extend", "renew"])(
+      "identifies column %s in the result and audit summary",
+      async (column) => {
+        const { store, wired } = await wire(dslWith(false), column);
+
+        expect(wired.body.error).toBeUndefined();
+        expect(wired.body.column).toBe(column);
+        expect(store.changes).toHaveLength(1);
+        expect(store.changes[0].summary).toMatchObject({
+          widget: "Licenses",
+          event: "onClick",
+          column,
+        });
+      },
+    );
+
+    it("refuses a column wiring that closes a modal cycle", async () => {
+      const { updateLayout, wired } = await wire(dslWith(true));
+
+      expect(wired.body.code).toBe("modal_stack");
+      expect(String(wired.body.error)).toMatch(/modal cycle/);
+      expect(updateLayout).not.toHaveBeenCalled();
+    });
+  });
+
+  it("read_js_object returns each object's compiled source and a body-sensitive revision", async () => {
+    const APP = "a".repeat(24);
+    const collection = {
+      id: "coll1",
+      name: "BannerAdmin",
+      pageId: "b".repeat(24),
+      body: "export default { save: async () => { await SaveBanner.run(); } };",
+      actions: [{ id: "act1", name: "save" }],
+    };
+    // Hand-written in the editor: arbitrary JS that may hold secrets. Its source is returned as data (owner decision,
+    // APP-16355), as read_workflow returns a workflow's editor-written logic.
+    const editorAuthored = {
+      id: "coll2",
+      name: "Legacy",
+      pageId: "b".repeat(24),
+      body: "export default {\n\tapiKey: 'sk-live-secret',\n\tasync call () {\n\t\treturn fetch(this.apiKey);\n\t}\n}",
+      actions: [{ id: "act2", name: "call" }],
+    };
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listActionCollections: jest.fn(async () => [collection, editorAuthored]),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+    });
+
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+
+    expect(read.body.jsObjects[0]).toEqual({
+      id: "coll1",
+      name: "BannerAdmin",
+      pageId: "b".repeat(24),
+      signatures: [{ name: "save", params: [] }],
+      functions: ["save"],
+      authoredBy: "mcp",
+      definitionState: "none",
+      source: collection.body,
+      revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    expect(read.body.jsObjects[1]).toEqual({
+      id: "coll2",
+      name: "Legacy",
+      pageId: "b".repeat(24),
+      signatures: [{ name: "call", params: [] }],
+      functions: ["call"],
+      authoredBy: "editor",
+      definitionState: "none",
+      source: editorAuthored.body,
+      revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+
+    // A code-only change (same metadata, different body) moves the per-object revision.
+    (api.listActionCollections as jest.Mock).mockResolvedValueOnce([
+      { ...collection, body: "export default { save: async () => { } };" },
+    ]);
+    const reread = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+
+    expect(reread.body.jsObjects[0].revision).not.toBe(
+      read.body.jsObjects[0].revision,
+    );
+  });
+
+  it("update_js_object refuses a code update on an editor-authored object and never writes", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const editorAuthored = {
+      id: "coll2",
+      name: "Legacy",
+      pageId: "b".repeat(24),
+      body: "export default {\n\tasync call () {\n\t\treturn 1;\n\t}\n}",
+      actions: [{ id: "act2", name: "call" }],
+    };
+    const updateActionCollectionBody = jest.fn(async () => ({}));
+    const updateActionCollection = jest.fn(async () => ({}));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listActionCollections: jest.fn(async () => [editorAuthored]),
+      updateActionCollectionBody,
+      updateActionCollection,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const refused = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "coll2",
+        revision: read.body.jsObjects[0].revision,
+        functions: [{ name: "call", returns: { done: true } }],
+      },
+    });
+
+    expect(refused.body.code).toBe("editor_authored_js_object");
+    expect(updateActionCollectionBody).not.toHaveBeenCalled();
+    expect(updateActionCollection).not.toHaveBeenCalled();
+
+    // A rename does not touch the code and stays allowed.
+    const renamed = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "coll2",
+        revision: read.body.jsObjects[0].revision,
+        name: "LegacyRenamed",
+      },
+    });
+
+    expect(renamed.body.updated).toBe(true);
+    expect(updateActionCollectionBody).not.toHaveBeenCalled();
+    expect(updateActionCollection).toHaveBeenCalledTimes(1);
+  });
+
+  describe("APP-16355: replacing a JS object written in the editor", () => {
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    const apis = new WeakMap<object, AppsmithApi>();
+    const serverApiOf = (server: object) => apis.get(server)!;
+
+    function setup(pageText = "", overrides: Partial<AppsmithApi> = {}) {
+      const store = new MemoryGovernanceStore();
+      const legacy = {
+        id: "coll2",
+        name: "Legacy",
+        pageId: PAGE,
+        body: "export default {\n\tapiKey: 'k',\n\tasync load () { return 1; },\n\tasync old () { return 2; }\n}",
+        actions: [
+          {
+            id: "act1",
+            name: "load",
+            runBehaviour: "ON_PAGE_LOAD",
+            confirmBeforeExecute: true,
+          },
+          { id: "act2", name: "old" },
+        ],
+      };
+      const updateActionCollectionBody = jest.fn(async () => ({}));
+      const updateActionCollection = jest.fn<
+        Promise<object>,
+        [string, unknown]
+      >(async () => ({}));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listActionCollections: jest.fn(async () => [legacy]),
+        listActions: jest.fn(async () => []),
+        getPage: jest.fn(async () => ({
+          id: PAGE,
+          layouts: [{ id: "l1", dsl: { text: pageText } }],
+        })),
+        updateActionCollectionBody,
+        updateActionCollection: updateActionCollection as never,
+        ...overrides,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        jsEnabled: true,
+        governance: new McpGovernanceCoordinator(store),
+      });
+
+      apis.set(server, api);
+
+      return {
+        legacy,
+        server,
+        updateActionCollection,
+        updateActionCollectionBody,
+      };
+    }
+
+    async function specFor(
+      server: ReturnType<typeof createMcpHttpServer>,
+      functions: unknown[],
+    ) {
+      const read = await callTool(server, "read_js_object", {
+        applicationId: APP,
+      });
+
+      return {
+        applicationId: APP,
+        collectionId: "coll2",
+        revision: read.body.jsObjects[0].revision,
+        functions,
+      };
+    }
+
+    it("lists what changes, asks first, keeps kept functions' settings, and returns the replaced code", async () => {
+      const {
+        legacy,
+        server,
+        updateActionCollection,
+        updateActionCollectionBody,
+      } = setup();
+      const spec = await specFor(server, [
+        { name: "load", returns: 1 },
+        { name: "fresh", returns: 3 },
+      ]);
+      const prepared = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+
+      expect(prepared.body.removedFunctions).toEqual(["old"]);
+      expect(prepared.body.addedFunctions).toEqual(["fresh"]);
+      expect(prepared.body.relay).toContain("replace ALL the code");
+      expect(updateActionCollectionBody).not.toHaveBeenCalled();
+
+      const confirmed = await callTool(server, "confirm_replace_js_object", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(confirmed.body.updated).toBe(true);
+      expect(confirmed.body.replacedSource).toBe(legacy.body);
+      expect(updateActionCollectionBody).toHaveBeenCalledTimes(1);
+      const patch = updateActionCollection.mock.calls[0][1] as {
+        actions: {
+          updated: Record<string, unknown>[];
+          added: Record<string, unknown>[];
+          deleted: { name: string }[];
+        };
+      };
+
+      expect(patch.actions.updated[0]).toMatchObject({
+        id: "act1",
+        name: "load",
+        runBehaviour: "ON_PAGE_LOAD",
+        confirmBeforeExecute: true,
+      });
+      expect(patch.actions.added.map((a) => a.name)).toEqual(["fresh"]);
+      expect(patch.actions.deleted.map((d) => d.name)).toEqual(["old"]);
+    });
+
+    it("refuses to drop a function the page still calls, unless acknowledged", async () => {
+      const { server } = setup("{{ Legacy.old() }}");
+      const spec = await specFor(server, [{ name: "load", returns: 1 }]);
+      const refused = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+
+      expect(refused.body.code).toBe("replace_breaks_calls");
+      expect(refused.body.brokenCalls).toEqual([
+        { where: "the page layout", calls: "Legacy.old" },
+      ]);
+
+      const acknowledged = await callTool(server, "prepare_replace_js_object", {
+        spec,
+        acknowledgeBrokenCalls: true,
+      });
+
+      expect(acknowledged.body.confirmationId).toEqual(expect.any(String));
+    });
+
+    it("returns short editor source exactly as written", async () => {
+      const { legacy, server } = setup();
+      const read = await callTool(server, "read_js_object", {
+        applicationId: APP,
+      });
+
+      expect(read.body.jsObjects[0].source).toBe(legacy.body);
+      expect(read.body.jsObjects[0].sourceTruncated).toBeUndefined();
+    });
+
+    it("on a git-connected app, refuses without the branch and keeps the token", async () => {
+      const { server, updateActionCollectionBody } = setup("", {
+        getApplication: jest.fn(async () => ({
+          id: APP,
+          gitApplicationMetadata: {
+            branchName: "feature/x",
+            remoteUrl: "git@github.com:acme/app.git",
+          },
+        })),
+      });
+      const spec = await specFor(server, [
+        { name: "load", returns: 1 },
+        { name: "old", returns: 2 },
+      ]);
+      const prepared = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+      const refused = await callTool(server, "confirm_replace_js_object", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(refused.body.code).toBe("git_branch_required");
+      expect(updateActionCollectionBody).not.toHaveBeenCalled();
+
+      const confirmed = await callTool(server, "confirm_replace_js_object", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+        branch: "feature/x",
+      });
+
+      expect(confirmed.body.updated).toBe(true);
+    });
+
+    it("refuses when the object changed after it was read, before writing", async () => {
+      const { legacy, server, updateActionCollectionBody } = setup();
+      const spec = await specFor(server, [
+        { name: "load", returns: 1 },
+        { name: "old", returns: 2 },
+      ]);
+      const prepared = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+      const edited = { ...legacy, body: `${legacy.body}\n` };
+      let calls = 0;
+
+      // confirm reads the object for its checks, then for the update, then once more under the lock: only that last
+      // read sees the editor's save.
+      (
+        serverApiOf(server).listActionCollections as jest.Mock
+      ).mockImplementation(async () => (++calls >= 3 ? [edited] : [legacy]));
+
+      const confirmed = await callTool(server, "confirm_replace_js_object", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(confirmed.body.code).toBe("revision_conflict");
+      expect(updateActionCollectionBody).not.toHaveBeenCalled();
+    });
+
+    it("refuses an object too large to keep a copy of in the change record", async () => {
+      const { legacy, server } = setup();
+
+      legacy.body = `export default { note: '${"x".repeat(9 * 1024 * 1024)}' }`;
+
+      const spec = await specFor(server, [{ name: "load", returns: 1 }]);
+      const refused = await callTool(server, "prepare_replace_js_object", {
+        spec,
+        acknowledgeBrokenCalls: true,
+      });
+
+      expect(refused.body.code).toBe("js_object_too_large");
+    });
+
+    it("refuses to make a synchronous function the page still calls async, unless acknowledged", async () => {
+      const { legacy, server } = setup("{{ Legacy.load() }}");
+
+      (legacy.actions[0] as Record<string, unknown>).actionConfiguration = {
+        isAsync: false,
+      };
+
+      const spec = await specFor(server, [
+        { name: "load", returns: 1 },
+        { name: "old", returns: 2 },
+      ]);
+      const refused = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+
+      expect(refused.body.code).toBe("replace_breaks_calls");
+      expect(refused.body.brokenCalls).toEqual([
+        { where: "the page layout", calls: "Legacy.load (becomes async)" },
+      ]);
+    });
+
+    it("writes the run and confirm settings read under the lock, not the earlier ones", async () => {
+      const { legacy, server, updateActionCollection } = setup();
+      const spec = await specFor(server, [
+        { name: "load", returns: 1 },
+        { name: "old", returns: 2 },
+      ]);
+      const prepared = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+      // A settings-only change in the editor does not change the object's revision.
+      const resettled = {
+        ...legacy,
+        actions: [
+          { id: "act1", name: "load", runBehaviour: "MANUAL" },
+          { id: "act2", name: "old" },
+        ],
+      };
+      let calls = 0;
+
+      (
+        serverApiOf(server).listActionCollections as jest.Mock
+      ).mockImplementation(async () => (++calls >= 3 ? [resettled] : [legacy]));
+
+      const confirmed = await callTool(server, "confirm_replace_js_object", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(confirmed.body.updated).toBe(true);
+      const patch = updateActionCollection.mock.calls[0][1] as {
+        actions: { updated: Record<string, unknown>[] };
+      };
+
+      expect(patch.actions.updated[0]).toMatchObject({
+        name: "load",
+        runBehaviour: "MANUAL",
+      });
+      expect(patch.actions.updated[0].confirmBeforeExecute).toBeUndefined();
+    });
+
+    it("cuts returned editor source at 200,000 characters and flags it", async () => {
+      const { legacy, server } = setup();
+
+      legacy.body = `export default { note: '${"x".repeat(200_100)}' }`;
+
+      const read = await callTool(server, "read_js_object", {
+        applicationId: APP,
+      });
+
+      expect(read.body.jsObjects[0].source).toHaveLength(200_000);
+      expect(read.body.jsObjects[0].sourceTruncated).toBe(true);
+    });
+
+    it("refuses a token prepared for a different definition", async () => {
+      const { server, updateActionCollectionBody } = setup();
+      const spec = await specFor(server, [
+        { name: "load", returns: 1 },
+        { name: "old", returns: 2 },
+      ]);
+      const prepared = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+      const swapped = await callTool(server, "confirm_replace_js_object", {
+        spec: {
+          ...spec,
+          functions: [
+            { name: "load", returns: 9 },
+            { name: "old", returns: 2 },
+          ],
+        },
+        confirmationId: prepared.body.confirmationId,
+      });
+
+      expect(swapped.body.updated).toBeUndefined();
+      expect(updateActionCollectionBody).not.toHaveBeenCalled();
+    });
+
+    it("sends an object MCP wrote to update_js_object instead", async () => {
+      const { legacy, server } = setup();
+
+      legacy.body =
+        "export default { refresh: async () => { await GetBanners.run(); } };";
+
+      const spec = await specFor(server, [{ name: "refresh", returns: 1 }]);
+      const refused = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+
+      expect(refused.body.code).toBe("mcp_authored_js_object");
+    });
+  });
+
+  it("update_js_object writes the code through the body route, then diffs the functions on the PATCH", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const before = {
+      id: "coll1",
+      name: "BannerAdmin",
+      pageId: "b".repeat(24),
+      body: "export default { refresh: async () => { await GetBanners.run(); } };",
+      actions: [
+        { id: "act-refresh", name: "refresh" },
+        { id: "act-old", name: "legacyFn" },
+      ],
+    };
+    const after = {
+      ...before,
+      body: "export default { refresh: async () => { await GetBanners.run(); }, save: async () => { await SaveBanner.run(); await GetBanners.run(); return { saved: true }; } };",
+      actions: [
+        { id: "act-refresh", name: "refresh" },
+        { id: "act-save", name: "save" },
+      ],
+    };
+    const calls: string[] = [];
+    const listActionCollections = jest
+      .fn<Promise<unknown>, [string]>()
+      .mockResolvedValueOnce([before]) // read_js_object
+      .mockResolvedValueOnce([before]) // update: locate current
+      .mockResolvedValueOnce([before]) // update: re-read under the lock
+      .mockResolvedValue([after]); // update: re-read after the writes
+    const updateActionCollectionBody = jest.fn<
+      Promise<unknown>,
+      [string, { body: string }]
+    >(async () => {
+      calls.push("body");
+
+      return {};
+    });
+    const updateActionCollection = jest.fn<
+      Promise<unknown>,
+      [string, Record<string, unknown>]
+    >(async () => {
+      calls.push("patch");
+
+      return { ...before, body: null };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listActionCollections,
+      updateActionCollectionBody,
+      updateActionCollection,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const updated = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "coll1",
+        revision: read.body.jsObjects[0].revision,
+        functions: [
+          { name: "refresh", run: [{ query: "GetBanners" }] },
+          {
+            name: "save",
+            run: [{ query: "SaveBanner" }, { query: "GetBanners" }],
+            returns: { saved: true },
+          },
+        ],
+      },
+    });
+
+    expect(updated.body.updated).toBe(true);
+    // Body first (the only route that changes code), then the function diff.
+    expect(calls).toEqual(["body", "patch"]);
+    // The written body is the compiled code followed by the embedded definition marker.
+    expect(updateActionCollectionBody).toHaveBeenCalledWith("coll1", {
+      body: expect.stringMatching(
+        /^export default \{ refresh: async function \(\) \{ await GetBanners\.run\(\); \}, save: async function \(\) \{ await SaveBanner\.run\(\); await GetBanners\.run\(\); return \{ saved: true \}; \} \}; \/\* mcp-spec:[A-Za-z0-9+/=]+ \*\/$/,
+      ),
+    });
+    const patch = updateActionCollection.mock.calls[0][1] as {
+      actions: {
+        added: { name: string }[];
+        updated: { id: string; name: string }[];
+        deleted: { id: string; name: string }[];
+      };
+    };
+
+    expect(patch.actions.added.map((a) => a.name)).toEqual(["save"]);
+    expect(patch.actions.updated).toEqual([
+      expect.objectContaining({ id: "act-refresh", name: "refresh" }),
+    ]);
+    expect(patch.actions.deleted).toEqual([
+      { id: "act-old", name: "legacyFn" },
+    ]);
+    // The result reflects the re-read collection (the PATCH response carries a nulled body).
+    expect(updated.body.jsObject.functions).toEqual(["refresh", "save"]);
+    expect(updated.body.jsObject.source).toBe(after.body);
+  });
+
+  it("create → read → update round-trips a definition with params and steps (council M2 QA)", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const definition = {
+      constants: { maxIds: 50 },
+      functions: [
+        {
+          name: "splitLines",
+          params: ["value"],
+          returns: {
+            fn: "unique",
+            args: [
+              {
+                fn: "map",
+                args: [
+                  {
+                    fn: "split",
+                    args: [{ param: "value" }, { sep: "commaOrNewline" }],
+                  },
+                  { fn: "trim", args: [{ item: true }] },
+                ],
+              },
+            ],
+          },
+        },
+        {
+          name: "save",
+          steps: [
+            {
+              run: "UpsertBanner",
+              with: { ids: { widget: "inpIds", property: "text" } },
+              into: "result",
+            },
+            { return: { var: "result" } },
+          ],
+        },
+      ],
+    };
+    const compiledBody = compileJsObject(definition as never);
+    const createActionCollection = jest.fn<
+      Promise<unknown>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "coll1", name: "BannerAdmin" }));
+    const stored = {
+      id: "coll1",
+      name: "BannerAdmin",
+      pageId: "b".repeat(24),
+      body: compiledBody,
+      actions: [
+        { id: "act-split", name: "splitLines" },
+        { id: "act-save", name: "save" },
+      ],
+    };
+    // Empty until the create lands (the create's own revision check re-lists), then the stored object.
+    let collections: unknown[] = [];
+    const listActionCollections = jest.fn<Promise<unknown>, [string]>(
+      async () => collections,
+    );
+    const updateActionCollectionBody = jest.fn(async () => ({}));
+    const updateActionCollection = jest.fn(async () => ({
+      ...stored,
+      body: null,
+    }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listPlugins: jest.fn(async () => [
+        { id: "p".repeat(24), type: "JS", packageName: "js-plugin" },
+      ]),
+      listActionCollections,
+      createActionCollection,
+      updateActionCollectionBody,
+      updateActionCollection,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const empty = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const created = await callTool(server, "create_js_object", {
+      spec: {
+        applicationId: APP,
+        pageId: "b".repeat(24),
+        name: "BannerAdmin",
+        revision: empty.body.revision,
+        ...definition,
+      },
+    });
+
+    expect(created.body).toEqual(expect.objectContaining({ created: true }));
+    collections = [stored];
+    const dto = createActionCollection.mock.calls[0][0] as {
+      body: string;
+      actions: {
+        name: string;
+        actionConfiguration: { jsArguments: unknown };
+      }[];
+    };
+
+    // The written body is exactly the compiler's image of the definition, and params become jsArguments.
+    expect(dto.body).toBe(compiledBody);
+    expect(dto.actions.map((a) => a.name)).toEqual(["splitLines", "save"]);
+    expect(dto.actions[0].actionConfiguration.jsArguments).toEqual([
+      { name: "value", value: "" },
+    ]);
+
+    // Reading it back yields the same definition, structurally, plus its state.
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+
+    expect(read.body.jsObjects[0]).toEqual(
+      expect.objectContaining({
+        authoredBy: "mcp",
+        definitionState: "current",
+        definition,
+        source: compiledBody,
+      }),
+    );
+
+    // Editing the definition and sending it back recompiles the whole body from the new definition.
+    const edited = {
+      ...definition,
+      functions: [
+        definition.functions[0],
+        {
+          ...definition.functions[1],
+          steps: [
+            ...(definition.functions[1].steps ?? []),
+            { showAlert: "Saved" },
+          ],
+        },
+      ],
+    };
+    const updated = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "coll1",
+        revision: read.body.jsObjects[0].revision,
+        ...edited,
+      },
+    });
+
+    expect(updated.body.updated).toBe(true);
+    expect(updateActionCollectionBody).toHaveBeenCalledWith("coll1", {
+      body: compileJsObject(edited as never),
+    });
+    expect((updateActionCollection.mock.calls[0] as unknown[])[1]).toEqual(
+      expect.objectContaining({
+        actions: expect.objectContaining({
+          updated: expect.arrayContaining([
+            expect.objectContaining({ id: "act-save", name: "save" }),
+          ]),
+        }),
+      }),
+    );
+  });
+
+  // A store that keeps JS definitions, as the Mongo store does.
+  class DefinitionStore extends MemoryGovernanceStore {
+    readonly definitions: McpJsDefinitionRecord[] = [];
+    failSave = false;
+    failFind = false;
+
+    async saveJsDefinition(record: McpJsDefinitionRecord): Promise<void> {
+      if (this.failSave) throw new Error("store unavailable");
+
+      if (
+        !this.definitions.some(
+          (d) =>
+            d.organizationId === record.organizationId &&
+            d.codeHash === record.codeHash,
+        )
+      ) {
+        this.definitions.push(record);
+      }
+    }
+    async findJsDefinitions(
+      organizationId: string,
+      codeHashes: readonly string[],
+    ): Promise<McpJsDefinitionRecord[]> {
+      if (this.failFind) throw new Error("mongodb://user:secret@host down");
+
+      return this.definitions.filter(
+        (d) =>
+          d.organizationId === organizationId &&
+          codeHashes.includes(d.codeHash),
+      );
+    }
+  }
+
+  it("writes readable JS objects when the store keeps definitions, and reads them back on another pod", async () => {
+    const store = new DefinitionStore();
+    const APP = "a".repeat(24);
+    const definition = {
+      constants: { limit: 10 },
+      functions: [
+        {
+          name: "label",
+          params: ["value"],
+          returns: { fn: "trim", args: [{ param: "value" }] },
+        },
+        {
+          name: "save",
+          steps: [
+            {
+              call: "label",
+              args: [{ widget: "inpName", property: "text" }],
+              into: "name",
+            },
+            {
+              if: { fn: "isEmpty", args: [{ var: "name" }] },
+              then: [
+                { showAlert: "Enter a name.", style: "warning" },
+                { return: false },
+              ],
+              else: [{ showAlert: "Saved", style: "success" }],
+            },
+            { return: true },
+          ],
+        },
+      ],
+    };
+    const readable = compileJsObject(definition as never, { readable: true });
+    let collections: unknown[] = [];
+    const createActionCollection = jest.fn<
+      Promise<unknown>,
+      [Record<string, unknown>]
+    >(async (dto) => ({ id: "coll1", name: "Form", body: dto.body }));
+    const updateActionCollectionBody = jest.fn(async () => ({}));
+    const updateActionCollection = jest.fn(async () => ({}));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listPlugins: jest.fn(async () => [
+        { id: "p".repeat(24), type: "JS", packageName: "js-plugin" },
+      ]),
+      listActionCollections: jest.fn(async () => collections),
+      createActionCollection,
+      updateActionCollectionBody,
+      updateActionCollection,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const empty = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+
+    // The store cannot save: nothing is written, because a readable body without its definition would read back
+    // as editor-authored.
+    store.failSave = true;
+    const refused = await callTool(server, "create_js_object", {
+      spec: {
+        applicationId: APP,
+        pageId: "b".repeat(24),
+        name: "Form",
+        revision: empty.body.revision,
+        ...definition,
+      },
+    });
+
+    expect(refused.body.created).toBeUndefined();
+    expect(createActionCollection).not.toHaveBeenCalled();
+    store.failSave = false;
+
+    const created = await callTool(server, "create_js_object", {
+      spec: {
+        applicationId: APP,
+        pageId: "b".repeat(24),
+        name: "Form",
+        revision: empty.body.revision,
+        ...definition,
+      },
+    });
+
+    expect(created.body).toEqual(expect.objectContaining({ created: true }));
+    const dto = createActionCollection.mock.calls[0][0] as {
+      body: string;
+      actions: { name: string; actionConfiguration: { body: string } }[];
+    };
+
+    // One statement per line, no marker, and each function's JSAction body is that function's text.
+    expect(dto.body).toBe(readable);
+    expect(dto.body).not.toContain("mcp-spec");
+    expect(dto.body).toContain(
+      "\n\tsave: async function () {\n\t\tlet name = await this.label(inpName.text);\n",
+    );
+    expect(dto.actions[1].actionConfiguration.body).toBe(
+      readable.slice(
+        readable.indexOf("async function () {"),
+        readable.lastIndexOf("\t},") + 2,
+      ),
+    );
+    expect(store.definitions).toHaveLength(1);
+
+    // Each listing loads the definitions from the store (nothing is kept in the process between requests).
+    collections = [
+      {
+        id: "coll1",
+        name: "Form",
+        pageId: "b".repeat(24),
+        body: readable,
+        actions: [
+          { id: "act-label", name: "label" },
+          { id: "act-save", name: "save" },
+        ],
+      },
+    ];
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+
+    expect(read.body.jsObjects[0]).toEqual(
+      expect.objectContaining({
+        authoredBy: "mcp",
+        definitionState: "current",
+        definition,
+        source: readable,
+      }),
+    );
+
+    // An update writes the readable layout too, and records the new body's definition first.
+    const edited = {
+      ...definition,
+      functions: [
+        definition.functions[0],
+        {
+          ...definition.functions[1],
+          steps: (definition.functions[1].steps ?? []).slice(0, 1),
+        },
+      ],
+    };
+    const updated = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "coll1",
+        revision: read.body.jsObjects[0].revision,
+        ...edited,
+      },
+    });
+
+    expect(updated.body.updated).toBe(true);
+    expect(updateActionCollectionBody).toHaveBeenCalledWith("coll1", {
+      body: compileJsObject(edited as never, { readable: true }),
+    });
+    expect(store.definitions).toHaveLength(2);
+
+    // A hand edit of the readable body makes it editor-written: no record matches the new text.
+    collections = [
+      {
+        ...(collections[0] as Record<string, unknown>),
+        body: readable.replace("Saved", "Saved!"),
+      },
+    ];
+    const afterEdit = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+
+    expect(afterEdit.body.jsObjects[0]).toEqual(
+      expect.objectContaining({ authoredBy: "editor" }),
+    );
+    expect(afterEdit.body.jsObjects[0].definition).toBeUndefined();
+  });
+
+  describe("readable JS objects: failure paths and replacement", () => {
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    const definition = {
+      functions: [{ name: "label", returns: { fn: "trim", args: [" x "] } }],
+    };
+    const readable = compileJsObject(definition as never, { readable: true });
+
+    function setup(store: DefinitionStore, body: string) {
+      const collection = () => ({
+        id: "coll1",
+        name: "Form",
+        pageId: PAGE,
+        body,
+        actions: [{ id: "act-label", name: "label" }],
+      });
+      const updateActionCollectionBody = jest.fn(async () => ({}));
+      const updateActionCollection = jest.fn(async () => ({}));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        listActionCollections: jest.fn(async () => [collection()]),
+        listActions: jest.fn(async () => []),
+        getPage: jest.fn(async () => ({
+          id: PAGE,
+          layouts: [{ id: "l1", dsl: {} }],
+        })),
+        updateActionCollectionBody,
+        updateActionCollection,
+      };
+      const server = createMcpHttpServer(API_BASE_URL, () => api, {
+        jsEnabled: true,
+        governance: new McpGovernanceCoordinator(store),
+      });
+
+      return { server, updateActionCollection, updateActionCollectionBody };
+    }
+
+    const edited = {
+      functions: [{ name: "label", returns: { fn: "trim", args: [" y "] } }],
+    };
+
+    it("refuses an update, and writes nothing, when the definition cannot be saved", async () => {
+      const store = new DefinitionStore();
+
+      await new McpGovernanceCoordinator(store).saveJsDefinition(
+        "org-default",
+        readable,
+        definition as never,
+      );
+      const { server, updateActionCollection, updateActionCollectionBody } =
+        setup(store, readable);
+      const read = await callTool(server, "read_js_object", {
+        applicationId: APP,
+      });
+
+      expect(read.body.jsObjects[0].authoredBy).toBe("mcp");
+      store.failSave = true;
+      const refused = await callTool(server, "update_js_object", {
+        spec: {
+          applicationId: APP,
+          collectionId: "coll1",
+          revision: read.body.jsObjects[0].revision,
+          ...edited,
+        },
+      });
+
+      expect(refused.body.updated).toBeUndefined();
+      expect(updateActionCollectionBody).not.toHaveBeenCalled();
+      expect(updateActionCollection).not.toHaveBeenCalled();
+    });
+
+    it("reads an object as unavailable, and refuses to rewrite it, when the store cannot be read", async () => {
+      const store = new DefinitionStore();
+
+      await new McpGovernanceCoordinator(store).saveJsDefinition(
+        "org-default",
+        readable,
+        definition as never,
+      );
+      store.failFind = true;
+      const stderr = jest
+        .spyOn(process.stderr, "write")
+        .mockImplementation(() => true);
+      const { server, updateActionCollectionBody } = setup(store, readable);
+
+      try {
+        const read = await callTool(server, "read_js_object", {
+          applicationId: APP,
+        });
+
+        expect(read.body.jsObjects[0]).toEqual(
+          expect.objectContaining({
+            authoredBy: "editor",
+            definitionState: "unavailable",
+          }),
+        );
+        const refused = await callTool(server, "update_js_object", {
+          spec: {
+            applicationId: APP,
+            collectionId: "coll1",
+            revision: read.body.jsObjects[0].revision,
+            ...edited,
+          },
+        });
+
+        expect(refused.body.code).toBe("editor_authored_js_object");
+        expect(updateActionCollectionBody).not.toHaveBeenCalled();
+        const logged = stderr.mock.calls.map(([line]) => String(line)).join("");
+
+        expect(logged).toContain("could not load JS-object definitions");
+        // Only the error's class is logged, never its message.
+        expect(logged).not.toContain("secret");
+      } finally {
+        stderr.mockRestore();
+      }
+    });
+
+    it("replaces an editor-written object with readable code and records its definition", async () => {
+      const store = new DefinitionStore();
+      const editorBody = "export default {\n\tasync label () { return 1; }\n}";
+      const { server, updateActionCollectionBody } = setup(store, editorBody);
+      const read = await callTool(server, "read_js_object", {
+        applicationId: APP,
+      });
+
+      expect(read.body.jsObjects[0].authoredBy).toBe("editor");
+      const spec = {
+        applicationId: APP,
+        collectionId: "coll1",
+        revision: read.body.jsObjects[0].revision,
+        ...edited,
+      };
+      const prepared = await callTool(server, "prepare_replace_js_object", {
+        spec,
+      });
+      const confirmed = await callTool(server, "confirm_replace_js_object", {
+        spec,
+        confirmationId: prepared.body.confirmationId,
+      });
+      const written = compileJsObject(edited as never, { readable: true });
+
+      expect(confirmed.body.updated).toBe(true);
+      expect(updateActionCollectionBody).toHaveBeenCalledWith("coll1", {
+        body: written,
+      });
+      expect(written).not.toContain("mcp-spec");
+      expect(store.definitions.map((d) => d.organizationId)).toEqual([
+        "org-default",
+      ]);
+    });
+  });
+
+  it("read_js_object reports a compiler-written body whose code was edited afterwards as drifted", async () => {
+    const APP = "a".repeat(24);
+    const body = compileJsObject({
+      functions: [{ name: "refresh", run: [{ query: "GetBanners" }] }],
+    } as never);
+    // An editor rename rewrote the code part; the marker still carries the old definition.
+    const drifted = {
+      id: "coll1",
+      name: "BannerAdmin",
+      pageId: "b".repeat(24),
+      body: body.replace("GetBanners.run()", "GetBanners2.run()"),
+      actions: [{ id: "act1", name: "refresh" }],
+    };
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listActionCollections: jest.fn(async () => [drifted]),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+    });
+
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+
+    expect(read.body.jsObjects[0]).toEqual({
+      id: "coll1",
+      name: "BannerAdmin",
+      pageId: "b".repeat(24),
+      signatures: [{ name: "refresh", params: [] }],
+      functions: ["refresh"],
+      authoredBy: "editor",
+      definitionState: "drifted",
+      source: expect.any(String),
+      revision: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    // The hand-edited source is returned as data; the stale definition is not.
+    expect(read.body.jsObjects[0].definition).toBeUndefined();
+  });
+
+  it("refuses a call cycle closed through another compiler-authored object on the page (create and update)", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    // Existing MCP-authored object whose function calls Flow.go.
+    const utils = {
+      id: "coll-utils",
+      name: "Utils",
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [
+          {
+            name: "count",
+            returns: { call: { object: "Flow", function: "go" } },
+          },
+        ],
+      } as never),
+      actions: [{ id: "a1", name: "count" }],
+    };
+    const current = {
+      id: "coll1",
+      name: "Flow",
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [{ name: "go", steps: [{ return: 1 }] }],
+      } as never),
+      actions: [{ id: "act-go", name: "go" }],
+    };
+    const createActionCollection = jest.fn(async (body: unknown) => ({
+      ...(body as object),
+      id: "coll-new",
+    }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listPlugins: jest.fn(async () => [
+        { id: "p".repeat(24), type: "JS", packageName: "js-plugin" },
+      ]),
+      listActionCollections: jest.fn(async () => [current, utils]),
+      createActionCollection,
+      updateActionCollectionBody: jest.fn(async () => ({})),
+      updateActionCollection: jest.fn(async () => ({ ...current, body: null })),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    // Create: Flow2.start → Utils.count → Flow.go is a chain, fine; Report.tick → Utils.count → Flow.go → (Flow does
+    // not call back) is fine too. A NEW object whose function is called by Utils and calls Utils closes a cycle.
+    const listRead = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const created = await callTool(server, "create_js_object", {
+      spec: {
+        applicationId: APP,
+        pageId: PAGE,
+        name: "Report",
+        revision: listRead.body.revision,
+        functions: [
+          {
+            name: "tick",
+            returns: { call: { object: "Utils", function: "count" } },
+          },
+        ],
+      },
+    });
+
+    expect(created.body.created).toBe(true);
+
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const flow = read.body.jsObjects.find(
+      (o: { name: string }) => o.name === "Flow",
+    );
+    // Update: Flow.go → Utils.count, and Utils.count → Flow.go already exists on the page: a cycle.
+    const cyclic = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "coll1",
+        revision: flow.revision,
+        functions: [
+          {
+            name: "go",
+            returns: { call: { object: "Utils", function: "count" } },
+          },
+        ],
+      },
+    });
+
+    expect(cyclic.body.code).toBe("call_cycle");
+    expect(String(cyclic.body.error)).toContain(
+      "Flow.go → Utils.count → Flow.go",
+    );
+    expect(api.updateActionCollectionBody).not.toHaveBeenCalled();
+
+    // Create: a new object that Utils does not call cannot close a cycle even if it calls Utils.
+    const chain = await callTool(server, "create_js_object", {
+      spec: {
+        applicationId: APP,
+        pageId: PAGE,
+        name: "Report2",
+        revision: read.body.revision,
+        functions: [
+          {
+            name: "a",
+            returns: { call: { object: "Utils", function: "count" } },
+          },
+        ],
+      },
+    });
+
+    expect(chain.body.created).toBe(true);
+
+    // Create: a sibling cycle inside the new object is refused by the same handler check (code call_cycle).
+    const sibling = await callTool(server, "create_js_object", {
+      spec: {
+        applicationId: APP,
+        pageId: PAGE,
+        name: "Loop",
+        revision: read.body.revision,
+        functions: [
+          { name: "a", returns: { call: "b" } },
+          { name: "b", returns: { call: "a" } },
+        ],
+      },
+    });
+
+    expect(sibling.body.code).toBe("call_cycle");
+    expect(String(sibling.body.error)).toContain("Loop.a → Loop.b → Loop.a");
+  });
+
+  it("refuses a rename that would leave compiled calls dangling, and a rename that closes a cycle (security re-check B/C/D)", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    const utils = {
+      id: "collUtils",
+      name: "Utils",
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [
+          {
+            name: "count",
+            returns: { call: { object: "Report", function: "go" } },
+          },
+        ],
+      } as never),
+      actions: [{ id: "a1", name: "count" }],
+    };
+    const report = {
+      id: "collReport",
+      name: "Report",
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [{ name: "go", steps: [{ return: 1 }] }],
+      } as never),
+      actions: [{ id: "a2", name: "go" }],
+    };
+    // An object nobody calls, whose function calls Utils.count.
+    const old = {
+      id: "collOld",
+      name: "Old",
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [
+          {
+            name: "go",
+            returns: { call: { object: "Utils", function: "count" } },
+          },
+        ],
+      } as never),
+      actions: [{ id: "a3", name: "go" }],
+    };
+    const updateActionCollection = jest.fn(async (body: unknown) => body);
+    const updateActionCollectionBody = jest.fn(async () => ({}));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listActionCollections: jest.fn(async () => [utils, report, old]),
+      updateActionCollection,
+      updateActionCollectionBody,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const revisionOf = (name: string) =>
+      read.body.jsObjects.find((o: { name: string }) => o.name === name)
+        .revision;
+    const update = async (collectionId: string, name: string, spec: object) =>
+      callTool(server, "update_js_object", {
+        spec: {
+          applicationId: APP,
+          collectionId,
+          revision: revisionOf(name),
+          ...spec,
+        },
+      });
+
+    // B: rename-only of an object another object calls → refused (its compiled call would dangle / re-bind).
+    const renamedAway = await update("collReport", "Report", {
+      name: "Other",
+    });
+
+    expect(renamedAway.body.code).toBe("rename_breaks_calls");
+    expect(String(renamedAway.body.error)).toContain("Utils.count");
+
+    // D: rename-only INTO a name another object calls, where this object calls back → cycle under the new name.
+    // (Old.go → Utils.count, Utils.count → Report.go; renaming Old to Report closes Report.go → Utils.count → Report.go.)
+    const listWithoutReport = [utils, old];
+
+    (api.listActionCollections as jest.Mock).mockResolvedValue(
+      listWithoutReport,
+    );
+    const renamedInto = await update("collOld", "Old", { name: "Report" });
+
+    expect(renamedInto.body.code).toBe("call_cycle");
+    expect(String(renamedInto.body.error)).toContain(
+      "Report.go → Utils.count → Report.go",
+    );
+
+    // C: rename + functions in one update, closing the same cycle → refused.
+    const renamedWithCode = await update("collOld", "Old", {
+      name: "Report",
+      functions: [
+        {
+          name: "go",
+          returns: { call: { object: "Utils", function: "count" } },
+        },
+      ],
+    });
+
+    expect(renamedWithCode.body.code).toBe("call_cycle");
+
+    // A rename that neither dangles nor cycles still works.
+    const harmless = await update("collOld", "Old", { name: "Helper" });
+
+    expect(harmless.body.updated).toBe(true);
+    expect(updateActionCollectionBody).not.toHaveBeenCalled();
+  });
+
+  it("refuses a three-object call cycle closed by an update and by a create", async () => {
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    const mk = (
+      id: string,
+      name: string,
+      fn: string,
+      target?: { object: string; function: string },
+    ) => ({
+      id,
+      name,
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [{ name: fn, returns: target ? { call: target } : 1 }],
+      } as never),
+      actions: [{ id: `${id}Act`, name: fn }],
+    });
+    const a = mk("collA", "A", "f", { object: "B", function: "g" });
+    const b = mk("collB", "B", "g", { object: "C", function: "h" });
+    const c = mk("collC", "C", "h");
+    const makeApi = (collections: unknown[]): AppsmithApi => ({
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listPlugins: jest.fn(async () => [
+        { id: "p".repeat(24), type: "JS", packageName: "js-plugin" },
+      ]),
+      listActionCollections: jest.fn(async () => collections),
+      createActionCollection: jest.fn(async (body: unknown) => ({
+        ...(body as object),
+        id: "collNew",
+      })),
+      updateActionCollectionBody: jest.fn(async () => ({})),
+      updateActionCollection: jest.fn(async () => ({ ...c, body: null })),
+    });
+
+    // Update: C.h -> A.f while A.f -> B.g -> C.h already exist on the page.
+    const api = makeApi([a, b, c]);
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const cObj = read.body.jsObjects.find(
+      (o: { name: string }) => o.name === "C",
+    );
+    const cyclic = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "collC",
+        revision: cObj.revision,
+        functions: [
+          { name: "h", returns: { call: { object: "A", function: "f" } } },
+        ],
+      },
+    });
+
+    expect(cyclic.body.code).toBe("call_cycle");
+    expect(String(cyclic.body.error)).toContain("C.h → A.f → B.g → C.h");
+    expect(api.updateActionCollectionBody).not.toHaveBeenCalled();
+
+    // Create: B.g -> D.k already exists (D not yet created); creating D with k -> A.f closes D.k -> A.f -> B.g -> D.k.
+    const b2 = mk("collB", "B", "g", { object: "D", function: "k" });
+    const api2 = makeApi([a, b2]);
+    const server2 = createMcpHttpServer(API_BASE_URL, () => api2, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+    const read2 = await callTool(server2, "read_js_object", {
+      applicationId: APP,
+    });
+    const created = await callTool(server2, "create_js_object", {
+      spec: {
+        applicationId: APP,
+        pageId: PAGE,
+        name: "D",
+        revision: read2.body.revision,
+        functions: [
+          { name: "k", returns: { call: { object: "A", function: "f" } } },
+        ],
+      },
+    });
+
+    expect(created.body.code).toBe("call_cycle");
+    expect(String(created.body.error)).toContain("D.k → A.f → B.g → D.k");
+    expect(api2.createActionCollection).not.toHaveBeenCalled();
+  });
+
+  it("refuses a rename onto a name another JS object or a query on the page already uses", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    const mk = (id: string, name: string) => ({
+      id,
+      name,
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [{ name: "go", returns: 1 }],
+      } as never),
+      actions: [{ id: `${id}Act`, name: "go" }],
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listActionCollections: jest.fn(async () => [
+        mk("collA", "Alpha"),
+        mk("collB", "Beta"),
+      ]),
+      listActions: jest.fn(async () => [
+        { id: "q1", name: "GetUsers", pageId: PAGE },
+      ]),
+      updateActionCollection: jest.fn(async (body: unknown) => body),
+      updateActionCollectionBody: jest.fn(async () => ({})),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const revision = read.body.jsObjects.find(
+      (o: { name: string }) => o.name === "Alpha",
+    ).revision;
+    const rename = async (name: string) =>
+      callTool(server, "update_js_object", {
+        spec: { applicationId: APP, collectionId: "collA", revision, name },
+      });
+
+    const ontoObject = await rename("Beta");
+
+    expect(ontoObject.body.code).toBe("name_taken");
+    expect(String(ontoObject.body.error)).toContain('JS object "Beta"');
+
+    const ontoQuery = await rename("GetUsers");
+
+    expect(ontoQuery.body.code).toBe("name_taken");
+    expect(String(ontoQuery.body.error)).toContain('query "GetUsers"');
+    expect(api.updateActionCollection).not.toHaveBeenCalled();
+
+    const free = await rename("Gamma");
+
+    expect(free.body.updated).toBe(true);
+  });
+
+  it("allows a rename onto a name that only another page's JS object or query uses", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    const OTHER_PAGE = "c".repeat(24);
+    const mk = (id: string, name: string, pageId: string) => ({
+      id,
+      name,
+      pageId,
+      body: compileJsObject({
+        functions: [{ name: "go", returns: 1 }],
+      } as never),
+      actions: [{ id: `${id}Act`, name: "go" }],
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listActionCollections: jest.fn(async () => [
+        mk("collA", "Alpha", PAGE),
+        mk("collB", "Beta", OTHER_PAGE),
+      ]),
+      listActions: jest.fn(async () => [
+        { id: "q1", name: "GetUsers", pageId: OTHER_PAGE },
+      ]),
+      updateActionCollection: jest.fn(async (body: unknown) => body),
+      updateActionCollectionBody: jest.fn(async () => ({})),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const revision = read.body.jsObjects.find(
+      (o: { name: string }) => o.name === "Alpha",
+    ).revision;
+    const rename = async (name: string) =>
+      callTool(server, "update_js_object", {
+        spec: { applicationId: APP, collectionId: "collA", revision, name },
+      });
+
+    // Names are page-scoped in the data tree: the same name on another page is a legal Appsmith state.
+    expect((await rename("Beta")).body.updated).toBe(true);
+    expect((await rename("GetUsers")).body.updated).toBe(true);
+  });
+
+  it("re-checks the rename target under the lock, so a create that lands between the early check and the lock is caught", async () => {
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    const mk = (id: string, name: string) => ({
+      id,
+      name,
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [{ name: "go", returns: 1 }],
+      } as never),
+      actions: [{ id: `${id}Act`, name: "go" }],
+    });
+    // The "concurrent create" lands the moment the update's lock is acquired: from then on the listing carries
+    // the object the rename wants to become.
+    let gammaExists = false;
+    const store = new (class extends MemoryGovernanceStore {
+      override async acquireLock(
+        entityKey: string,
+      ): Promise<string | undefined> {
+        const lock = await super.acquireLock(entityKey);
+
+        if (lock !== undefined) gammaExists = true;
+
+        return lock;
+      }
+    })();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listActionCollections: jest.fn(async () =>
+        gammaExists
+          ? [mk("collA", "Alpha"), mk("collG", "Gamma")]
+          : [mk("collA", "Alpha")],
+      ),
+      listActions: jest.fn(async () => []),
+      updateActionCollection: jest.fn(async (body: unknown) => body),
+      updateActionCollectionBody: jest.fn(async () => ({})),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const revision = read.body.jsObjects.find(
+      (o: { name: string }) => o.name === "Alpha",
+    ).revision;
+
+    const raced = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "collA",
+        revision,
+        name: "Gamma",
+      },
+    });
+
+    expect(raced.body.code).toBe("name_taken");
+    expect(String(raced.body.error)).toContain('JS object "Gamma"');
+    expect(api.updateActionCollection).not.toHaveBeenCalled();
+    expect(api.updateActionCollectionBody).not.toHaveBeenCalled();
+    // The lock was released on the way out.
+    expect(store.locked.size).toBe(0);
+  });
+
+  it("serialises every JS-object write in an application on one governance key", async () => {
+    const APP = "a".repeat(24);
+    const PAGE = "b".repeat(24);
+    const current = {
+      id: "collA",
+      name: "Alpha",
+      pageId: PAGE,
+      body: compileJsObject({
+        functions: [{ name: "go", returns: 1 }],
+      } as never),
+      actions: [{ id: "collAAct", name: "go" }],
+    };
+    const keys: string[] = [];
+    const store = new (class extends MemoryGovernanceStore {
+      override async acquireLock(
+        entityKey: string,
+      ): Promise<string | undefined> {
+        keys.push(entityKey);
+
+        return super.acquireLock(entityKey);
+      }
+    })();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listActionCollections: jest.fn(async () => [current]),
+      listActions: jest.fn(async () => []),
+      updateActionCollection: jest.fn(async (body: unknown) => body),
+      updateActionCollectionBody: jest.fn(async () => ({})),
+      deleteActionCollection: jest.fn(async () => ({})),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const revision = read.body.jsObjects[0].revision;
+
+    const codeUpdate = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "collA",
+        revision,
+        functions: [{ name: "go", returns: 2 }],
+      },
+    });
+
+    expect(codeUpdate.body.updated).toBe(true);
+    expect(keys).toEqual([`application:${APP}:jsobjects`]);
+
+    // The delete executes on the same key (its one-time confirmation stays bound to the object itself).
+    const reread = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const spec = {
+      applicationId: APP,
+      collectionId: "collA",
+      revision: reread.body.jsObjects[0].revision,
+    };
+    const prepared = await callTool(server, "prepare_delete_js_object", {
+      spec,
+    });
+
+    expect(typeof prepared.body.confirmationId).toBe("string");
+
+    const confirmed = await callTool(server, "confirm_delete_js_object", {
+      spec,
+      confirmationId: prepared.body.confirmationId,
+    });
+
+    expect(confirmed.body.deleted).toBe(true);
+    expect(api.deleteActionCollection).toHaveBeenCalledWith("collA");
+    expect(keys).toEqual([
+      `application:${APP}:jsobjects`,
+      `application:${APP}:jsobjects`,
+    ]);
+    expect(store.locked.size).toBe(0);
+  });
+
+  it("update_js_object checks cross-object calls on this page before writing", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const current = {
+      id: "coll1",
+      name: "Flow",
+      pageId: "b".repeat(24),
+      body: compileJsObject({
+        functions: [{ name: "go", steps: [{ return: 1 }] }],
+      } as never),
+      actions: [{ id: "act-go", name: "go" }],
+    };
+    const utils = {
+      id: "coll-utils",
+      name: "Utils",
+      pageId: "b".repeat(24),
+      body: "export default {}",
+      actions: [{ id: "a1", name: "count" }],
+    };
+    const otherPageUtils = {
+      ...utils,
+      id: "coll-other",
+      name: "Helpers",
+      pageId: "z".repeat(24),
+    };
+    const updateActionCollectionBody = jest.fn(async () => ({}));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listActionCollections: jest.fn(async () => [
+        current,
+        utils,
+        otherPageUtils,
+      ]),
+      updateActionCollectionBody,
+      updateActionCollection: jest.fn(async () => ({ ...current, body: null })),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const update = async (call: unknown) =>
+      callTool(server, "update_js_object", {
+        spec: {
+          applicationId: APP,
+          collectionId: "coll1",
+          revision: read.body.jsObjects[0].revision,
+          functions: [
+            {
+              name: "go",
+              steps: [{ call, into: "n" }, { return: { var: "n" } }],
+            },
+          ],
+        },
+      });
+
+    expect(
+      String((await update({ object: "Nope", function: "count" })).body.error),
+    ).toMatch(/not found on this page/);
+    expect(
+      String((await update({ object: "Utils", function: "drop" })).body.error),
+    ).toMatch(/function "drop" was not found/);
+    expect(
+      String((await update({ object: "Flow", function: "go" })).body.error),
+    ).toMatch(/by its name alone/);
+    expect(
+      String(
+        (await update({ object: "Helpers", function: "count" })).body.error,
+      ),
+    ).toMatch(/not found on this page/);
+    expect(updateActionCollectionBody).not.toHaveBeenCalled();
+
+    const ok = await update({ object: "Utils", function: "count" });
+
+    expect(ok.body.updated).toBe(true);
+    expect(updateActionCollectionBody).toHaveBeenCalledTimes(1);
+  });
+
+  it("update_js_object reports a PATCH failure after the body write as a partial failure that needs a re-read", async () => {
+    const store = new MemoryGovernanceStore();
+    const APP = "a".repeat(24);
+    const before = {
+      id: "coll1",
+      name: "Helpers",
+      pageId: "b".repeat(24),
+      body: compileJsObject({
+        functions: [{ name: "refresh", run: [{ query: "GetOrders" }] }],
+      } as never),
+      actions: [{ id: "act-refresh", name: "refresh" }],
+    };
+    const updateActionCollectionBody = jest.fn(async () => ({}));
+    const updateActionCollection = jest.fn(async () => {
+      throw new Error("Appsmith API request failed (500)");
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listActionCollections: jest.fn(async () => [before]),
+      updateActionCollectionBody,
+      updateActionCollection,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(store),
+    });
+
+    const read = await callTool(server, "read_js_object", {
+      applicationId: APP,
+    });
+    const updated = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: APP,
+        collectionId: "coll1",
+        revision: read.body.jsObjects[0].revision,
+        functions: [
+          { name: "refresh", run: [{ query: "GetOrders" }] },
+          { name: "reset", steps: [{ resetWidget: "inpTitle" }] },
+        ],
+      },
+    });
+
+    // The body route was written, the PATCH failed, and the error says exactly that plus what to do next.
+    expect(updateActionCollectionBody).toHaveBeenCalledTimes(1);
+    expect(updated.body.updated).toBeUndefined();
+    // A thrown mutation error surfaces as { valid: false, errors: [{ message }] }.
+    const message = String(updated.body.errors?.[0]?.message);
+
+    expect(message).toContain(
+      "the JS object's code was written but its function list could not be updated",
+    );
+    expect(message).toContain("read_js_object for the new revision");
+  });
+
+  it("wire_event { call } resolves a function from the compiler's embedded definition when the JSAction list is empty", async () => {
+    const store = new MemoryGovernanceStore();
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "b",
+          widgetName: "SaveBtn",
+          type: "BUTTON_WIDGET",
+          topRow: 0,
+          bottomRow: 4,
+          leftColumn: 0,
+          rightColumn: 16,
+        },
+      ],
+    };
+    let current: Record<string, unknown> = DSL;
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async (_app, _page, _layout, dsl) => {
+      current = dsl;
+
+      return { ok: true };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: current },
+      })),
+      listActionCollections: jest.fn(async () => [
+        {
+          id: "coll1",
+          name: "Helpers",
+          // Marker present, JSActions absent: the embedded definition is the function-name oracle.
+          body: compileJsObject({
+            functions: [{ name: "save", steps: [{ return: true }] }],
+          } as never),
+          actions: [],
+        },
+      ]),
+      updateLayout: updateLayout as never,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: false,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const wire = async (call: { object: string; function: string }) =>
+      callTool(server, "wire_event", {
+        applicationId: "app1",
+        pageId: "p1",
+        layoutId: "l1",
+        revision: fingerprintDsl(current as never),
+        spec: { widget: "SaveBtn", event: "onClick", action: { call } },
+      });
+
+    expect(
+      (await wire({ object: "Helpers", function: "nope" })).body.error,
+    ).toMatch(/function "nope" was not found on JS object "Helpers"/);
+    expect(
+      (await wire({ object: "Helpers", function: "save" })).body.changeId,
+    ).toBeDefined();
+  });
+
+  it("create_js_object checks cross-object calls against the application before writing", async () => {
+    const createActionCollection = jest.fn<
+      Promise<unknown>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "coll-new", name: "Flow" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+      })),
+      listPlugins: jest.fn(async () => [
+        { id: "p".repeat(24), type: "JS", packageName: "js-plugin" },
+      ]),
+      listActionCollections: jest.fn(async () => [
+        {
+          id: "coll-utils",
+          name: "Utils",
+          pageId: "b".repeat(24),
+          body: "export default {}",
+          actions: [{ id: "a1", name: "count" }],
+        },
+      ]),
+      createActionCollection,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: "a".repeat(24),
+    });
+    const create = async (call: unknown) =>
+      callTool(server, "create_js_object", {
+        spec: {
+          applicationId: "a".repeat(24),
+          pageId: "b".repeat(24),
+          name: "Flow",
+          revision: read.body.revision,
+          functions: [
+            {
+              name: "go",
+              steps: [{ call, into: "n" }, { return: { var: "n" } }],
+            },
+          ],
+        },
+      });
+
+    expect(
+      String((await create({ object: "Nope", function: "count" })).body.error),
+    ).toMatch(/JS object "Nope" was not found/);
+    // A query is not a JS object: Query1.run is not a callable target here (use the run statement instead).
+    expect(
+      String((await create({ object: "Query1", function: "run" })).body.error),
+    ).toMatch(/JS object "Query1" was not found on this page/);
+    expect(
+      String((await create({ object: "Utils", function: "drop" })).body.error),
+    ).toMatch(/function "drop" was not found on JS object "Utils"/);
+    expect(
+      String((await create({ object: "Flow", function: "go" })).body.error),
+    ).toMatch(/by its name alone/);
+    expect(createActionCollection).not.toHaveBeenCalled();
+
+    // Page-scoped: a JS object of the same name on ANOTHER page does not resolve the call (entity names are
+    // unique per page, so a same-named query on this page would otherwise be what the call reaches at run time).
+    (api.listActionCollections as jest.Mock).mockResolvedValueOnce([
+      {
+        id: "coll-other",
+        name: "Utils",
+        pageId: "z".repeat(24),
+        body: "export default {}",
+        actions: [{ id: "a2", name: "count" }],
+      },
+    ]);
+    expect(
+      String((await create({ object: "Utils", function: "count" })).body.error),
+    ).toMatch(/not found on this page/);
+    expect(createActionCollection).not.toHaveBeenCalled();
+
+    const ok = await create({ object: "Utils", function: "count" });
+
+    expect(ok.body.created).toBe(true);
+    const dto = createActionCollection.mock.calls[0][0] as { body: string };
+
+    expect(dto.body).toContain("return await Utils.count(); } finally");
+  });
+
+  // Security review of F11: navigateTo treats a target that is not a page as a URL, so a navigate step must open a
+  // page of this application, as wire_event's navigate must.
+  it("create_js_object refuses a navigate step to a page that does not exist, or one named like an IP", async () => {
+    const createActionCollection = jest.fn<
+      Promise<unknown>,
+      [Record<string, unknown>]
+    >(async () => ({ id: "coll-new", name: "Flow" }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationPages: jest.fn(async () => ({
+        workspaceId: "w".repeat(24),
+        pages: [{ id: "c".repeat(24), name: "Ticket Details" }],
+      })),
+      listPlugins: jest.fn(async () => [
+        { id: "p".repeat(24), type: "JS", packageName: "js-plugin" },
+      ]),
+      listActionCollections: jest.fn(async () => []),
+      createActionCollection,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+    const read = await callTool(server, "read_js_object", {
+      applicationId: "a".repeat(24),
+    });
+    const createSteps = async (steps: unknown[]) =>
+      callTool(server, "create_js_object", {
+        spec: {
+          applicationId: "a".repeat(24),
+          pageId: "b".repeat(24),
+          name: "Flow",
+          revision: read.body.revision,
+          functions: [{ name: "go", steps }],
+        },
+      });
+    const create = async (navigate: string) =>
+      createSteps([{ navigate, params: { x: 1.55 } }]);
+
+    // Only step positions are walked: a param named "navigate" is a value, not a page, while a navigate nested in
+    // an if is still checked.
+    expect(
+      String(
+        (
+          await createSteps([
+            {
+              if: true,
+              then: [{ navigate: "Elsewhere" }],
+            },
+          ])
+        ).body.error,
+      ),
+    ).toMatch(/page "Elsewhere" was not found/);
+    expect(createActionCollection).not.toHaveBeenCalled();
+    expect(
+      (
+        await createSteps([
+          {
+            navigate: "Ticket Details",
+            params: { navigate: "not a page" },
+          },
+        ])
+      ).body.created,
+    ).toBe(true);
+    createActionCollection.mockClear();
+
+    expect(String((await create("Missing")).body.error)).toMatch(
+      /page "Missing" was not found/,
+    );
+    expect(JSON.stringify((await create("1572395042")).body)).toMatch(
+      /cannot read as an IP address/,
+    );
+    expect(createActionCollection).not.toHaveBeenCalled();
+
+    expect((await create("Ticket Details")).body.created).toBe(true);
+  });
+
+  it("create_js_object refuses a definition nested past the JSON depth cap before parsing it", async () => {
+    const api: AppsmithApi = { ...createApi()() };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: true,
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+    let deep: unknown = 1;
+
+    for (let i = 0; i < 200; i += 1) deep = { op: "neg", args: [deep] };
+
+    const refused = await callTool(server, "create_js_object", {
+      spec: {
+        applicationId: "a".repeat(24),
+        pageId: "b".repeat(24),
+        name: "Deep",
+        revision: "d".repeat(64),
+        functions: [{ name: "f", returns: deep }],
+      },
+    });
+
+    expect(String(refused.body.error)).toContain("nests deeper than");
+
+    // The update handler guards the same way, before any read.
+    const refusedUpdate = await callTool(server, "update_js_object", {
+      spec: {
+        applicationId: "a".repeat(24),
+        collectionId: "c".repeat(24),
+        revision: "d".repeat(64),
+        functions: [{ name: "f", returns: deep }],
+      },
+    });
+
+    expect(String(refusedUpdate.body.error)).toContain("nests deeper than");
+    expect(api.listActionCollections).not.toHaveBeenCalled();
+  });
+
+  it("wire_event { call } emits Object.function() only for a function that exists on a JS object of the app", async () => {
+    const store = new MemoryGovernanceStore();
+    const DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "b",
+          widgetName: "SaveBtn",
+          type: "BUTTON_WIDGET",
+          topRow: 0,
+          bottomRow: 4,
+          leftColumn: 0,
+          rightColumn: 16,
+        },
+      ],
+    };
+    let current: Record<string, unknown> = DSL;
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async (_app, _page, _layout, dsl) => {
+      current = dsl;
+
+      return { ok: true };
+    });
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: current },
+      })),
+      listActionCollections: jest.fn(async () => [
+        {
+          id: "coll1",
+          name: "BannerAdmin",
+          // No JSActions (a collection written before per-function actions existed): the compiled body shape
+          // still declares the member.
+          body: "export default { save: async () => { await SaveBanner.run(); } };",
+          actions: [],
+        },
+        {
+          id: "coll2",
+          name: "Legacy",
+          // Editor-authored: recognised by its JSAction names, never by scanning its body.
+          body: "export default {\n\tasync archive () {\n\t\treturn 1;\n\t}\n}",
+          actions: [{ id: "act2", name: "archive" }],
+        },
+      ]),
+      updateLayout: updateLayout as never,
+    };
+    // `call` is deliberately available without the JS-authoring gate: it only wires an event to code that already
+    // exists in the application (like `run` on an existing query).
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      jsEnabled: false,
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const wire = async (call: { object: string; function: string }) =>
+      callTool(server, "wire_event", {
+        applicationId: "app1",
+        pageId: "p1",
+        layoutId: "l1",
+        revision: fingerprintDsl(current as never),
+        spec: { widget: "SaveBtn", event: "onClick", action: { call } },
+      });
+
+    // Dangling references are refused before anything is written.
+    expect(
+      (await wire({ object: "Nope", function: "save" })).body.error,
+    ).toMatch(/JS object "Nope" was not found/);
+    expect(
+      (await wire({ object: "BannerAdmin", function: "drop" })).body.error,
+    ).toMatch(/function "drop" was not found on JS object "BannerAdmin"/);
+    expect(updateLayout).not.toHaveBeenCalled();
+
+    const wired = await wire({ object: "BannerAdmin", function: "save" });
+
+    expect(wired.body.changeId).toBeDefined();
+    const written = updateLayout.mock.calls[0][3] as {
+      children: { widgetName: string; onClick?: string }[];
+    };
+
+    expect(
+      written.children.find((w) => w.widgetName === "SaveBtn")?.onClick,
+    ).toBe("{{ BannerAdmin.save() }}");
+
+    // Editor-authored objects are callable too, resolved by JSAction name.
+    const legacy = await wire({ object: "Legacy", function: "archive" });
+
+    expect(legacy.body.changeId).toBeDefined();
+    expect(
+      (updateLayout.mock.calls[1][3] as { children: { onClick?: string }[] })
+        .children[0].onClick,
+    ).toBe("{{ Legacy.archive() }}");
+  });
+
+  it("JS-object tools are unavailable without the JS gate", async () => {
+    const server = createMcpHttpServer(API_BASE_URL, () => createApi()(), {
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+    const sessionId = await initSession(server);
+    const listed = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", id: 22, method: "tools/list" });
+    const names = new Set(parseJsonRpc(listed).result.tools.map((t) => t.name));
+
+    for (const tool of [
+      "read_js_object",
+      "create_js_object",
+      "update_js_object",
+      "prepare_delete_js_object",
+      "confirm_delete_js_object",
+    ]) {
+      expect(names.has(tool)).toBe(false);
+    }
+  });
+
+  // Item K.2 — tool-level coverage for the always-on read/patch and data-layer reads.
+  const TEXT_DSL = {
+    ...ROOT_DSL,
+    children: [
+      {
+        widgetId: "g",
+        widgetName: "Greeting",
+        type: "TEXT_WIDGET",
+        text: "Hi",
+        topRow: 0,
+        bottomRow: 4,
+        leftColumn: 0,
+        rightColumn: 24,
+      },
+    ],
+  };
+
+  function textServer(
+    updateLayout: AppsmithApi["updateLayout"] = jest.fn(async () => ({
+      ok: true,
+    })),
+  ) {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: TEXT_DSL },
+      })),
+      updateLayout,
+    };
+
+    return createMcpHttpServer(API_BASE_URL, () => api);
+  }
+
+  it("read_semantic_page returns a safe projection and a revision", async () => {
+    const read = await callTool(textServer(), "read_semantic_page", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+    });
+
+    expect(read.body.revision).toBe(fingerprintDsl(TEXT_DSL as never));
+    expect(JSON.stringify(read.body.page)).toContain("Greeting");
+  });
+
+  it("patch_widgets updates an allowlisted property and writes it back", async () => {
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async () => ({ ok: true }));
+    const patched = await callTool(textServer(updateLayout), "patch_widgets", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(TEXT_DSL as never),
+      patch: {
+        operations: [
+          { kind: "update", name: "Greeting", props: { text: "Welcome" } },
+        ],
+      },
+    });
+
+    expect(patched.body.changes).toBeDefined();
+    const written = updateLayout.mock.calls[0][3] as {
+      children: { widgetName: string; text?: string }[];
+    };
+
+    expect(
+      written.children.find((w) => w.widgetName === "Greeting")?.text,
+    ).toBe("Welcome");
+    // Non-git app: no git warning.
+    expect(patched.body.gitWarning).toBeUndefined();
+    // Every layout mutation says the deployed app is stale — ungoverned wording points at the editor's Deploy
+    // button, since re-publish via MCP is unavailable without governance.
+    expect(patched.body.deployNote).toContain("edit copy");
+    expect(patched.body.deployNote).toContain("click Deploy");
+    expect(patched.body.deployNote).toContain("requires governance");
+  });
+
+  // M6 — the occupancy-aware move surfaces its repair end-to-end: requestedPosition vs position in changes, a
+  // top-level note, and a written DSL that is overlap-free (so the commitLayout delta gate passes).
+  it("patch_widgets repairs a colliding move, reports notes, and writes an overlap-free layout", async () => {
+    const STACKED_DSL = {
+      ...ROOT_DSL,
+      children: [
+        {
+          widgetId: "a",
+          widgetName: "Upper",
+          type: "TEXT_WIDGET",
+          topRow: 0,
+          bottomRow: 10,
+          leftColumn: 0,
+          rightColumn: 24,
+        },
+        {
+          widgetId: "b",
+          widgetName: "Lower",
+          type: "TEXT_WIDGET",
+          topRow: 12,
+          bottomRow: 20,
+          leftColumn: 0,
+          rightColumn: 24,
+        },
+      ],
+    };
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async () => ({ ok: true }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: STACKED_DSL },
+      })),
+      updateLayout,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const patched = await callTool(server, "patch_widgets", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(STACKED_DSL as never),
+      patch: {
+        operations: [
+          {
+            kind: "move",
+            name: "Lower",
+            position: { topRow: 2, leftColumn: 0 },
+          },
+        ],
+      },
+    });
+
+    // Not gated (the repair produced an overlap-free result), and the repair is fully reported.
+    expect(patched.body.code).toBeUndefined();
+    expect(patched.body.changes[0]).toMatchObject({
+      widgetName: "Lower",
+      requestedPosition: { topRow: 2, leftColumn: 0 },
+      position: { topRow: 11, leftColumn: 0 },
+    });
+    expect(String(patched.body.notes)).toContain("placed at");
+
+    const written = updateLayout.mock.calls[0][3] as {
+      children: { widgetName: string; topRow: number }[];
+    };
+
+    expect(written.children.find((w) => w.widgetName === "Lower")?.topRow).toBe(
+      11,
+    );
+    // The post-write diagnostics carry no overlap warning.
+    const diagnostics = patched.body.diagnostics as {
+      issues: { rule: string }[];
+    };
+
+    expect(diagnostics.issues.map((issue) => issue.rule)).not.toContain(
+      "overlap",
+    );
+  });
+
+  it("layout mutations on a governed deployment steer the agent to re-publish (deployNote)", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: TEXT_DSL },
+      })),
+      updateLayout: jest.fn(async () => ({ ok: true })),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+    const patched = await callTool(server, "patch_widgets", {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(TEXT_DSL as never),
+      patch: {
+        operations: [
+          { kind: "update", name: "Greeting", props: { text: "Welcome" } },
+        ],
+      },
+    });
+
+    expect(patched.body.deployNote).toContain("edit copy");
+    expect(patched.body.deployNote).toContain(
+      "prepare_publish -> confirm_publish",
+    );
+  });
+
+  // M1-T3: a git-connected app edited via MCP produces uncommitted branch changes; the edit proceeds but warns.
+  const GIT_APP = {
+    id: "app1",
+    gitApplicationMetadata: {
+      branchName: "feature/x",
+      remoteUrl: "git@github.com:acme/app.git",
+    },
+  };
+
+  it("patch_widgets on a git-connected app requires the branch parameter (M7 gate) and then proceeds with the warning", async () => {
+    const updateLayout = jest.fn<
+      Promise<{ ok: boolean }>,
+      [string, string, string, Record<string, unknown>]
+    >(async () => ({ ok: true }));
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: TEXT_DSL },
+      })),
+      getApplication: jest.fn(async () => GIT_APP),
+      updateLayout,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const args = {
+      applicationId: "app1",
+      pageId: "p1",
+      layoutId: "l1",
+      revision: fingerprintDsl(TEXT_DSL as never),
+      patch: {
+        operations: [
+          { kind: "update", name: "Greeting", props: { text: "Welcome" } },
+        ],
+      },
+    };
+
+    // M7 BREAKING behavior: without a branch the mutation is refused, carrying the current branch for retry.
+    const gated = await callTool(server, "patch_widgets", args);
+
+    expect(gated.body.code).toBe("git_branch_required");
+    expect(gated.body.currentBranch).toBe("feature/x");
+    expect(updateLayout).not.toHaveBeenCalled();
+
+    // With the matching branch it proceeds (write happened) and still carries the branch-named warning.
+    const patched = await callTool(server, "patch_widgets", {
+      ...args,
+      branch: "feature/x",
+    });
+
+    expect(updateLayout).toHaveBeenCalled();
+    expect(patched.body.changes).toBeDefined();
+    expect(patched.body.gitWarning).toContain("feature/x");
+    expect(patched.body.gitWarning).toContain("UNCOMMITTED");
+  });
+
+  it("confirm_publish rejects QUERY-level drift between prepare and confirm (content fingerprint)", async () => {
+    // The page list is identical throughout — only an action's updatedAt changed between prepare and confirm
+    // (e.g. someone edited a query while the human deliberated). The old page-list revision was blind to this;
+    // the content revision must refuse the deploy.
+    const store = new MemoryGovernanceStore();
+    const publishApplication = jest.fn();
+    const pagesResponse = {
+      workspaceId: "ws1",
+      application: { id: "app1", name: "Orders", slug: "orders" },
+      pages: [{ id: "pg1", name: "Home", slug: "home", isDefault: true }],
+    };
+    const listActions = jest
+      .fn<Promise<unknown>, []>()
+      .mockResolvedValueOnce([{ id: "a1", updatedAt: "2026-07-21T00:00:00Z" }])
+      .mockResolvedValue([{ id: "a1", updatedAt: "2026-07-21T00:05:00Z" }]);
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getApplication: jest.fn(async () => ({})),
+        getApplicationPages: jest.fn(async () => pagesResponse),
+        listActions,
+        publishApplication,
+      }),
+      { dataEnabled: true, governance: new McpGovernanceCoordinator(store) },
+    );
+
+    const read = await callTool(server, "read_pages", {
+      applicationId: "app1",
+    });
+    const prepared = await callTool(server, "prepare_publish", {
+      applicationId: "app1",
+      revision: read.body.revision,
+    });
+
+    // prepare returns the CONTENT revision the confirmation is bound to.
+    expect(String(prepared.body.revision)).toMatch(/^[a-f0-9]{64}$/);
+
+    const confirmed = await callTool(server, "confirm_publish", {
+      applicationId: "app1",
+      revision: prepared.body.revision,
+      confirmationId: prepared.body.confirmationId,
+    });
+
+    expect(confirmed.body.published).not.toBe(true);
+    expect(publishApplication).not.toHaveBeenCalled();
+  });
+
+  it("confirm_publish refuses a git-connected app and never deploys", async () => {
+    const publishApplication = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplication: jest.fn(async () => GIT_APP),
+      publishApplication,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+
+    const res = await callTool(server, "confirm_publish", {
+      applicationId: "app1",
+      confirmationId: "conf1",
+      revision: "a".repeat(64),
+    });
+
+    expect(res.body.code).toBe("git_connected");
+    expect(res.body.published).toBe(false);
+    expect(res.body.error).toContain("feature/x");
+    expect(publishApplication).not.toHaveBeenCalled();
+  });
+
+  it("confirm_publish fails CLOSED when git state cannot be read (refuses, never deploys)", async () => {
+    // The publish gate is hard: if getApplication throws, we cannot rule out a git connection, so refuse rather than
+    // risk deploying uncommitted git state. (The advisory edit warning fails open; this gate does not.)
+    const publishApplication = jest.fn();
+    const api: AppsmithApi = {
+      ...createApi()(),
+      getApplication: jest.fn(async () => {
+        throw new Error("network");
+      }),
+      publishApplication,
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+    });
+
+    const res = await callTool(server, "confirm_publish", {
+      applicationId: "app1",
+      confirmationId: "conf1",
+      revision: "a".repeat(64),
+    });
+
+    expect(res.body.code).toBe("git_state_unknown");
+    expect(res.body.published).toBe(false);
+    expect(publishApplication).not.toHaveBeenCalled();
+  });
+
+  it("list_actions returns safe metadata only (no bodies, headers, or credentials)", async () => {
+    const api: AppsmithApi = {
+      ...createApi()(),
+      listActions: jest.fn(async () => [
+        {
+          id: "act1",
+          name: "getUsers",
+          pageId: "p1",
+          pluginType: "DB",
+          actionConfiguration: {
+            body: "SELECT secret_col FROM t",
+            headers: [{ key: "Authorization", value: "Bearer xyz" }],
+          },
+          datasource: { id: "ds1", pluginId: "postgres" },
+        },
+      ]),
+    };
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+    });
+    const { body, text } = await callTool(server, "list_actions", {
+      applicationId: "app1",
+    });
+
+    expect(JSON.stringify(body)).toContain("getUsers");
+    expect(text).not.toContain("SELECT secret_col");
+    expect(text).not.toContain("Bearer xyz");
+    expect(text).not.toContain("actionConfiguration");
+  });
+
+  // Item E — run_action / prepare_run_action / confirm_run_action.
+  // Read-only means a PROTOCOL-level guarantee: a REST GET/HEAD. DB/SQL query text is never trusted as read-only.
+  const READ_ONLY_ACTION = {
+    id: "act1",
+    name: "getUsers",
+    pageId: "p1",
+    pluginType: "API",
+    updatedAt: "2026-07-12T00:00:00.000Z",
+    actionConfiguration: { httpMethod: "GET" },
+    datasource: { id: "ds1", pluginId: "restapi" },
+  };
+  const WRITE_ACTION = {
+    id: "act1",
+    name: "insertUser",
+    pageId: "p1",
+    pluginType: "DB",
+    updatedAt: "2026-07-12T00:00:00.000Z",
+    actionConfiguration: { body: "INSERT INTO users (name) VALUES ({{x}});" },
+    datasource: { id: "ds1", pluginId: "postgres" },
+  };
+
+  it("run_action requires confirmation for a REST GET (external egress) and refuses a DB write", async () => {
+    // M1-T2: a REST/API action can egress to any external host, so even a GET must NOT auto-run — it could exfiltrate
+    // query-bound data to an attacker-chosen URL with no human in the loop. It now routes through prepare/confirm.
+    const roExecute = jest.fn();
+    const roServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => READ_ONLY_ACTION),
+        executeAction: roExecute,
+      }),
+      { dataEnabled: true },
+    );
+    const ro = await callTool(roServer, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(ro.body.code).toBe("confirmation_required");
+    expect(roExecute).not.toHaveBeenCalled();
+
+    const rwExecute = jest.fn();
+    const rwServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => WRITE_ACTION),
+        executeAction: rwExecute,
+      }),
+      { dataEnabled: true },
+    );
+    const rw = await callTool(rwServer, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(rw.body.code).toBe("confirmation_required");
+    expect(rwExecute).not.toHaveBeenCalled();
+  });
+
+  it("run_action refuses to auto-run a host-restricted (DB) action even with httpMethod GET (no confirm-gate bypass)", async () => {
+    // Security regression (hacktron): actionConfiguration.httpMethod is NOT a trusted read-only signal for a
+    // host-restricted (DB) action. DB plugins do not use HTTP verbs, and the backend does not strip an injected
+    // httpMethod — so a mutating SQL action stamped with "GET" must still route through prepare/confirm, never
+    // auto-run. Before the fix this exact document auto-ran (the since-removed isReadOnlyAction predicate returned true), executing the mutation
+    // with no human in the loop. The ONLY read auto-run door is the Sheets path (proven separately below).
+    const executeAction = jest.fn();
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...WRITE_ACTION, // pluginType "DB", host-restricted Postgres datasource
+          actionConfiguration: {
+            httpMethod: "GET", // attacker-injected protocol-read-only method
+            body: "DROP TABLE users;", // ...on a mutating SQL body
+          },
+        })),
+        executeAction,
+      }),
+      { dataEnabled: true },
+    );
+    const res = await callTool(server, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(res.body.code).toBe("confirmation_required");
+    expect(executeAction).not.toHaveBeenCalled();
+  });
+
+  // The Sheets auto-run door: a FETCH_MANY/FETCH_DETAILS command whose action pluginId AND datasource both
+  // STRICTLY resolve (through the server-authoritative workspace plugin/datasource lists) to google-sheets-plugin
+  // is protocol-read-only AND host-restricted, so it may auto-run. The workspace comes from the application's
+  // pages DTO (createApi's getApplicationPages default: { workspaceId: "ws1" }), never the action document.
+  const SHEETS_READ_ACTION = {
+    id: "act1",
+    name: "ReadTasks",
+    pageId: "p1",
+    pluginType: "SAAS",
+    pluginId: "plug-sheets",
+    workspaceId: "ws-spoofable",
+    updatedAt: "2026-07-21T00:00:00.000Z",
+    actionConfiguration: {
+      formData: {
+        command: { data: "FETCH_MANY" },
+        entityType: { data: "ROWS" },
+      },
+    },
+    datasource: { id: "ds1", pluginId: "plug-sheets" },
+  };
+  const SHEETS_PLUGINS = [
+    { id: "plug-sheets", packageName: "google-sheets-plugin" },
+    { id: "plug-pg", packageName: "postgres-plugin" },
+  ];
+  const SHEETS_DATASOURCES = [{ id: "ds1", pluginId: "plug-sheets" }];
+
+  it("run_action auto-runs a Google Sheets read (plugin family proven via the workspace plugin list)", async () => {
+    const executeAction = jest.fn(async () => ({ isExecutionSuccess: true }));
+    const listPlugins = jest.fn(async () => SHEETS_PLUGINS);
+    const listDatasources = jest.fn(async () => SHEETS_DATASOURCES);
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => SHEETS_READ_ACTION),
+        listPlugins,
+        listDatasources,
+        executeAction,
+      }),
+      { dataEnabled: true },
+    );
+    const res = await callTool(server, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(res.body.executed).toBe(true);
+    expect(executeAction).toHaveBeenCalledWith("act1");
+    // Both lookups use the pages-DTO workspace ("ws1"), NOT the action document's ("ws-spoofable").
+    expect(listPlugins).toHaveBeenCalledWith("ws1");
+    expect(listDatasources).toHaveBeenCalledWith("ws1");
+  });
+
+  it("run_action fails CLOSED when the action's pluginId is the literal Sheets package name absent from the plugin list", async () => {
+    // F1 regression: pluginPackageName's not-found fallback returns the pluginId itself, so an action document
+    // persisted with pluginId "google-sheets-plugin" would pass a family check built on it. The auto-run gate
+    // must use strict list-membership resolution instead — and on the server, this exact document would execute
+    // the DATASOURCE's plugin, so letting it through would auto-run arbitrary plugins.
+    const executeAction = jest.fn();
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...SHEETS_READ_ACTION,
+          pluginId: "google-sheets-plugin",
+        })),
+        listPlugins: jest.fn(async () => SHEETS_PLUGINS),
+        listDatasources: jest.fn(async () => SHEETS_DATASOURCES),
+        executeAction,
+      }),
+      { dataEnabled: true },
+    );
+    const res = await callTool(server, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(res.body.code).toBe("confirmation_required");
+    expect(executeAction).not.toHaveBeenCalled();
+  });
+
+  it("run_action fails CLOSED when a Sheets-labeled action points at a non-Sheets datasource", async () => {
+    // On a pluginId miss the server executes the DATASOURCE's plugin, so the datasource must independently
+    // resolve to Sheets. A Sheets-resolving action pluginId with a Postgres datasource must not auto-run.
+    const executeAction = jest.fn();
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...SHEETS_READ_ACTION,
+          datasource: { id: "ds-pg", pluginId: "plug-pg" },
+        })),
+        listPlugins: jest.fn(async () => SHEETS_PLUGINS),
+        listDatasources: jest.fn(async () => [
+          { id: "ds-pg", pluginId: "plug-pg" },
+        ]),
+        executeAction,
+      }),
+      { dataEnabled: true },
+    );
+    const res = await callTool(server, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(res.body.code).toBe("confirmation_required");
+    expect(executeAction).not.toHaveBeenCalled();
+  });
+
+  it("run_action refuses a Sheets append (INSERT_ONE) — only the closed read commands auto-run", async () => {
+    const executeAction = jest.fn();
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...SHEETS_READ_ACTION,
+          actionConfiguration: {
+            formData: {
+              command: { data: "INSERT_ONE" },
+              entityType: { data: "ROWS" },
+            },
+          },
+        })),
+        listPlugins: jest.fn(async () => SHEETS_PLUGINS),
+        executeAction,
+      }),
+      { dataEnabled: true },
+    );
+    const res = await callTool(server, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(res.body.code).toBe("confirmation_required");
+    expect(executeAction).not.toHaveBeenCalled();
+  });
+
+  it("run_action refuses a Sheets update (UPDATE_ONE) — a write is never in the closed read set", async () => {
+    const executeAction = jest.fn();
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...SHEETS_READ_ACTION,
+          actionConfiguration: {
+            formData: {
+              command: { data: "UPDATE_ONE" },
+              entityType: { data: "ROWS" },
+            },
+          },
+        })),
+        listPlugins: jest.fn(async () => SHEETS_PLUGINS),
+        executeAction,
+      }),
+      { dataEnabled: true },
+    );
+    const res = await callTool(server, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(res.body.code).toBe("confirmation_required");
+    expect(executeAction).not.toHaveBeenCalled();
+  });
+
+  it("run_action fails CLOSED when the action merely claims to be Sheets (plugin resolves elsewhere) or the plugin list is unavailable", async () => {
+    // Spoof: an action document with a Sheets-looking command whose pluginId resolves to a DIFFERENT package. The
+    // classifier must trust only the workspace plugin list, not the action's own strings.
+    const spoofExecute = jest.fn();
+    const spoofServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => SHEETS_READ_ACTION),
+        listPlugins: jest.fn(async () => [
+          { id: "plug-sheets", packageName: "saas-hubspot-plugin" },
+        ]),
+        executeAction: spoofExecute,
+      }),
+      { dataEnabled: true },
+    );
+    const spoofed = await callTool(spoofServer, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(spoofed.body.code).toBe("confirmation_required");
+    expect(spoofExecute).not.toHaveBeenCalled();
+
+    // Plugin list unreachable -> the door stays shut (confirmation path still available).
+    const failExecute = jest.fn();
+    const failServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => SHEETS_READ_ACTION),
+        listPlugins: jest.fn(async () => {
+          throw new Error("boom");
+        }),
+        executeAction: failExecute,
+      }),
+      { dataEnabled: true },
+    );
+    const failed = await callTool(failServer, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(failed.body.code).toBe("confirmation_required");
+    expect(failExecute).not.toHaveBeenCalled();
+  });
+
+  it("prepare_run_action reports readOnly true for a Sheets read and degrades to false when the plugin list is unavailable", async () => {
+    // The advisory readOnly flag runs through the same async classifier. A Sheets read prepares as readOnly: true
+    // ("you could have used run_action"); a classifier failure degrades the FLAG, never the prepare itself.
+    const roStore = new MemoryGovernanceStore();
+    const roServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => SHEETS_READ_ACTION),
+        listPlugins: jest.fn(async () => SHEETS_PLUGINS),
+        listDatasources: jest.fn(async () => SHEETS_DATASOURCES),
+      }),
+      { dataEnabled: true, governance: new McpGovernanceCoordinator(roStore) },
+    );
+    const roRead = await callTool(roServer, "get_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+    const roPrepared = await callTool(roServer, "prepare_run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+      revision: roRead.body.revision,
+    });
+
+    expect(roPrepared.body.readOnly).toBe(true);
+    expect(roPrepared.body.confirmationId).toBeDefined();
+
+    const failStore = new MemoryGovernanceStore();
+    const failServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => SHEETS_READ_ACTION),
+        listPlugins: jest.fn(async () => {
+          throw new Error("boom");
+        }),
+        listDatasources: jest.fn(async () => SHEETS_DATASOURCES),
+      }),
+      {
+        dataEnabled: true,
+        governance: new McpGovernanceCoordinator(failStore),
+      },
+    );
+    const failRead = await callTool(failServer, "get_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+    const failPrepared = await callTool(failServer, "prepare_run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+      revision: failRead.body.revision,
+    });
+
+    expect(failPrepared.body.readOnly).toBe(false);
+    expect(failPrepared.body.confirmationId).toBeDefined();
+  });
+
+  // get_datasource_structure: Sheets discovery (spreadsheets -> sheet names -> columns) over the datasource
+  // trigger endpoint, with the plain structure passthrough untouched for DB datasources.
+  const SHEET_URL = "https://docs.google.com/spreadsheets/d/abc123/edit";
+
+  it("get_datasource_structure walks a Sheets datasource: spreadsheets, then sheet names, then columns", async () => {
+    const triggerDatasource = jest.fn(
+      async (_id: string, body: Record<string, unknown>) => {
+        if (body.requestType === "SPREADSHEET_SELECTOR") {
+          return { trigger: [{ label: "TaskData", value: SHEET_URL }] };
+        }
+
+        if (body.requestType === "SHEET_SELECTOR") {
+          return { trigger: [{ label: "Sheet1", value: "Sheet1" }] };
+        }
+
+        return {
+          trigger: [
+            { label: "Name", value: "Name" },
+            { label: "DueDate", value: "DueDate" },
+            { label: "Status", value: "Status" },
+          ],
+        };
+      },
+    );
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getDatasourceStructure: jest.fn(async () => ({})),
+        triggerDatasource,
+      }),
+      { dataEnabled: true },
+    );
+
+    // No params: empty structure -> the spreadsheet probe answers.
+    const spreadsheets = await callTool(server, "get_datasource_structure", {
+      datasourceId: "ds1",
+    });
+
+    expect(spreadsheets.body.spreadsheets).toEqual([
+      { label: "TaskData", value: SHEET_URL },
+    ]);
+
+    // + sheetUrl: sheet (tab) names.
+    const sheets = await callTool(server, "get_datasource_structure", {
+      datasourceId: "ds1",
+      sheetUrl: SHEET_URL,
+    });
+
+    expect(sheets.body.sheets).toEqual(["Sheet1"]);
+    expect(triggerDatasource).toHaveBeenCalledWith(
+      "ds1",
+      expect.objectContaining({
+        requestType: "SHEET_SELECTOR",
+        parameters: { sheetUrl: SHEET_URL },
+      }),
+    );
+
+    // + sheetName: column names (headerRow defaults to 1).
+    const columns = await callTool(server, "get_datasource_structure", {
+      datasourceId: "ds1",
+      sheetUrl: SHEET_URL,
+      sheetName: "Sheet1",
+    });
+
+    expect(columns.body.columns).toEqual(["Name", "DueDate", "Status"]);
+    expect(triggerDatasource).toHaveBeenCalledWith(
+      "ds1",
+      expect.objectContaining({
+        requestType: "COLUMNS_SELECTOR",
+        parameters: {
+          sheetUrl: SHEET_URL,
+          sheetName: "Sheet1",
+          tableHeaderIndex: "1",
+        },
+      }),
+    );
+  });
+
+  it("get_datasource_structure leaves non-Sheets datasources alone (tables passthrough; probe failure returns the raw structure)", async () => {
+    // A DB structure with tables: returned as-is, no trigger probe.
+    const dbStructure = { tables: [{ name: "users", columns: [] }] };
+    const dbTrigger = jest.fn();
+    const dbServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getDatasourceStructure: jest.fn(async () => dbStructure),
+        triggerDatasource: dbTrigger,
+      }),
+      { dataEnabled: true },
+    );
+    const db = await callTool(dbServer, "get_datasource_structure", {
+      datasourceId: "ds1",
+    });
+
+    expect(db.body).toEqual(dbStructure);
+    expect(dbTrigger).not.toHaveBeenCalled();
+
+    // Empty structure on a plugin WITHOUT the selector trigger (REST/AI/...): the probe fails and the raw
+    // structure is still the answer.
+    const emptyServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getDatasourceStructure: jest.fn(async () => ({})),
+        triggerDatasource: jest.fn(async () => {
+          throw new Error("Appsmith API request failed (500)");
+        }),
+      }),
+      { dataEnabled: true },
+    );
+    const empty = await callTool(emptyServer, "get_datasource_structure", {
+      datasourceId: "ds1",
+    });
+
+    expect(empty.body).toEqual({});
+
+    // sheetName without sheetUrl is ambiguous -> explicit error, no API calls.
+    const invalid = await callTool(emptyServer, "get_datasource_structure", {
+      datasourceId: "ds1",
+      sheetName: "Sheet1",
+    });
+
+    expect(invalid.body.error).toContain("sheetUrl");
+  });
+
+  it("get_datasource_structure bounds trigger output and errors on a metadata-less drill-down response", async () => {
+    // 250 entries with junk mixed in and over-length strings: the projection caps at 200 options, drops
+    // non-conforming entries, and truncates label/value.
+    const noisyTrigger = [
+      null,
+      "bare-string",
+      { label: 42, value: "dropped-non-string-label" },
+      { label: "L".repeat(400), value: "V".repeat(3000) },
+      ...Array.from({ length: 250 }, (_, i) => ({
+        label: `sheet-${i}`,
+        value: `sheet-${i}`,
+      })),
+    ];
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        triggerDatasource: jest.fn(async () => ({ trigger: noisyTrigger })),
+      }),
+      { dataEnabled: true },
+    );
+    const sheets = await callTool(server, "get_datasource_structure", {
+      datasourceId: "ds1",
+      sheetUrl: SHEET_URL,
+    });
+
+    expect(sheets.body.sheets).toHaveLength(200);
+    expect(sheets.body.sheets[0]).toBe("V".repeat(2000));
+    expect(sheets.body.sheets).not.toContain("dropped-non-string-label");
+
+    // A drill-down (sheetUrl set) whose response has no trigger array is an explicit error, not a passthrough.
+    const noMetadataServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        triggerDatasource: jest.fn(async () => ({ notTrigger: true })),
+      }),
+      { dataEnabled: true },
+    );
+    const noMetadata = await callTool(
+      noMetadataServer,
+      "get_datasource_structure",
+      { datasourceId: "ds1", sheetUrl: SHEET_URL },
+    );
+
+    expect(noMetadata.body.error).toContain("sheet metadata");
+  });
+
+  it("get_datasource_structure propagates a non-default headerRow into the columns trigger", async () => {
+    const triggerDatasource = jest.fn(async () => ({
+      trigger: [{ label: "ColA", value: "ColA" }],
+    }));
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({ ...createApi()(), triggerDatasource }),
+      { dataEnabled: true },
+    );
+    const columns = await callTool(server, "get_datasource_structure", {
+      datasourceId: "ds1",
+      sheetUrl: SHEET_URL,
+      sheetName: "Sheet1",
+      headerRow: 5,
+    });
+
+    expect(columns.body.columns).toEqual(["ColA"]);
+    expect(triggerDatasource).toHaveBeenCalledWith(
+      "ds1",
+      expect.objectContaining({
+        requestType: "COLUMNS_SELECTOR",
+        parameters: {
+          sheetUrl: SHEET_URL,
+          sheetName: "Sheet1",
+          tableHeaderIndex: "5",
+        },
+      }),
+    );
+  });
+
+  it("run_action refuses DB queries whose text looks read-only but can mutate (no confirmation bypass)", async () => {
+    // Each body starts with a keyword the old prefix check treated as read-only, yet each can mutate: a CTE that
+    // DELETEs, a mutating function call, EXPLAIN ANALYZE (which executes the plan), and a plain SELECT (which can
+    // call mutating functions). None may run via run_action without prepare/confirm.
+    const dangerousBodies = [
+      "WITH deleted AS (DELETE FROM logs WHERE level = 'DEBUG' RETURNING *) SELECT * FROM deleted;",
+      "SELECT delete_old_records();",
+      "EXPLAIN ANALYZE DELETE FROM users WHERE id = 1;",
+      "SHOW tables; DROP TABLE users;",
+      "SELECT * FROM users;",
+    ];
+
+    for (const body of dangerousBodies) {
+      const executeAction = jest.fn();
+      const server = createMcpHttpServer(
+        API_BASE_URL,
+        () => ({
+          ...createApi()(),
+          getAction: jest.fn(async () => ({
+            ...WRITE_ACTION,
+            actionConfiguration: { body },
+          })),
+          executeAction,
+        }),
+        { dataEnabled: true },
+      );
+      const res = await callTool(server, "run_action", {
+        applicationId: "app1",
+        actionId: "act1",
+      });
+
+      expect(res.body.code).toBe("confirmation_required");
+      expect(res.body.executed).toBeUndefined();
+      expect(executeAction).not.toHaveBeenCalled();
+    }
+  });
+
+  it("refuses a REST HEAD (external egress) and a REST write (non-GET/HEAD) without confirmation", async () => {
+    // M1-T2: HEAD is a safe HTTP method, but a REST/API datasource can egress externally, so it no longer auto-runs.
+    const headExecute = jest.fn();
+    const headServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...READ_ONLY_ACTION,
+          actionConfiguration: { httpMethod: "HEAD" },
+        })),
+        executeAction: headExecute,
+      }),
+      { dataEnabled: true },
+    );
+    const head = await callTool(headServer, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(head.body.code).toBe("confirmation_required");
+    expect(headExecute).not.toHaveBeenCalled();
+
+    // A REST write (POST) is not a safe method -> refused, no execution.
+    const postExecute = jest.fn();
+    const postServer = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => ({
+          ...READ_ONLY_ACTION,
+          actionConfiguration: { httpMethod: "POST" },
+        })),
+        executeAction: postExecute,
+      }),
+      { dataEnabled: true },
+    );
+    const post = await callTool(postServer, "run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+
+    expect(post.body.code).toBe("confirmation_required");
+    expect(postExecute).not.toHaveBeenCalled();
+  });
+
+  it("prepare_run_action + confirm_run_action runs a non-read-only action with a token", async () => {
+    const store = new MemoryGovernanceStore();
+    const executeAction = jest.fn(async () => ({ isExecutionSuccess: true }));
+    const server = createMcpHttpServer(
+      API_BASE_URL,
+      () => ({
+        ...createApi()(),
+        getAction: jest.fn(async () => WRITE_ACTION),
+        executeAction,
+      }),
+      { dataEnabled: true, governance: new McpGovernanceCoordinator(store) },
+    );
+
+    const read = await callTool(server, "get_action", {
+      applicationId: "app1",
+      actionId: "act1",
+    });
+    const prepared = await callTool(server, "prepare_run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+      revision: read.body.revision,
+    });
+
+    expect(prepared.body.readOnly).toBe(false);
+
+    const confirmed = await callTool(server, "confirm_run_action", {
+      applicationId: "app1",
+      actionId: "act1",
+      revision: read.body.revision,
+      confirmationId: prepared.body.confirmationId,
+    });
+
+    expect(confirmed.body.executed).toBe(true);
+    expect(executeAction).toHaveBeenCalledWith("act1");
+    expect(typeof confirmed.body.changeId).toBe("string");
+    expect(store.changes.some((c) => c.operation === "run_action")).toBe(true);
+  });
+  describe("APP-16381 review regressions", () => {
+    const dsl = {
+      ...ROOT_DSL,
+      children: [
+        {
+          ...ROOT_DSL,
+          widgetId: "b",
+          widgetName: "Submit",
+          type: "BUTTON_WIDGET",
+        },
+        {
+          ...ROOT_DSL,
+          widgetId: "i",
+          widgetName: "Initials",
+          type: "INPUT_WIDGET_V2",
+        },
+        {
+          ...ROOT_DSL,
+          widgetId: "t",
+          widgetName: "Licenses",
+          type: "TABLE_WIDGET_V2",
+        },
+      ],
+    };
+
+    function setup(listActions: () => Promise<unknown>, dataEnabled = false) {
+      const updateLayout = jest.fn(async () => ({ ok: true }));
+      const api: AppsmithApi = {
+        ...createApi()(),
+        getApplicationContext: jest.fn(async (applicationId: string) => ({
+          pages: [],
+          page: {
+            applicationId,
+            layouts: [
+              { id: "l1", dsl },
+              { id: "l2", dsl },
+            ],
+          },
+          layout: { id: "l1", dsl },
+        })),
+        listActionCollections: jest.fn(async () => [
+          { name: "Utils", actions: [{ name: "save" }] },
+        ]),
+        listActions: jest.fn(listActions) as never,
+        updateLayout: updateLayout as never,
+      };
+
+      return {
+        api,
+        updateLayout,
+        server: createMcpHttpServer(API_BASE_URL, () => api, {
+          dataEnabled,
+          jsEnabled: true,
+          governance: new McpGovernanceCoordinator(new MemoryGovernanceStore()),
+        }),
+      };
+    }
+
+    it("removes embedded page DSL when narrowing a widget with default include", async () => {
+      const { server } = setup(async () => []);
+      const read = await callTool(server, "get_application_context", {
+        applicationId: "app1",
+        pageId: "p1",
+        layoutId: "l1",
+        widget: "Initials",
+      });
+
+      expect(read.body.error).toBeUndefined();
+      expect(JSON.stringify(read.body)).not.toContain(
+        '"widgetName":"Licenses"',
+      );
+      expect(
+        (read.body.page as { layouts: { dsl?: unknown }[] }).layouts.every(
+          (l) => l.dsl === undefined,
+        ),
+      ).toBe(true);
+      expect(
+        (read.body.layout as { dsl: { widgetName: string } }).dsl.widgetName,
+      ).toBe("Initials");
+      const full = await callTool(server, "get_application_context", {
+        applicationId: "app1",
+        pageId: "p1",
+        layoutId: "l1",
+      });
+
+      expect(JSON.stringify(full.body)).toContain('"widgetName":"Licenses"');
+    });
+    const wire = async (
+      server: ReturnType<typeof setup>["server"],
+      arg: unknown,
+    ) =>
+      callTool(server, "wire_event", {
+        applicationId: "app1",
+        pageId: "p1",
+        layoutId: "l1",
+        revision: fingerprintDsl(dsl as never),
+        spec: {
+          widget: "Submit",
+          event: "onClick",
+          action: {
+            call: { object: "Utils", function: "save", args: [{ expr: arg }] },
+          },
+        },
+      });
+
+    it.each([false, true])(
+      "checks expression queries with dataEnabled=%s",
+      async (enabled) => {
+        const good = setup(async () => [{ name: "GetUsage" }], enabled);
+
+        expect(
+          (await wire(good.server, { query: "GetUsage" })).body.error,
+        ).toBeUndefined();
+        expect(good.updateLayout).toHaveBeenCalledTimes(1);
+        const missing = setup(async () => [], enabled);
+
+        expect(
+          (await wire(missing.server, { query: "GetUsage" })).body.error,
+        ).toMatch(/was not found/);
+        expect(missing.updateLayout).not.toHaveBeenCalled();
+        const down = setup(async () => {
+          throw new Error("down");
+        }, enabled);
+
+        expect(
+          (await wire(down.server, { query: "GetUsage" })).body.error,
+        ).toMatch(/cannot be checked/);
+        expect(down.updateLayout).not.toHaveBeenCalled();
+      },
+    );
+    it("refuses a table expression on an input and permits a real table", async () => {
+      const { server, updateLayout } = setup(async () => []);
+
+      expect(
+        (await wire(server, { table: "Initials", column: "id" })).body.error,
+      ).toMatch(/not a table widget/);
+      expect(updateLayout).not.toHaveBeenCalled();
+      expect(
+        (await wire(server, { table: "Licenses", column: "id" })).body.error,
+      ).toBeUndefined();
+      expect(updateLayout).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+// M5 — build_application returns editor/viewer URLs for the default page and AUTO-PUBLISHES the app it just
+// created (governed: change record; ungoverned: structured telemetry event; failure: warning, never a failed create).
+describe("M5 — build_application URLs + auto-publish", () => {
+  const IMPORT_RESPONSE = {
+    application: {
+      id: "app123",
+      slug: "demo-app",
+      pages: [
+        { id: "page2", slug: "other", isDefault: false },
+        { id: "page1", slug: "home", isDefault: true },
+      ],
+    },
+    isPartialImport: false,
+  };
+
+  // M9-F2: build_application now sources page slugs for the URLs from the pages DTO (getApplicationPages), not the
+  // import response — the live import response's pages carry no slugs. This is the realistic 200 pages-DTO shape.
+  const PAGES_DTO = {
+    application: { id: "app123", slug: "demo-app" },
+    pages: [
+      { id: "page2", slug: "other", isDefault: false },
+      { id: "page1", slug: "home", isDefault: true },
+    ],
+  };
+
+  const APP_SPEC = {
+    name: "Demo",
+    pages: [{ name: "Home", widgets: [{ type: "text", text: "Hi" }] }],
+  };
+
+  function makeApi(overrides: Partial<AppsmithApi> = {}): AppsmithApi {
+    return {
+      ...createApi()(),
+      importApplicationArtifact: jest.fn(async () => IMPORT_RESPONSE),
+      getApplicationPages: jest.fn(async () => PAGES_DTO),
+      ...overrides,
+    };
+  }
+
+  // The origin is captured ONCE per session from the initialize request, so header-derivation tests set the
+  // forged/forwarded headers on the initialize call only.
+  async function initSession(
+    server: ReturnType<typeof createMcpHttpServer>,
+    headers: Record<string, string> = {},
+  ) {
+    let request = supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token");
+
+    for (const [name, value] of Object.entries(headers)) {
+      request = request.set(name, value);
+    }
+
+    const initialized = await request.send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    let follow = supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId);
+
+    // A configured Host allowlist applies to EVERY request, so the follow-up must carry the same Host.
+    for (const [name, value] of Object.entries(headers)) {
+      follow = follow.set(name, value);
+    }
+
+    await follow.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    return sessionId;
+  }
+
+  async function buildApplication(
+    server: ReturnType<typeof createMcpHttpServer>,
+    sessionId: string,
+    headers: Record<string, string> = {},
+  ) {
+    let request = supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId);
+
+    for (const [name, value] of Object.entries(headers)) {
+      request = request.set(name, value);
+    }
+
+    const call = await request.send({
+      jsonrpc: "2.0",
+      id: 30,
+      method: "tools/call",
+      params: {
+        name: "build_application",
+        arguments: { workspaceId: "ws1", app: APP_SPEC },
+      },
+    });
+
+    return JSON.parse(parseJsonRpc(call).result.content[0].text);
+  }
+
+  it("returns root-relative URLs for the default page and publishes the new app", async () => {
+    const api = makeApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const body = await buildApplication(server, await initSession(server));
+
+    expect(body.applicationId).toBe("app123");
+    expect(body.pages).toEqual([
+      { id: "page2", slug: "other", isDefault: false },
+      { id: "page1", slug: "home", isDefault: true },
+    ]);
+    // No configured or derivable origin -> root-relative URLs (never a guessed absolute origin), built from the
+    // DEFAULT page even when it is not first in the list.
+    expect(body.editorUrl).toBe("/app/demo-app/home-page1/edit");
+    expect(body.viewerUrl).toBe("/app/demo-app/home-page1");
+    expect(body.warnings).toBeUndefined();
+    expect(body.diagnostics).toBeDefined();
+    expect(api.publishApplication).toHaveBeenCalledWith("app123");
+  });
+
+  it("F3: attaches the default page's layoutId (from GET /pages/{pageId}) to that page in the result", async () => {
+    const getPage = jest.fn(async () => ({
+      id: "page1",
+      layouts: [{ id: "layout-page1" }],
+    }));
+    const api = makeApi({ getPage });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const body = await buildApplication(server, await initSession(server));
+
+    // The layoutId is fetched for the DEFAULT page (page1) and attached ONLY to it.
+    expect(getPage).toHaveBeenCalledWith("page1");
+    expect(body.pages).toEqual([
+      { id: "page2", slug: "other", isDefault: false },
+      { id: "page1", slug: "home", isDefault: true, layoutId: "layout-page1" },
+    ]);
+  });
+
+  it("F3: omits layoutId (never fails the build) when the page fetch has no layouts", async () => {
+    const api = makeApi({ getPage: jest.fn(async () => ({ id: "page1" })) });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const body = await buildApplication(server, await initSession(server));
+
+    expect(body.pages).toEqual([
+      { id: "page2", slug: "other", isDefault: false },
+      { id: "page1", slug: "home", isDefault: true },
+    ]);
+  });
+
+  it("builds absolute URLs from the configured public origin", async () => {
+    const api = makeApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      publicOrigin: "https://apps.example.com",
+    });
+    const body = await buildApplication(server, await initSession(server));
+
+    expect(body.editorUrl).toBe(
+      "https://apps.example.com/app/demo-app/home-page1/edit",
+    );
+    expect(body.viewerUrl).toBe(
+      "https://apps.example.com/app/demo-app/home-page1",
+    );
+  });
+
+  it("derives the origin from validated X-Forwarded-Proto + Host at initialize", async () => {
+    const api = makeApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const sessionId = await initSession(server, {
+      "X-Forwarded-Proto": "https",
+      Host: "apps.example.com",
+    });
+    const body = await buildApplication(server, sessionId);
+
+    expect(body.viewerUrl).toBe(
+      "https://apps.example.com/app/demo-app/home-page1",
+    );
+  });
+
+  it("falls back to root-relative URLs on a forged proto or hostile Host", async () => {
+    const api = makeApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+
+    const forgedProto = await buildApplication(
+      server,
+      await initSession(server, {
+        "X-Forwarded-Proto": "javascript",
+        Host: "apps.example.com",
+      }),
+    );
+
+    expect(forgedProto.editorUrl).toBe("/app/demo-app/home-page1/edit");
+
+    // A Host that fails the hostname charset (underscore) — header-legal, so it reaches the derivation and is
+    // refused there; the harsher injection shapes ("<script>", brackets) are unit-tested on sessionOriginFromHeaders.
+    const hostileHost = await buildApplication(
+      server,
+      await initSession(server, {
+        "X-Forwarded-Proto": "https",
+        Host: "evil_example.com",
+      }),
+    );
+
+    expect(hostileHost.viewerUrl).toBe("/app/demo-app/home-page1");
+  });
+
+  it("honors the Host allowlist when deriving the origin from headers", async () => {
+    const api = makeApi();
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      allowedHosts: ["apps.example.com"],
+    });
+    const allowedHeaders = {
+      "X-Forwarded-Proto": "https",
+      Host: "apps.example.com",
+    };
+    const body = await buildApplication(
+      server,
+      await initSession(server, allowedHeaders),
+      allowedHeaders,
+    );
+
+    // An allowlisted host still derives an absolute origin; a non-member host is rejected at the HTTP layer
+    // (403) before any session exists, and sessionOriginFromHeaders additionally refuses it (unit-tested above).
+    expect(body.viewerUrl).toBe(
+      "https://apps.example.com/app/demo-app/home-page1",
+    );
+  });
+
+  it("omits the URLs (but keeps ids) when the pages DTO lacks slugs", async () => {
+    const api = makeApi({
+      importApplicationArtifact: jest.fn(async () => ({
+        application: {
+          id: "app123",
+          pages: [{ id: "page1", isDefault: true }],
+        },
+      })),
+      // The URL slugs come from the pages DTO now (F2); a slug-less DTO must omit the URLs.
+      getApplicationPages: jest.fn(async () => ({
+        application: { id: "app123" },
+        pages: [{ id: "page1", isDefault: true }],
+      })),
+    });
+    // Even with an origin configured, a missing slug must omit the URLs rather than construct a broken path.
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      publicOrigin: "https://apps.example.com",
+    });
+    const body = await buildApplication(server, await initSession(server));
+
+    expect(body.applicationId).toBe("app123");
+    expect(body.pages).toEqual([{ id: "page1", isDefault: true }]);
+    expect(body.editorUrl).toBeUndefined();
+    expect(body.viewerUrl).toBeUndefined();
+    expect(api.publishApplication).toHaveBeenCalledWith("app123");
+  });
+
+  it("degrades a publish failure to a coarse warning while the create still succeeds", async () => {
+    const api = makeApi({
+      publishApplication: jest.fn(async () => {
+        throw new Error("Appsmith API request failed (503)");
+      }),
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const body = await buildApplication(server, await initSession(server));
+
+    expect(body.applicationId).toBe("app123");
+    expect(body.editorUrl).toBe("/app/demo-app/home-page1/edit");
+    expect(body.warnings).toEqual(["created but not deployed: server_error"]);
+    // Only the coarse class survives — never the raw upstream error text.
+    expect(JSON.stringify(body)).not.toContain("Appsmith API request failed");
+  });
+
+  it("emits the auto-publish telemetry event on ungoverned deployments (hashed actor, coarse class)", async () => {
+    const events: Record<string, unknown>[] = [];
+    const stderrSpy = jest
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        const line = typeof chunk === "string" ? chunk : chunk.toString();
+
+        try {
+          events.push(JSON.parse(line));
+        } catch {
+          // Non-JSON writes are irrelevant to this assertion.
+        }
+
+        return true;
+      });
+
+    try {
+      const api = makeApi();
+      const server = createMcpHttpServer(API_BASE_URL, () => api);
+
+      await buildApplication(server, await initSession(server));
+
+      const event = events.find(
+        (entry) => entry.event === "appsmith_mcp_auto_publish",
+      );
+
+      expect(event).toMatchObject({
+        statusClass: "success",
+        usernameHash: createHash("sha256")
+          .update("user@appsmith.com")
+          .digest("hex"),
+      });
+      // The caller's identity is only ever recorded as a hash, never in plaintext.
+      expect(JSON.stringify(event)).not.toContain("user@appsmith.com");
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  class MemoryStore implements McpGovernanceStore {
+    readonly changes: McpChangeRecord[] = [];
+    readonly confirmations = new Map<string, PreparedConfirmation>();
+    locked = new Set<string>();
+
+    async acquireLock(entityKey: string): Promise<string | undefined> {
+      if (this.locked.has(entityKey)) return undefined;
+
+      this.locked.add(entityKey);
+
+      return `lock:${entityKey}`;
+    }
+    async releaseLock(entityKey: string): Promise<void> {
+      this.locked.delete(entityKey);
+    }
+    async createConfirmation(c: PreparedConfirmation): Promise<void> {
+      this.confirmations.set(c.id, c);
+    }
+    async consumeConfirmation(
+      id: string,
+    ): Promise<PreparedConfirmation | undefined> {
+      const c = this.confirmations.get(id);
+
+      this.confirmations.delete(id);
+
+      return c;
+    }
+    async peekConfirmation(
+      id: string,
+    ): Promise<PreparedConfirmation | undefined> {
+      return this.confirmations.get(id);
+    }
+    async saveChange(change: McpChangeRecord): Promise<void> {
+      this.changes.push(change);
+    }
+    async getChange(
+      id: string,
+      actorId: string,
+      organizationId: string,
+    ): Promise<McpChangeRecord | undefined> {
+      return this.changes.find(
+        (c) =>
+          c.id === id &&
+          c.actorId === actorId &&
+          c.organizationId === organizationId,
+      );
+    }
+    async listChanges(
+      actorId: string,
+      organizationId: string,
+      limit: number,
+    ): Promise<McpChangeRecord[]> {
+      return this.changes
+        .filter(
+          (c) => c.actorId === actorId && c.organizationId === organizationId,
+        )
+        .slice(-limit)
+        .reverse();
+    }
+    async getAnyChange(
+      id: string,
+      organizationId: string,
+    ): Promise<McpChangeRecord | undefined> {
+      return this.changes.find(
+        (c) => c.id === id && c.organizationId === organizationId,
+      );
+    }
+    async listAllChanges(
+      organizationId: string,
+      limit: number,
+    ): Promise<McpChangeRecord[]> {
+      return this.changes
+        .filter((c) => c.organizationId === organizationId)
+        .slice(-limit)
+        .reverse();
+    }
+  }
+
+  it("records the governed auto-publish as an auto_publish change record", async () => {
+    const store = new MemoryStore();
+    // The governed path reuses this single pages read for BOTH the revision fingerprint and the F2 URLs, so it must
+    // carry the app slug + page slugs (the realistic pages DTO), not a bare page list.
+    const api = makeApi({
+      getApplicationPages: jest.fn(async () => ({
+        application: { id: "app123", slug: "demo-app" },
+        pages: [{ id: "page1", name: "Home", slug: "home", isDefault: true }],
+      })),
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const body = await buildApplication(server, await initSession(server));
+
+    expect(api.publishApplication).toHaveBeenCalledWith("app123");
+    expect(body.warnings).toBeUndefined();
+    expect(body.editorUrl).toBe("/app/demo-app/home-page1/edit");
+
+    // The deploy is never silent under governance: it leaves an attributed change record, like confirm_publish.
+    const change = store.changes.find(
+      (entry) => entry.operation === "auto_publish",
+    );
+
+    expect(change).toBeDefined();
+    expect(change?.actorId).toBe("user@appsmith.com");
+    expect(change?.entityKey).toBe("application:app123");
+    expect(change?.summary).toMatchObject({ applicationId: "app123" });
+  });
+
+  it("degrades a GOVERNED auto-publish failure to the same coarse warning (create succeeds, no change record)", async () => {
+    const store = new MemoryStore();
+    const api = makeApi({
+      publishApplication: jest.fn(async () => {
+        throw new Error("Appsmith API request failed (503)");
+      }),
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      governance: new McpGovernanceCoordinator(store),
+    });
+    const body = await buildApplication(server, await initSession(server));
+
+    // The create still succeeds with its URLs; only the deploy degrades to the coarse warning.
+    expect(body.applicationId).toBe("app123");
+    expect(body.editorUrl).toBe("/app/demo-app/home-page1/edit");
+    expect(body.warnings).toEqual(["created but not deployed: server_error"]);
+    expect(JSON.stringify(body)).not.toContain("Appsmith API request failed");
+    // A FAILED governed deploy leaves no auto_publish change record — nothing was executed.
+    expect(
+      store.changes.find((entry) => entry.operation === "auto_publish"),
+    ).toBeUndefined();
+  });
+
+  it("classifies a 4xx publish failure as client_error and a non-HTTP failure as the 'error' fallback", async () => {
+    const clientError = makeApi({
+      publishApplication: jest.fn(async () => {
+        throw new Error("Appsmith API request failed (403)");
+      }),
+    });
+    const clientServer = createMcpHttpServer(API_BASE_URL, () => clientError);
+    const clientBody = await buildApplication(
+      clientServer,
+      await initSession(clientServer),
+    );
+
+    expect(clientBody.warnings).toEqual([
+      "created but not deployed: client_error",
+    ]);
+
+    // A non-HTTP failure (no "(NNN)" status in the message) falls back to the coarse "error" class —
+    // and the raw message still never leaks.
+    const nonHttp = makeApi({
+      publishApplication: jest.fn(async () => {
+        throw new Error("socket hang up");
+      }),
+    });
+    const nonHttpServer = createMcpHttpServer(API_BASE_URL, () => nonHttp);
+    const nonHttpBody = await buildApplication(
+      nonHttpServer,
+      await initSession(nonHttpServer),
+    );
+
+    expect(nonHttpBody.warnings).toEqual(["created but not deployed: error"]);
+    expect(JSON.stringify(nonHttpBody)).not.toContain("socket hang up");
+  });
+
+  it("projects ids and URLs from a bare (non-DTO-wrapped) import response", async () => {
+    const api = makeApi({
+      // Older import shapes return the application object directly, not { application, isPartialImport }.
+      importApplicationArtifact: jest.fn(async () => ({
+        id: "app123",
+        slug: "demo-app",
+        pages: [{ id: "page1", slug: "home", isDefault: true }],
+      })),
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api);
+    const body = await buildApplication(server, await initSession(server));
+
+    expect(body.applicationId).toBe("app123");
+    expect(body.editorUrl).toBe("/app/demo-app/home-page1/edit");
+    expect(body.viewerUrl).toBe("/app/demo-app/home-page1");
+    expect(api.publishApplication).toHaveBeenCalledWith("app123");
+  });
+
+  // The M5 acceptance-test seam, closed: ONE continuous pipeline from build (store-bound table) through wiring
+  // both buttons against the DSL the build actually imported — no per-step fixture resets.
+  it("pipeline: build a store-bound table, then wire lookup (appendToStore fields) and clear (clearStoreKey + reset)", async () => {
+    const STORE_APP_SPEC = {
+      name: "ZipLookup",
+      pages: [
+        {
+          name: "Home",
+          widgets: [
+            {
+              type: "input",
+              name: "ZipInput",
+              label: "Zip",
+              validation: { format: "zipcode" },
+            },
+            { type: "button", name: "LookupButton", text: "Lookup" },
+            { type: "button", name: "ClearButton", text: "Clear" },
+            {
+              type: "table",
+              name: "ZipResults",
+              source: { store: "zipResults" },
+            },
+          ],
+        },
+      ],
+    };
+
+    // The DSL the build imported IS the DSL the wiring edits: captured from the import call, then kept current
+    // through updateLayout, exactly like the live server would serve it back.
+    let currentDsl: Record<string, unknown> | undefined;
+    const api = makeApi({
+      importApplicationArtifact: jest.fn(
+        async (_workspaceId: string, artifact: Record<string, unknown>) => {
+          const pageList = artifact.pageList as {
+            unpublishedPage: { layouts: { dsl: Record<string, unknown> }[] };
+          }[];
+
+          currentDsl = pageList[0].unpublishedPage.layouts[0].dsl;
+
+          return IMPORT_RESPONSE;
+        },
+      ),
+      getApplicationContext: jest.fn(async (applicationId: string) => ({
+        pages: [],
+        page: { applicationId },
+        layout: { dsl: currentDsl },
+      })),
+      updateLayout: jest.fn(
+        async (
+          _app: string,
+          _page: string,
+          _layout: string,
+          dsl: Record<string, unknown>,
+        ) => {
+          currentDsl = dsl;
+
+          return { ok: true };
+        },
+      ) as never,
+      listActions: jest.fn(async () => [
+        { id: "act1", name: "LookupZip", pageId: "page1" },
+      ]),
+    });
+    const server = createMcpHttpServer(API_BASE_URL, () => api, {
+      dataEnabled: true,
+    });
+    const sessionId = await initSession(server);
+
+    async function call(
+      name: string,
+      args: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> {
+      const response = await supertest(server)
+        .post("/mcp")
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", "Bearer mcp_user-token")
+        .set("mcp-session-id", sessionId)
+        .send({
+          jsonrpc: "2.0",
+          id: 31,
+          method: "tools/call",
+          params: { name, arguments: args },
+        });
+
+      return JSON.parse(parseJsonRpc(response).result.content[0].text);
+    }
+
+    const built = await call("build_application", {
+      workspaceId: "ws1",
+      app: STORE_APP_SPEC,
+    });
+
+    // Result URLs present, deploy clean.
+    expect(built.applicationId).toBe("app123");
+    expect(built.editorUrl).toBe("/app/demo-app/home-page1/edit");
+    expect(built.viewerUrl).toBe("/app/demo-app/home-page1");
+    expect(built.warnings).toBeUndefined();
+
+    // The imported DSL carries the store-bound table.
+    const widgets = (currentDsl as { children: Record<string, unknown>[] })
+      .children;
+    const table = widgets.find((w) => w.widgetName === "ZipResults");
+
+    expect(table?.tableData).toBe("{{ appsmith.store.zipResults ?? [] }}");
+
+    // Lookup button: run the query, then append ONE projected row per run (the fields projection).
+    const lookupWired = await call("wire_event", {
+      applicationId: "app123",
+      pageId: "page1",
+      layoutId: "l1",
+      revision: fingerprintDsl(currentDsl as never),
+      spec: {
+        widget: "LookupButton",
+        event: "onClick",
+        action: {
+          run: "LookupZip",
+          onSuccess: [
+            {
+              appendToStore: {
+                key: "zipResults",
+                query: "LookupZip",
+                fields: [
+                  { as: "zip", path: ["post code"] },
+                  { as: "state", path: ["places", 0, "state"] },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    expect(lookupWired.error).toBeUndefined();
+    expect(lookupWired.revision).toBeDefined();
+
+    // Clear button: a statement LIST — empty the store key AND reset the input in one click.
+    const clearWired = await call("wire_event", {
+      applicationId: "app123",
+      pageId: "page1",
+      layoutId: "l1",
+      revision: fingerprintDsl(currentDsl as never),
+      spec: {
+        widget: "ClearButton",
+        event: "onClick",
+        action: [
+          { clearStoreKey: { key: "zipResults" } },
+          { reset: "ZipInput" },
+        ],
+      },
+    });
+
+    expect(clearWired.error).toBeUndefined();
+
+    // The final DSL carries both compiled triggers, wired onto the SAME imported layout.
+    const finalWidgets = (currentDsl as { children: Record<string, unknown>[] })
+      .children;
+    const lookup = finalWidgets.find((w) => w.widgetName === "LookupButton");
+    const clear = finalWidgets.find((w) => w.widgetName === "ClearButton");
+
+    expect(String(lookup?.onClick)).toContain("LookupZip.run(");
+    expect(String(lookup?.onClick)).toContain("storeValue(");
+    expect(String(lookup?.onClick)).toContain("zipResults");
+    expect(String(clear?.onClick)).toContain("storeValue(");
+    expect(String(clear?.onClick)).toContain("resetWidget('ZipInput'");
+  });
+});
+
+describe("close-the-loop — advisory write classifier", () => {
+  const restAction = (method: string) => ({
+    unpublishedAction: {
+      name: "callApi",
+      actionConfiguration: { httpMethod: method },
+    },
+  });
+  const sqlAction = (name: string, body: string) => ({
+    unpublishedAction: { name, actionConfiguration: { body } },
+  });
+
+  it("classifies non-GET REST and mutating SQL as writes", () => {
+    expect(looksLikeWriteAction(restAction("POST"))).toBe(true);
+    expect(looksLikeWriteAction(restAction("DELETE"))).toBe(true);
+    expect(looksLikeWriteAction(restAction("GET"))).toBe(false);
+    expect(
+      looksLikeWriteAction(sqlAction("ins", "INSERT INTO tasks VALUES (1)")),
+    ).toBe(true);
+    expect(
+      looksLikeWriteAction(sqlAction("upd", "  update tasks set done=1")),
+    ).toBe(true);
+    expect(looksLikeWriteAction(sqlAction("sel", "SELECT * FROM tasks"))).toBe(
+      false,
+    );
+  });
+
+  // A body the MCP stores starts with its marker comment, so the keyword is read after it, whether or not the body
+  // was edited since.
+  it("classifies an MCP-marked body by the query after its marker line", () => {
+    const marked = markMcpAuthoredBody("INSERT INTO tasks VALUES (1);");
+
+    expect(looksLikeWriteAction(sqlAction("ins", marked))).toBe(true);
+    expect(
+      looksLikeWriteAction(sqlAction("ins", `${marked} -- edited later`)),
+    ).toBe(true);
+    expect(
+      looksLikeWriteAction(
+        sqlAction("sel", markMcpAuthoredBody("SELECT * FROM tasks;")),
+      ),
+    ).toBe(false);
+  });
+
+  it("is advisory-only: a disguised mutation is missed here, never auto-run", () => {
+    // SELECT calling a mutating function — the fail-closed isAutoRunnableAction gate (not this classifier)
+    // is what protects run_action; this classifier only powers hints.
+    expect(looksLikeWriteAction(sqlAction("sneaky", "SELECT drop_old()"))).toBe(
+      false,
+    );
+  });
+
+  it("writeActionNames extracts only the write subset", () => {
+    const list = [
+      sqlAction("insertTask", "INSERT INTO tasks (name) VALUES ({{a}})"),
+      sqlAction("getTasks", "SELECT * FROM tasks"),
+      restAction("POST"),
+      null,
+      "garbage",
+    ];
+
+    expect(writeActionNames(list)).toEqual(["insertTask", "callApi"]);
+    expect(writeActionNames("not a list")).toEqual([]);
+  });
+});
+
+// APP-16087: the request log line and the backend calls a tool call makes must describe THAT tool call. MCP answers
+// every tool call with HTTP 200, and a session's API client outlives the request that created it.
+describe("MCP request correlation and outcome logging", () => {
+  async function openSession(
+    server: ReturnType<typeof createMcpHttpServer>,
+    headers: Record<string, string> = {},
+  ): Promise<string> {
+    const initialized = await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set(headers)
+      .send(initializeRequest);
+    const sessionId = initialized.headers["mcp-session-id"] as string;
+
+    await supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    return sessionId;
+  }
+
+  function callTool(
+    server: ReturnType<typeof createMcpHttpServer>,
+    sessionId: string,
+    name: string,
+    args: Record<string, unknown>,
+    headers: Record<string, string> = {},
+    id = 7,
+  ) {
+    return supertest(server)
+      .post("/mcp")
+      .set("Accept", "application/json, text/event-stream")
+      .set("Authorization", "Bearer mcp_user-token")
+      .set("mcp-session-id", sessionId)
+      .set(headers)
+      .send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args },
+      });
+  }
+
+  function captureEvents(): {
+    events: Record<string, unknown>[];
+    restore: () => void;
+  } {
+    const events: Record<string, unknown>[] = [];
+    const spy = jest
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        try {
+          events.push(
+            JSON.parse(typeof chunk === "string" ? chunk : chunk.toString()),
+          );
+        } catch {
+          // Non-JSON writes are irrelevant here.
+        }
+
+        return true;
+      });
+
+    return { events, restore: () => spy.mockRestore() };
+  }
+
+  it("sends the tool call's own correlation headers to the backend, not the session's initialize ones", async () => {
+    const fetchFn = jest.fn<
+      Promise<Response>,
+      [RequestInfo | URL, RequestInit?]
+    >(async (url) => {
+      const path = String(url).slice(API_BASE_URL.length);
+      const data = path.startsWith("/api/v1/users/me")
+        ? {
+            username: "user@appsmith.com",
+            isAnonymous: false,
+            organizationId: "org-1",
+          }
+        : [];
+
+      return new Response(JSON.stringify({ data }), { status: 200 });
+    });
+    const server = createMcpHttpServer(API_BASE_URL, (token, headers) =>
+      createAppsmithApi(
+        token,
+        API_BASE_URL,
+        fetchFn as unknown as typeof fetch,
+        headers,
+      ),
+    );
+    const sessionId = await openSession(server, {
+      "X-Appsmith-Request-Id": "initialize-request",
+      "X-Request-Id": "initialize-client-request",
+    });
+
+    await callTool(
+      server,
+      sessionId,
+      "list_workspaces",
+      {},
+      { "X-Appsmith-Request-Id": "tool-call-request" },
+    );
+
+    const toolCall = fetchFn.mock.calls.find(([url]) =>
+      String(url).endsWith("/api/v1/workspaces/home"),
+    );
+
+    expect(toolCall).toBeDefined();
+    const headers = new Headers(toolCall?.[1]?.headers);
+
+    expect(headers.get("X-Appsmith-Request-Id")).toBe("tool-call-request");
+    // The tool call carried no client request id, so none of the initialize request's leaks onto it.
+    expect(headers.get("X-Request-Id")).toBeNull();
+  });
+
+  it.each([
+    {
+      label: "a successful call",
+      tool: "list_workspaces",
+      args: {},
+      api: { listWorkspaces: jest.fn(async () => []) },
+      expected: { statusClass: "success" },
+    },
+    {
+      label: "a refusal carrying the tool's code",
+      tool: "create_datasource",
+      args: { workspaceId: "ws1", name: "Sheet", plugin: "googlesheets" },
+      api: {},
+      expected: { statusClass: "refused", toolCode: "needs_ui_oauth" },
+    },
+    {
+      label: "a backend failure",
+      tool: "list_workspaces",
+      args: {},
+      api: {
+        listWorkspaces: jest.fn(async () => {
+          throw new Error("Appsmith API request failed (401)");
+        }),
+      },
+      expected: { statusClass: "tool_error" },
+    },
+    {
+      label: "a spec the tool rejects",
+      tool: "validate_app_spec",
+      args: {
+        app: {
+          name: "Demo",
+          pages: [{ name: "Home", widgets: [{ type: "no_such_widget" }] }],
+        },
+      },
+      api: {},
+      expected: { statusClass: "invalid_input" },
+    },
+    {
+      label: "arguments the SDK rejects before the tool runs",
+      tool: "list_applications",
+      args: { workspaceId: 42 },
+      api: {},
+      expected: { statusClass: "invalid_input" },
+    },
+    {
+      label: "a tool that does not exist",
+      tool: "no_such_tool",
+      args: {},
+      api: {},
+      expected: { statusClass: "invalid_input" },
+    },
+    {
+      label: "a large successful result (classified without re-parsing it)",
+      tool: "list_workspaces",
+      args: {},
+      api: {
+        listWorkspaces: jest.fn(async () =>
+          Array.from({ length: 2000 }, (_, index) => ({
+            id: `ws-${index}`,
+            name: `Workspace ${index} with a long enough name to grow the result`,
+          })),
+        ),
+      },
+      expected: { statusClass: "success" },
+    },
+  ])(
+    "logs $label with the tool's outcome, not the HTTP 200",
+    async ({ api, args, expected, tool }) => {
+      const { events, restore } = captureEvents();
+
+      try {
+        const server = createMcpHttpServer(
+          API_BASE_URL,
+          () => ({ ...createApi()(), ...api }) as AppsmithApi,
+          { dataEnabled: true },
+        );
+        const sessionId = await openSession(server);
+        const response = await callTool(server, sessionId, tool, args);
+
+        expect(response.status).toBe(200);
+
+        const toolEvent = events.find(
+          (event) =>
+            event.event === "appsmith_mcp_request" && event.tool === tool,
+        );
+
+        expect(toolEvent).toMatchObject({ status: 200, ...expected });
+
+        if (!("toolCode" in expected)) {
+          expect(toolEvent?.toolCode).toBeUndefined();
+        }
+
+        // Only the class and the tool's own code are logged: no message text or arguments.
+        const serialized = JSON.stringify(toolEvent);
+
+        expect(serialized).not.toContain("Appsmith API request failed");
+        expect(serialized).not.toContain("OAuth");
+        expect(serialized).not.toContain("ws1");
+      } finally {
+        restore();
+      }
+    },
+  );
+
+  it("keeps two overlapping tool calls on one session on their own correlation ids", async () => {
+    // Call A is held at its authentication step until call B has started, so B's request is underway before A builds
+    // the headers of its backend call. Anything shared between requests would hand A the later request's id.
+    let holdAuth = false;
+    let authCalls = 0;
+    let firstHeld: () => void = () => {};
+    const firstAuthArrived = new Promise<void>((resolve) => {
+      firstHeld = resolve;
+    });
+    let releaseFirst: () => void = () => {};
+    const secondAuthArrived = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const fetchFn = jest.fn<
+      Promise<Response>,
+      [RequestInfo | URL, RequestInit?]
+    >(async (url) => {
+      const path = String(url).slice(API_BASE_URL.length);
+
+      if (path.startsWith("/api/v1/users/me")) {
+        if (holdAuth) {
+          authCalls += 1;
+
+          if (authCalls === 1) {
+            firstHeld();
+            await secondAuthArrived;
+          } else {
+            releaseFirst();
+          }
+        }
+
+        return new Response(
+          JSON.stringify({
+            data: {
+              username: "user@appsmith.com",
+              isAnonymous: false,
+              organizationId: "org-1",
+            },
+          }),
+          { status: 200 },
+        );
+      }
+
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    });
+    const server = createMcpHttpServer(API_BASE_URL, (token, headers) =>
+      createAppsmithApi(
+        token,
+        API_BASE_URL,
+        fetchFn as unknown as typeof fetch,
+        headers,
+      ),
+    );
+    const sessionId = await openSession(server, {
+      "X-Appsmith-Request-Id": "initialize-request",
+    });
+
+    holdAuth = true;
+
+    const callA = callTool(
+      server,
+      sessionId,
+      "list_workspaces",
+      {},
+      { "X-Appsmith-Request-Id": "call-a" },
+    ).then((response) => response);
+
+    await firstAuthArrived;
+
+    const callB = callTool(
+      server,
+      sessionId,
+      "list_workspaces",
+      {},
+      { "X-Appsmith-Request-Id": "call-b" },
+      8,
+    ).then((response) => response);
+
+    await Promise.all([callA, callB]);
+
+    const ids = fetchFn.mock.calls
+      .filter(([url]) => String(url).endsWith("/api/v1/workspaces/home"))
+      .map(([, init]) =>
+        new Headers(init?.headers).get("X-Appsmith-Request-Id"),
+      )
+      .sort();
+
+    expect(ids).toEqual(["call-a", "call-b"]);
+  });
+
+  it("keeps the HTTP-derived class for requests that are not tool calls", async () => {
+    const { events, restore } = captureEvents();
+
+    try {
+      const server = createMcpHttpServer(API_BASE_URL, createApi());
+      const sessionId = await openSession(server);
+
+      await supertest(server)
+        .post("/mcp")
+        .set("Accept", "application/json, text/event-stream")
+        .set("Authorization", "Bearer mcp_user-token")
+        .set("mcp-session-id", sessionId)
+        .send({ jsonrpc: "2.0", id: 9, method: "tools/list" });
+
+      const listEvent = events.find(
+        (event) =>
+          event.event === "appsmith_mcp_request" &&
+          event.mcpMethod === "tools/list",
+      );
+
+      expect(listEvent).toMatchObject({ status: 200, statusClass: "success" });
+      expect(listEvent?.tool).toBeUndefined();
+      expect(listEvent?.toolCode).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+});

@@ -1,26 +1,24 @@
 import React, { useEffect, useCallback } from "react";
-import styled, { AnyStyledComponent } from "styled-components";
+import styled from "styled-components";
 import { Classes } from "@blueprintjs/core";
 import { Colors } from "constants/Colors";
-import {
+import type {
   ReactTableColumnProps,
   ReactTableFilter,
   Operator,
-  OperatorTypes,
 } from "./Constants";
-import { DropdownOption } from "./TableFilters";
+import { OperatorTypes } from "./Constants";
+import type { DropdownOption } from "./TableFilters";
 import Button from "components/editorComponents/Button";
 import CascadeFields from "./CascadeFields";
 import {
   createMessage,
   TABLE_FILTER_COLUMN_TYPE_CALLOUT,
-} from "constants/messages";
+} from "ee/constants/messages";
 import { ControlIcons } from "icons/ControlIcons";
-import Icon, { IconSize } from "components/ads/Icon";
+import { Icon, IconSize } from "@design-system/widgets-old";
 
-const StyledPlusCircleIcon = styled(
-  ControlIcons.ADD_CIRCLE_CONTROL as AnyStyledComponent,
-)`
+const StyledPlusCircleIcon = styled(ControlIcons.ADD_CIRCLE_CONTROL)`
   padding: 0;
   position: relative;
   cursor: pointer;
@@ -73,7 +71,6 @@ const ButtonActionsWrapper = styled.div`
 // margin-left is same as move block width in TableFilterPane.tsx
 const ColumnTypeBindingMessage = styled.div`
   height: 40px;
-  line-height: 40px;
   background: ${Colors.WHITE_SNOW};
   box-sizing: border-box;
   font-size: 12px;
@@ -112,6 +109,8 @@ interface TableFilterProps {
   applyFilter: (filters: ReactTableFilter[]) => void;
   hideFilterPane: (widgetId: string) => void;
   widgetId: string;
+  accentColor: string;
+  borderRadius: string;
 }
 
 const DEFAULT_FILTER = {
@@ -128,18 +127,22 @@ function TableFilterPaneContent(props: TableFilterProps) {
 
   useEffect(() => {
     const filters: ReactTableFilter[] = props.filters ? [...props.filters] : [];
+
     if (filters.length === 0) {
       filters.push({ ...DEFAULT_FILTER });
     }
+
     updateFilters(filters);
   }, [props.filters]);
 
   const addFilter = () => {
     const updatedFilters = filters ? [...filters] : [];
     let operator: Operator = OperatorTypes.OR;
+
     if (updatedFilters.length >= 2) {
       operator = updatedFilters[1].operator;
     }
+
     updatedFilters.push({ ...DEFAULT_FILTER, operator });
     updateFilters(updatedFilters);
   };
@@ -159,6 +162,7 @@ function TableFilterPaneContent(props: TableFilterProps) {
   const columns: DropdownOption[] = props.columns
     .map((column: ReactTableColumnProps) => {
       const type = column.metaProperties?.type || "text";
+
       return {
         label: column.Header,
         value: column.accessor,
@@ -175,6 +179,7 @@ function TableFilterPaneContent(props: TableFilterProps) {
     filters[0].column &&
     filters[0].condition
   );
+
   return (
     <TableFilterOuterWrapper
       onClick={(e) => {
@@ -193,12 +198,15 @@ function TableFilterPaneContent(props: TableFilterProps) {
         {filters.map((filter: ReactTableFilter, index: number) => {
           return (
             <CascadeFields
+              accentColor={props.accentColor}
               applyFilter={(filter: ReactTableFilter, index: number) => {
                 // here updated filters store in state, not in redux
                 const updatedFilters = filters ? [...filters] : [];
+
                 updatedFilters[index] = filter;
                 updateFilters(updatedFilters);
               }}
+              borderRadius={props.borderRadius}
               column={filter.column}
               columns={columns}
               condition={filter.condition}
@@ -212,13 +220,16 @@ function TableFilterPaneContent(props: TableFilterProps) {
                 if (index === 1 && filters.length > 2) {
                   filters[2].operator = filters[1].operator;
                 }
+
                 const newFilters = [
                   ...filters.slice(0, index),
                   ...filters.slice(index + 1),
                 ];
+
                 if (newFilters.length === 0) {
                   newFilters.push({ ...DEFAULT_FILTER });
                 }
+
                 // removed filter directly update redux
                 // with redux update, useEffect will update local state too
                 props.applyFilter(newFilters);

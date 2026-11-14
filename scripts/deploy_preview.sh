@@ -1,0 +1,166 @@
+#!/bin/bash
+# Params are in environment variables as PARAM_{SLUG}, e.g. PARAM_USER_ID
+
+set -euo pipefail
+
+edition="ce"
+
+# AWS credentials are provided via OIDC (configure-aws-credentials action)
+export region="ap-south-1"
+export cluster_name="uatx-cluster"
+
+echo "Region: $region"
+echo "Cluster name: $cluster_name"
+echo "Pull Request Number: $PULL_REQUEST_NUMBER"
+
+# Set naming context
+export NAMESPACE="$edition$PULL_REQUEST_NUMBER"
+export CHARTNAME="$edition$PULL_REQUEST_NUMBER"
+export SECRET="$edition$PULL_REQUEST_NUMBER"
+export DBNAME="$edition$PULL_REQUEST_NUMBER"
+export DOMAINNAME="$edition-$PULL_REQUEST_NUMBER.dp.appsmith.com"
+export HELMCHART="appsmith"
+export HELMCHART_URL="http://helm-ee.appsmith.com"
+
+# Optional environment variables (already set externally)
+export OPENAI_ASSISTANT_ID="$OPENAI_ASSISTANT_ID"
+export OPENAI_API_KEY="$OPENAI_API_KEY"
+export APPSMITH_CARBON_API_KEY="$APPSMITH_CARBON_API_KEY"
+export APPSMITH_CARBON_API_BASE_PATH="$APPSMITH_CARBON_API_BASE_PATH"
+export APPSMITH_AI_SERVER_MANAGED_HOSTING="$APPSMITH_AI_SERVER_MANAGED_HOSTING"
+export APPSMITH_BETTERBUGS_API_KEY="$APPSMITH_BETTERBUGS_API_KEY"
+export APPSMITH_PYLON_APP_ID="${APPSMITH_PYLON_APP_ID:-}"
+export APPSMITH_SEGMENT_CE_KEY="${APPSMITH_SEGMENT_CE_KEY:-}"
+
+# Update kubeconfig
+aws eks update-kubeconfig --region "$region" --name "$cluster_name"
+
+kubectl config set-context --current --namespace=default
+kubectl get pods
+
+# Optional cleanup logic
+if [[ -n "${RECREATE-}" ]]; then
+  echo "Wiping the DP from MongoDB and Kubernetes since the reset flag was set"
+  pod_name="$(kubectl get pods -n "$NAMESPACE" -o json | jq -r '.items[0].metadata.name')"
+  # execute this db.dropDatabase() from the k8s cluster because there's network restrictions on Atlas cluster.
+  # The \$ is used to escape the $ character in the APPSMITH_DB_URL environment variable so it's interpolated inside the kubectl exec command.
+  kubectl exec "$pod_name" -n "$NAMESPACE" -- bash -c "mongosh \$APPSMITH_DB_URL --eval 'db.dropDatabase()'"
+  kubectl exec "$pod_name" -n "$NAMESPACE" -- bash -c "supervisorctl stop all && rm -rf /appsmith-stacks/*"
+  kubectl delete ns "$NAMESPACE" || true
+  kubectl patch pv "$NAMESPACE-appsmith" -p '{"metadata":{"finalizers":null}}' || true
+  kubectl delete pv "$NAMESPACE-appsmith" --grace-period=0 --force || true
+  echo "DP wiped from MongoDB and Kubernetes"
+fi
+
+# Create namespace and image pull secret
+kubectl create ns "$NAMESPACE" || true
+
+# Each preview's EFS volume is provisioned by the appsmith-dp-efs-<edition>
+# StorageClass: one access point per claim, rooted at /<edition>/<namespace> on
+# the deploy preview file system, created with the claim and removed with it.
+# The directory stays. The chart mounts this claim through
+# persistence.existingClaim. Keep exactly one data claim per namespace: two
+# claims on the same class in one namespace share the same directory.
+export PVC_NAME="$CHARTNAME-efs"
+kubectl apply -n "$NAMESPACE" -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: $PVC_NAME
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: appsmith-dp-efs-$edition
+  resources:
+    requests:
+      storage: 10Gi
+EOF
+
+kubectl create secret docker-registry "$SECRET" \
+  --docker-server=https://index.docker.io/v1/ \
+  --docker-username="$DOCKER_HUB_USERNAME" \
+  --docker-password="$DOCKER_HUB_ACCESS_TOKEN" \
+  -n "$NAMESPACE" || true
+
+# A preview runs against staging, so the staging license server URL and analytics keys
+# override the image defaults. APPSMITH_MIXPANEL_KEY must be empty, and the chart omits
+# empty applicationConfig values from its ConfigMap, so it is delivered through a Secret
+# that the chart mounts with envFrom.
+kubectl apply -n "$NAMESPACE" -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $CHARTNAME-env
+type: Opaque
+stringData:
+  APPSMITH_MIXPANEL_KEY: ""
+EOF
+
+# Add Helm repo (idempotent)
+AWS_REGION=us-east-2 helm repo add appsmith-ee "$HELMCHART_URL" || echo "Helm repo already added."
+helm repo update
+
+# Attempt to install the plugin only if it's not installed
+if ! helm plugin list | grep -q mapkubeapis; then
+  echo "Installing mapkubeapis plugin..."
+  helm plugin install https://github.com/helm/helm-mapkubeapis || echo "Plugin installation failed, continuing..."
+else
+  echo "mapkubeapis plugin already installed."
+fi
+
+# Run mapkubeapis (safe to fail)
+echo "Running helm mapkubeapis (optional)..."
+helm mapkubeapis "$CHARTNAME" -n "$NAMESPACE" || echo "mapkubeapis failed, continuing..."
+
+# Show chart metadata
+helm show chart appsmith-ee/$HELMCHART || echo "helm show chart failed (non-blocking)."
+
+echo "Deploying Appsmith Helm chart..."
+# The rollout annotation changes on every deploy, so the pod restarts even when the image tag is unchanged.
+# A preview's first boot runs every migration against a remote Atlas cluster, so the startup probe allows 30 minutes.
+helm upgrade -i "$CHARTNAME" "appsmith-ee/$HELMCHART" -n "$NAMESPACE" --create-namespace \
+  --set-string podAnnotations.deploy-preview/rollout="$(date -u +%Y%m%dT%H%M%SZ)" \
+  --set _image.repository="${IMAGE_REPOSITORY:-$DOCKER_HUB_ORGANIZATION/appsmith-dp}" \
+  --set _image.tag="${IMAGE_TAG:-$IMAGE_HASH}" \
+  --set _image.pullPolicy="Always" \
+  --set image.pullSecrets="$SECRET" \
+  --set autoscaling.enabled=true \
+  --set autoscaling.minReplicas=1 \
+  --set autoscaling.maxReplicas=1 \
+  --set redis.enabled=false \
+  --set postgresql.enabled=false \
+  --set mongodb.enabled=false \
+  --set probes.startupProbe.periodSeconds=10 \
+  --set probes.startupProbe.failureThreshold=180 \
+  --set ingress.enabled=true \
+  --set "ingress.hosts[0].host=$DOMAINNAME, ingress.hosts[0].paths[0].path=/, ingress.hosts[0].paths[0].pathType=Prefix" \
+  --set autoupdate.enabled=false \
+  --set ingress.className="traefik" \
+  --set persistence.existingClaim.enabled=true \
+  --set persistence.existingClaim.claimName="$PVC_NAME" \
+  --set resources.requests.cpu="1m" \
+  --set resources.requests.memory="3072Mi" \
+  --set podDisruptionBudgets.enabled=false \
+  --set applicationConfig.APPSMITH_SENTRY_DSN="https://abf15a075d1347969df44c746cca7eaa@o296332.ingest.sentry.io/1546547" \
+  --set applicationConfig.APPSMITH_SENTRY_ENVIRONMENT="$NAMESPACE" \
+  --set applicationConfig.APPSMITH_DB_URL="mongodb+srv://$DB_USERNAME:$DB_PASSWORD@$DB_URL/$DBNAME?retryWrites=true&minPoolSize=1&maxPoolSize=10&maxIdleTimeMS=900000&authSource=admin" \
+  --set applicationConfig.OPENAI_ASSISTANT_ID="$OPENAI_ASSISTANT_ID" \
+  --set applicationConfig.OPENAI_API_KEY="$OPENAI_API_KEY" \
+  --set applicationConfig.APPSMITH_CARBON_API_KEY="$APPSMITH_CARBON_API_KEY" \
+  --set applicationConfig.APPSMITH_CARBON_API_BASE_PATH="$APPSMITH_CARBON_API_BASE_PATH" \
+  --set applicationConfig.APPSMITH_AI_SERVER_MANAGED_HOSTING="$APPSMITH_AI_SERVER_MANAGED_HOSTING" \
+  --set applicationConfig.APPSMITH_BETTERBUGS_API_KEY="$APPSMITH_BETTERBUGS_API_KEY" \
+  --set applicationConfig.APPSMITH_PYLON_APP_ID="$APPSMITH_PYLON_APP_ID" \
+  --set applicationConfig.APPSMITH_BASE_URL="https://$DOMAINNAME" \
+  --set applicationConfig.APPSMITH_CUSTOMER_PORTAL_URL="https://release-customer.appsmith.com" \
+  --set applicationConfig.APPSMITH_CLOUD_SERVICES_BASE_URL="https://release-cs.appsmith.com" \
+  --set applicationConfig.APPSMITH_SEGMENT_CE_KEY="$APPSMITH_SEGMENT_CE_KEY" \
+  --set secretName="$CHARTNAME-env" \
+  --set applicationConfig.APPSMITH_RATE_LIMIT="1000" \
+  --set affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=instance_name \
+  --set affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In \
+  --set affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=uatx-shared \
+  --set tolerations[0].key=instance_name \
+  --set tolerations[0].operator=Equal \
+  --set tolerations[0].value=uatx-shared \
+  --set tolerations[0].effect=NoSchedule

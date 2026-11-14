@@ -24,7 +24,7 @@ This command will generate a folder called `helloWorldPlugin` with default sourc
 ```
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <java.version>11</java.version>
+        <java.version>25</java.version>
         <maven.compiler.source>${java.version}</maven.compiler.source>
         <maven.compiler.target>${java.version}</maven.compiler.target>
         <plugin.id>hello-world-plugin</plugin.id>
@@ -178,13 +178,22 @@ The `BasePlugin` & `PluginExecutor` classes define the basic operations of plugi
         plugin.setIconLocation("https://your-plugin-icon-location.png");
         plugin.setDocumentationLink("https://link-to-plugin-documentation.html");
         plugin.setDefaultInstall(true);
+
+        // Field to distinguish if the plugin is supported in air-gap instance, by default all the plugins will be 
+        // supported. One can opt out by adding this field in DB object. Generally SaaS plugins and DB which can't be 
+        // self-hosted can be a candidate for opting out of air-gap
+        plugin.setSupportedForAirGap(false);
+        
+        // Config to set if the plugin has any dependency on cloud-services
+        plugin.setIsDependentOnCS(true);
+        
         try {
             mongoTemplate.insert(plugin);
         } catch (DuplicateKeyException e) {
             log.warn(plugin.getPackageName() + " already present in database.");
         }
 
-        installPluginToAllOrganizations(mongoTemplate, plugin.getId());
+        installPluginToAllWorkspaces(mongoTemplate, plugin.getId());
     }
 ```
 

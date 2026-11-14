@@ -1,0 +1,241 @@
+import {
+  buildCreatePageRequest,
+  buildDeletePageRequest,
+  buildRenamePageRequest,
+  buildSetPageVisibilityRequest,
+  createPageSpecSchema,
+  deletePageSpecSchema,
+  renamePageSpecSchema,
+  setPageVisibilitySpecSchema,
+} from "./pages.js";
+
+const applicationId = "a".repeat(24);
+const pageId = "b".repeat(24);
+const revision = "c".repeat(64);
+
+describe("page CRUD request builders", () => {
+  it("builds a create request with only a compiler-owned blank layout", () => {
+    const request = buildCreatePageRequest(
+      createPageSpecSchema.parse({
+        applicationId,
+        revision,
+        name: "Orders",
+      }),
+    );
+
+    expect(request).toEqual({
+      applicationId,
+      revision,
+      method: "POST",
+      path: "v1/pages",
+      body: {
+        applicationId,
+        name: "Orders",
+        layouts: [
+          {
+            dsl: {
+              widgetName: "MainContainer",
+              backgroundColor: "none",
+              rightColumn: 1242,
+              snapColumns: 64,
+              widgetId: "0",
+              topRow: 0,
+              bottomRow: 1292,
+              parentRowSpace: 1,
+              type: "CANVAS_WIDGET",
+              detachFromLayout: true,
+              minHeight: 1292,
+              dynamicBindingPathList: {},
+              parentColumnSpace: 1,
+              leftColumn: 0,
+              children: [],
+            },
+            layoutOnLoadActions: [],
+          },
+        ],
+      },
+      destructive: false,
+    });
+  });
+
+  it.each([true, false])(
+    "APP-16324 F4: builds a minimal visibility request (hidden %s)",
+    (hidden) => {
+      expect(
+        buildSetPageVisibilityRequest(
+          setPageVisibilitySpecSchema.parse({
+            applicationId,
+            pageId,
+            revision,
+            hidden,
+          }),
+        ),
+      ).toEqual({
+        applicationId,
+        revision,
+        method: "PUT",
+        path: `v1/pages/${pageId}`,
+        body: { isHidden: hidden },
+        destructive: false,
+      });
+    },
+  );
+
+  it.each([
+    ["no hidden flag", { applicationId, pageId, revision }],
+    [
+      "a non-boolean hidden flag",
+      { applicationId, pageId, revision, hidden: "yes" },
+    ],
+    [
+      "an extra field",
+      { applicationId, pageId, revision, hidden: true, name: "x" },
+    ],
+    ["no revision", { applicationId, pageId, hidden: true }],
+  ])("APP-16324 F4: rejects a visibility spec with %s", (_label, spec) => {
+    expect(setPageVisibilitySpecSchema.safeParse(spec).success).toBe(false);
+  });
+
+  it("builds a minimal rename request", () => {
+    expect(
+      buildRenamePageRequest(
+        renamePageSpecSchema.parse({
+          applicationId,
+          pageId,
+          revision,
+          name: "Orders Archive",
+        }),
+      ),
+    ).toEqual({
+      applicationId,
+      revision,
+      method: "PUT",
+      path: `v1/pages/${pageId}`,
+      body: { name: "Orders Archive" },
+      destructive: false,
+    });
+  });
+
+  it("marks deletion as destructive and binds its confirmation to the page", () => {
+    expect(
+      buildDeletePageRequest(
+        deletePageSpecSchema.parse({ applicationId, pageId, revision }),
+      ),
+    ).toEqual({
+      applicationId,
+      pageId,
+      revision,
+      method: "DELETE",
+      path: `v1/pages/${pageId}`,
+      destructive: true,
+      confirmation: {
+        operation: "delete_page",
+        entityKey: `page:${pageId}`,
+      },
+    });
+  });
+});
+
+describe("page CRUD schemas reject unsafe mutation input", () => {
+  const invalidCreate: [string, Record<string, unknown>][] = [
+    ["missing revision", { revision: undefined }],
+    ["raw DSL", { dsl: { widgetName: "Injected" } }],
+    ["arbitrary page config", { isHidden: true }],
+    ["JavaScript binding", { name: "{{ evil.run() }}" }],
+    ["template interpolation", { name: "${evil}" }],
+    ["unsafe filename", { name: "../admin" }],
+    ["empty name", { name: "   " }],
+    ["invalid application ID", { applicationId: "app1" }],
+  ];
+
+  it.each(invalidCreate)("rejects create input with %s", (_label, override) => {
+    expect(
+      createPageSpecSchema.safeParse({
+        applicationId,
+        revision,
+        name: "Orders",
+        ...override,
+      }).success,
+    ).toBe(false);
+  });
+
+  it.each([
+    ["raw DSL", { layouts: [] }],
+    ["arbitrary page config", { customSlug: "orders" }],
+    ["binding name", { name: "{{ evil }}" }],
+    ["unsafe name", { name: "Orders/Archive" }],
+    ["missing revision", { revision: undefined }],
+  ])("rejects rename input with %s", (_label, override) => {
+    expect(
+      renamePageSpecSchema.safeParse({
+        applicationId,
+        pageId,
+        revision,
+        name: "Orders",
+        ...override,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects delete input without a revision or with caller-controlled fields", () => {
+    expect(
+      deletePageSpecSchema.safeParse({ applicationId, pageId }).success,
+    ).toBe(false);
+    expect(
+      deletePageSpecSchema.safeParse({
+        applicationId,
+        pageId,
+        revision,
+        force: true,
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe("page names reject binding syntax and line separators", () => {
+  it("refuses {{ }}, }}, and U+2028/U+2029 in a page name", () => {
+    for (const name of [
+      "Home {{ x }}",
+      "Home }}",
+      "Ho\u2028me",
+      "Ho\u2029me",
+    ]) {
+      expect(
+        createPageSpecSchema.safeParse({ applicationId, revision, name })
+          .success,
+      ).toBe(false);
+    }
+  });
+});
+
+// navigateTo treats a target that is not a page name as a URL and adds https://, so a page named like a numeric IP
+// could become a redirect to that IP. Such names are refused when creating or renaming a page.
+describe("page names that read as an IP address", () => {
+  it.each(["1572395042", "0x5db8d822", "12"])(
+    "refuses %s on create and rename",
+    (name) => {
+      expect(
+        createPageSpecSchema.safeParse({ applicationId, revision, name })
+          .success,
+      ).toBe(false);
+      expect(
+        renamePageSpecSchema.safeParse({
+          applicationId,
+          pageId: "p".repeat(24),
+          revision,
+          name,
+        }).success,
+      ).toBe(false);
+    },
+  );
+
+  it.each(["Orders", "Page 1", "2024 report", "Q4-2024"])(
+    "still accepts %s",
+    (name) => {
+      expect(
+        createPageSpecSchema.safeParse({ applicationId, revision, name })
+          .success,
+      ).toBe(true);
+    },
+  );
+});

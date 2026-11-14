@@ -2,6 +2,7 @@ package com.appsmith.external.models;
 
 import com.appsmith.external.exceptions.BaseException;
 import com.appsmith.external.exceptions.ErrorDTO;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.gson.InstanceCreator;
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -27,6 +28,7 @@ public class DatasourceStructure {
         VIEW,
         ALIAS,
         COLLECTION,
+        BUCKET,
     }
 
     @Data
@@ -89,6 +91,7 @@ public class DatasourceStructure {
     public static class PrimaryKey implements Key {
         String name;
         List<String> columnNames;
+
         public String getType() {
             return "primary key";
         }
@@ -100,6 +103,7 @@ public class DatasourceStructure {
         String name;
         List<String> fromColumns;
         List<String> toColumns;
+
         public String getType() {
             return "foreign key";
         }
@@ -112,26 +116,63 @@ public class DatasourceStructure {
         String body;
         Object configuration;
 
+        @JsonProperty("suggested")
+        boolean isSuggested;
+
         // To create templates for plugins which store the configurations
         // in List<Property> format
-        public Template(String title, String body, List<Property> configuration) {
+        public Template(String title, String body, List<Property> configuration, boolean isSuggested) {
             this.title = title;
             this.body = body;
             this.configuration = configuration;
+            // the reason we are adding this in an if-block is because this field should only be set for suggested
+            // templates only.
+            // for non suggested templates, this field should be null or non-existent
+            if (isSuggested) {
+                this.isSuggested = isSuggested;
+            }
         }
 
-        // To create templates for plugins with UQI framework whic store the configurations
+        // To create templates for plugins with UQI framework which store the configurations
         // as a map
-        public Template(String title, String body, Map<String, ?> configuration) {
+        public Template(String title, String body, Map<String, ?> configuration, boolean isSuggested) {
             this.title = title;
             this.body = body;
             this.configuration = configuration;
+            // the reason we are adding this in an if-block is because this field should only be set for suggested
+            // templates only.
+            // for non suggested templates, this field should be null or non-existent
+            if (isSuggested) {
+                this.isSuggested = isSuggested;
+            }
+        }
+
+        /**
+         * Create templates by passing UQI framework config.
+         * <p>
+         * For integrations that use UQI interface, a config map is used to indicate the required template.
+         */
+        public Template(String title, Map<String, ?> configuration, boolean isSuggested) {
+            this.title = title;
+            this.configuration = configuration;
+            // the reason we are adding this in an if-block is because this field should only be set for suggested
+            // templates only.
+            // for non suggested templates, this field should be null or non-existent
+            if (isSuggested) {
+                this.isSuggested = isSuggested;
+            }
         }
 
         // Creating templates without configuration
-        public Template(String title, String body) {
+        public Template(String title, String body, boolean isSuggested) {
             this.title = title;
             this.body = body;
+            // the reason we are adding this in an if-block is because this field should only be set for suggested
+            // templates only.
+            // for non suggested templates, this field should be null or non-existent
+            if (isSuggested) {
+                this.isSuggested = isSuggested;
+            }
         }
     }
 
@@ -142,10 +183,10 @@ public class DatasourceStructure {
         this.error.setMessage(error.getMessage());
 
         if (error instanceof BaseException) {
-            this.error.setCode(((BaseException)error).getAppErrorCode());
+            this.error.setCode(((BaseException) error).getAppErrorCode());
         }
     }
-    
+
     /**
      * Instance creator is required while de-serialising using Gson as key instance can't be invoked with
      * no-args constructor
@@ -162,5 +203,4 @@ public class DatasourceStructure {
             return key;
         }
     }
-    
 }

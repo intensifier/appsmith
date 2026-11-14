@@ -1,39 +1,52 @@
-import { put, select } from "redux-saga/effects";
+import { put, select, take } from "redux-saga/effects";
 import { getWidgetByName } from "sagas/selectors";
+import { resetWidgetMetaUpdates } from "actions/metaActions";
+
 import {
-  resetChildrenMetaProperty,
-  resetWidgetMetaProperty,
-} from "actions/metaActions";
+  ActionValidationError,
+  TriggerFailureError,
+} from "sagas/ActionExecution/errorUtils";
+import { getType, Types } from "utils/TypeHelpers";
+import type { FlattenedWidgetProps } from "WidgetProvider/types";
+import { ReduxActionTypes } from "ee/constants/ReduxActionConstants";
+import type { TResetWidgetDescription } from "workers/Evaluation/fns/resetWidget";
 import AppsmithConsole from "utils/AppsmithConsole";
-import { ResetWidgetDescription } from "entities/DataTree/actionTriggers";
-import { TriggerMeta } from "sagas/ActionExecution/ActionExecutionSagas";
-import { TriggerFailureError } from "sagas/ActionExecution/errorUtils";
+import type { SourceEntity } from "entities/AppsmithConsole";
 
 export default function* resetWidgetActionSaga(
-  payload: ResetWidgetDescription["payload"],
-  triggerMeta: TriggerMeta,
+  action: TResetWidgetDescription,
+  source?: SourceEntity,
 ) {
-  if (typeof payload.widgetName !== "string") {
-    throw new TriggerFailureError(
-      "widgetName needs to be a string",
-      triggerMeta,
+  const { payload } = action;
+  const { metaUpdates, resetChildren, widgetName } = payload;
+
+  if (getType(widgetName) !== Types.STRING) {
+    throw new ActionValidationError(
+      "RESET_WIDGET_META_RECURSIVE_BY_NAME",
+      "widgetName",
+      Types.STRING,
+      getType(widgetName),
     );
   }
 
-  const widget = yield select(getWidgetByName, payload.widgetName);
+  const widget: FlattenedWidgetProps | undefined = yield select(
+    getWidgetByName,
+    widgetName,
+  );
+
   if (!widget) {
-    throw new TriggerFailureError(
-      `widget ${payload.widgetName} not found`,
-      triggerMeta,
-    );
+    throw new TriggerFailureError(`Widget ${payload.widgetName} not found`);
   }
 
-  yield put(resetWidgetMetaProperty(widget.widgetId));
-  if (payload.resetChildren) {
-    yield put(resetChildrenMetaProperty(widget.widgetId));
-  }
+  yield put(resetWidgetMetaUpdates(metaUpdates));
 
+  yield take(ReduxActionTypes.RESET_WIDGET_META_EVALUATED);
   AppsmithConsole.info({
-    text: `resetWidget('${payload.widgetName}', ${payload.resetChildren}) was triggered`,
+    source,
+    text: `resetWidget triggered`,
+    state: {
+      widgetName,
+      resetChildren,
+    },
   });
 }

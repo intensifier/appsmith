@@ -2,10 +2,11 @@ package com.appsmith.server.repositories;
 
 import org.springframework.data.mongodb.repository.ReactiveMongoRepository;
 import org.springframework.data.repository.NoRepositoryBean;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.io.Serializable;
-import java.util.List;
+import java.util.Collection;
 
 @NoRepositoryBean
 public interface BaseRepository<T, ID extends Serializable> extends ReactiveMongoRepository<T, ID> {
@@ -13,7 +14,7 @@ public interface BaseRepository<T, ID extends Serializable> extends ReactiveMong
     /**
      * This function sets the deleted flag to true and then saves the modified document.
      *
-     * @param T The entity which needs to be archived
+     * @param entity The entity which needs to be archived
      * @return Mono<T>
      */
     Mono<T> archive(T entity);
@@ -33,5 +34,12 @@ public interface BaseRepository<T, ID extends Serializable> extends ReactiveMong
      * @param ids The list of ids of the document that needs to be archived.
      * @return
      */
-    Mono<Boolean> archiveAllById(List<ID> ids);
+    Mono<Boolean> archiveAllById(Collection<ID> ids);
+
+    /**
+     * This function retrieves all the documents in the collection without the user context. This method will be used
+     * by internal server workflows like crons etc. to fetch all the documents from the collection.
+     * @return
+     */
+    Flux<T> retrieveAll();
 }

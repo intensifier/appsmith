@@ -1,49 +1,40 @@
 package com.appsmith.server.services;
 
-import com.appsmith.external.models.Policy;
-import com.appsmith.server.acl.AppsmithRole;
+import com.appsmith.server.applications.base.ApplicationService;
 import com.appsmith.server.configurations.CommonConfig;
 import com.appsmith.server.configurations.WithMockAppsmithUser;
-import com.appsmith.server.domains.Application;
-import com.appsmith.server.domains.InviteUser;
 import com.appsmith.server.domains.LoginSource;
 import com.appsmith.server.domains.Organization;
+import com.appsmith.server.domains.OrganizationConfiguration;
 import com.appsmith.server.domains.User;
 import com.appsmith.server.exceptions.AppsmithError;
 import com.appsmith.server.exceptions.AppsmithException;
+import com.appsmith.server.helpers.UserOrganizationHelper;
+import com.appsmith.server.repositories.PermissionGroupRepository;
 import com.appsmith.server.repositories.UserRepository;
-import com.appsmith.server.solutions.UserSignup;
+import com.appsmith.server.repositories.WorkspaceRepository;
 import lombok.extern.slf4j.Slf4j;
-import org.junit.Before;
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.security.test.context.support.WithUserDetails;
-import org.springframework.test.annotation.DirtiesContext;
-import org.springframework.test.context.junit4.SpringRunner;
+import org.springframework.boot.test.mock.mockito.SpyBean;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
-import java.util.HashSet;
 import java.util.Set;
 
-import static com.appsmith.server.acl.AclPermission.MANAGE_APPLICATIONS;
-import static com.appsmith.server.acl.AclPermission.READ_APPLICATIONS;
+import static com.appsmith.server.constants.FieldName.ADMINISTRATOR;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @Slf4j
-@RunWith(SpringRunner.class)
-@SpringBootTest(properties = { "signup.disabled = true", "admin.emails = dummy_admin@appsmith.com,dummy2@appsmith.com" })
-@DirtiesContext
+@SpringBootTest
 public class UserServiceWithDisabledSignupTest {
 
     @Autowired
     UserService userService;
-
-    @Autowired
-    OrganizationService organizationService;
 
     @Autowired
     ApplicationService applicationService;
@@ -52,22 +43,44 @@ public class UserServiceWithDisabledSignupTest {
     UserRepository userRepository;
 
     @Autowired
-    PasswordEncoder passwordEncoder;
+    WorkspaceService workspaceService;
 
     @Autowired
+    WorkspaceRepository workspaceRepository;
+
+    @Autowired
+    PermissionGroupRepository permissionGroupRepository;
+
+    @Autowired
+    UserOrganizationHelper userOrganizationHelper;
+
+    @SpyBean
     CommonConfig commonConfig;
+
+    @Autowired
+    OrganizationService organizationService;
 
     Mono<User> userMono;
 
-    Mono<Organization> organizationMono;
-
-    @Autowired
-    UserSignup userSignup;
-
-    @Before
+    @BeforeEach
     public void setup() {
         userMono = userService.findByEmail("usertest@usertest.com");
-        organizationMono = organizationService.getBySlug("spring-test-organization");
+        Organization organization =
+                organizationService.getCurrentUserOrganization().block();
+        assert organization != null;
+        organization.getOrganizationConfiguration().setIsSignupDisabled(true);
+        organizationService.save(organization).block();
+        Mockito.when(commonConfig.getAdminEmails())
+                .thenReturn(Set.of("dummy_admin@appsmith.com", "dummy2@appsmith.com"));
+    }
+
+    @AfterAll
+    public static void cleanup(@Autowired OrganizationService organizationService) {
+        OrganizationConfiguration organizationConfiguration = new OrganizationConfiguration();
+        organizationConfiguration.setIsSignupDisabled(false);
+        Organization organization =
+                organizationService.getCurrentUserOrganization().block();
+        organizationService.save(organization).block();
     }
 
     @Test
@@ -95,16 +108,27 @@ public class UserServiceWithDisabledSignupTest {
         newUser.setEmail("dummy_admin@appsmith.com");
         newUser.setPassword("admin-password");
 
-        Mono<User> userMono = userService.create(newUser);
+        Mono<User> userMono = userService.create(newUser).cache();
 
-        StepVerifier.create(userMono)
-                .assertNext(user -> {
+        Mono<Set<String>> assignedToUsersMono = userMono.flatMap(user -> {
+                    String workspaceName = user.computeFirstName() + "'s apps";
+                    return workspaceRepository.findByName(workspaceName);
+                })
+                .flatMapMany(workspace -> permissionGroupRepository.findAllById(workspace.getDefaultPermissionGroups()))
+                .filter(permissionGroup -> permissionGroup.getName().startsWith(ADMINISTRATOR))
+                .single()
+                .map(permissionGroup -> permissionGroup.getAssignedToUserIds());
+
+        StepVerifier.create(Mono.zip(userMono, assignedToUsersMono))
+                .assertNext(tuple -> {
+                    User user = tuple.getT1();
+                    Set<String> workspaceAssignedToUsers = tuple.getT2();
                     assertThat(user).isNotNull();
                     assertThat(user.getId()).isNotNull();
                     assertThat(user.getEmail()).isEqualTo("dummy_admin@appsmith.com");
                     assertThat(user.getName()).isNullOrEmpty();
                     assertThat(user.getPolicies()).isNotEmpty();
-                    assertThat(user.getOrganizationIds()).hasSize(1);
+                    assertThat(workspaceAssignedToUsers).contains(user.getId());
                 })
                 .verifyComplete();
     }
@@ -116,100 +140,28 @@ public class UserServiceWithDisabledSignupTest {
         newUser.setEmail("dummy2@appsmith.com");
         newUser.setPassword("admin-password");
 
-        Mono<User> userMono = userService.create(newUser);
+        Mono<User> userMono = userService.create(newUser).cache();
 
-        StepVerifier.create(userMono)
-                .assertNext(user -> {
+        Mono<Set<String>> assignedToUsersMono = userMono.flatMap(user -> {
+                    String workspaceName = user.computeFirstName() + "'s apps";
+                    return workspaceRepository.findByName(workspaceName);
+                })
+                .flatMapMany(workspace -> permissionGroupRepository.findAllById(workspace.getDefaultPermissionGroups()))
+                .filter(permissionGroup -> permissionGroup.getName().startsWith(ADMINISTRATOR))
+                .single()
+                .map(permissionGroup -> permissionGroup.getAssignedToUserIds());
+
+        StepVerifier.create(Mono.zip(userMono, assignedToUsersMono))
+                .assertNext(tuple -> {
+                    User user = tuple.getT1();
+                    Set<String> workspaceAssignedToUsers = tuple.getT2();
                     assertThat(user).isNotNull();
                     assertThat(user.getId()).isNotNull();
                     assertThat(user.getEmail()).isEqualTo("dummy2@appsmith.com");
                     assertThat(user.getName()).isNullOrEmpty();
                     assertThat(user.getPolicies()).isNotEmpty();
-                    assertThat(user.getOrganizationIds()).hasSize(1);
-                })
-                .verifyComplete();
-    }
 
-    @Test
-    @DirtiesContext
-    @WithUserDetails(value = "api_user")
-    public void inviteUserToApplicationValidAsAdmin() {
-        InviteUser inviteUser = new InviteUser();
-        inviteUser.setEmail("inviteUserToApplication@test.com");
-        inviteUser.setRole(AppsmithRole.APPLICATION_ADMIN);
-
-        Mono<Application> applicationMono = applicationService.findByName("LayoutServiceTest TestApplications", MANAGE_APPLICATIONS)
-                .switchIfEmpty(Mono.error(new Exception("No such app")));
-
-        Mono<User> userMono = applicationMono.flatMap(application -> userService
-                .inviteUserToApplication(inviteUser, "http://localhost:8080", application.getId())).cache();
-
-        Mono<Application> updatedApplication = userMono.then(applicationService.findByName("LayoutServiceTest TestApplications", MANAGE_APPLICATIONS));
-
-        StepVerifier.create(Mono.zip(updatedApplication, userMono))
-                .assertNext(tuple -> {
-                    Application application = tuple.getT1();
-                    User user = tuple.getT2();
-
-                    Policy manageAppPolicy = Policy.builder()
-                            .permission(MANAGE_APPLICATIONS.getValue())
-                            .users(Set.of("api_user", user.getUsername()))
-                            .groups(new HashSet<>())
-                            .build();
-
-                    Policy readAppPolicy = Policy.builder()
-                            .permission(READ_APPLICATIONS.getValue())
-                            .users(Set.of("api_user", user.getUsername()))
-                            .groups(new HashSet<>())
-                            .build();
-
-
-                    assertThat(application).isNotNull();
-                    assertThat(application.getPolicies()).isNotEmpty();
-                    assertThat(application.getPolicies()).containsAll(Set.of(manageAppPolicy, readAppPolicy));
-
-                    assertThat(user).isNotNull();
-                })
-                .verifyComplete();
-    }
-
-    @Test
-    @WithUserDetails(value = "api_user")
-    public void inviteUserToApplicationValidAsViewer() {
-        InviteUser inviteUser = new InviteUser();
-        inviteUser.setEmail("inviteUserToApplication@test.com");
-        inviteUser.setRole(AppsmithRole.APPLICATION_VIEWER);
-
-        Mono<Application> applicationMono = applicationService.findByName("LayoutServiceTest TestApplications", READ_APPLICATIONS)
-                .switchIfEmpty(Mono.error(new Exception("No such app")));
-
-        Mono<User> userMono = applicationMono.flatMap(application -> userService
-                .inviteUserToApplication(inviteUser, "http://localhost:8080", application.getId())).cache();
-
-        Mono<Application> updatedApplication = userMono.then(applicationService.findByName("LayoutServiceTest TestApplications", READ_APPLICATIONS));
-
-
-        StepVerifier.create(Mono.zip(updatedApplication, userMono))
-                .assertNext(tuple -> {
-                    Application application = tuple.getT1();
-                    User user = tuple.getT2();
-
-                    Policy readAppPolicy = Policy.builder()
-                            .permission(READ_APPLICATIONS.getValue())
-                            .users(Set.of("api_user", user.getUsername()))
-                            .groups(new HashSet<>())
-                            .build();
-
-                    Policy manageAppPolicy = Policy.builder()
-                            .permission(MANAGE_APPLICATIONS.getValue())
-                            .users(Set.of("api_user"))
-                            .build();
-
-                    assertThat(application).isNotNull();
-                    assertThat(application.getPolicies()).isNotEmpty();
-                    assertThat(application.getPolicies()).containsAll(Set.of(manageAppPolicy, readAppPolicy));
-
-                    assertThat(user).isNotNull();
+                    assertThat(workspaceAssignedToUsers).contains(user.getId());
                 })
                 .verifyComplete();
     }
@@ -217,9 +169,13 @@ public class UserServiceWithDisabledSignupTest {
     @Test
     @WithMockAppsmithUser
     public void signUpViaFormLoginIfAlreadyInvited() {
+        String organizationId =
+                userOrganizationHelper.getCurrentUserOrganizationId().block();
+
         User newUser = new User();
         newUser.setEmail("alreadyInvited@alreadyInvited.com");
         newUser.setIsEnabled(false);
+        newUser.setOrganizationId(organizationId);
 
         userRepository.save(newUser).block();
 
@@ -232,8 +188,8 @@ public class UserServiceWithDisabledSignupTest {
 
         StepVerifier.create(userMono)
                 .assertNext(user -> {
-                    assertThat(user.getEmail().equals(newUser.getEmail()));
-                    assertThat(user.getSource().equals(LoginSource.FORM));
+                    assertThat(user.getEmail()).isEqualTo(newUser.getEmail());
+                    assertThat(user.getSource()).isEqualTo(LoginSource.FORM);
                     assertThat(user.getIsEnabled()).isTrue();
                 })
                 .verifyComplete();

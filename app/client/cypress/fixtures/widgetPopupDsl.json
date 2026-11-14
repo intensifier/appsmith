@@ -24,15 +24,12 @@
         "widgetName": "TreeSelect1",
         "displayName": "TreeSelect",
         "iconSVG": "/static/media/icon.bd99caba.svg",
-        "labelText": "Label",
         "topRow": 14,
-        "bottomRow": 20.9,
+        "bottomRow": 18,
         "parentRowSpace": 10,
         "type": "SINGLE_SELECT_TREE_WIDGET",
         "hideCard": false,
-        "defaultOptionValue": 
-          "GREEN"
-        ,
+        "defaultOptionValue": "GREEN",
         "parentColumnSpace": 19.8125,
         "leftColumn": 5,
         "options": [
@@ -63,7 +60,7 @@
         "isDisabled": false,
         "key": "oe8sn5hbxk",
         "isRequired": false,
-        "rightColumn": 18,
+        "rightColumn": 30,
         "widgetId": "p65c0i01ic",
         "isVisible": true,
         "version": 1,
@@ -77,16 +74,13 @@
         "widgetName": "MultiTreeSelect2",
         "displayName": "Multi TreeSelect",
         "iconSVG": "/static/media/icon.b3e28afb.svg",
-        "labelText": "Label",
         "topRow": 31,
-        "bottomRow": 37.9,
+        "bottomRow": 35,
         "parentRowSpace": 10,
         "type": "MULTI_SELECT_TREE_WIDGET",
         "hideCard": false,
         "mode": "SHOW_ALL",
-        "defaultOptionValue": [
-          "GREEN"
-        ],
+        "defaultOptionValue": ["GREEN"],
         "parentColumnSpace": 19.8125,
         "leftColumn": 5,
         "options": [
@@ -117,7 +111,7 @@
         "isDisabled": false,
         "key": "oe8sn5hbxk",
         "isRequired": false,
-        "rightColumn": 18,
+        "rightColumn": 30,
         "widgetId": "buewtu97rf",
         "isVisible": true,
         "version": 1,
@@ -132,14 +126,16 @@
         "isFilterable": true,
         "displayName": "Select",
         "iconSVG": "/static/media/icon.bd99caba.svg",
-        "labelText": "Label",
         "topRow": 50,
-        "bottomRow": 56.9,
+        "bottomRow": 54,
         "parentRowSpace": 10,
-        "type": "DROP_DOWN_WIDGET",
+        "type": "SELECT_WIDGET",
         "serverSideFiltering": false,
         "hideCard": false,
-        "defaultOptionValue": "GREEN",
+        "defaultOptionValue": {
+          "label": "Green",
+          "value": "GREEN"
+        },
         "selectionType": "SINGLE_SELECT",
         "parentColumnSpace": 19.8125,
         "dynamicTriggerPathList": [],
@@ -163,7 +159,7 @@
         "isDisabled": false,
         "key": "1b9j4l2c65",
         "isRequired": false,
-        "rightColumn": 18,
+        "rightColumn": 30,
         "widgetId": "vnoxjpwd8a",
         "isVisible": true,
         "version": 1,
@@ -175,15 +171,17 @@
         "widgetName": "MultiSelect1",
         "displayName": "MultiSelect",
         "iconSVG": "/static/media/icon.a3495809.svg",
-        "labelText": "Label",
         "topRow": 67,
-        "bottomRow": 73.9,
+        "bottomRow": 71,
         "parentRowSpace": 10,
-        "type": "MULTI_SELECT_WIDGET",
+        "type": "MULTI_SELECT_WIDGET_V2",
         "serverSideFiltering": false,
         "hideCard": false,
         "defaultOptionValue": [
-          "GREEN"
+          {
+            "label": "Green",
+            "value": "GREEN"
+          }
         ],
         "parentColumnSpace": 19.8125,
         "leftColumn": 5,
@@ -205,7 +203,7 @@
         "isDisabled": false,
         "key": "z8p14a1gb8",
         "isRequired": false,
-        "rightColumn": 18,
+        "rightColumn": 30,
         "widgetId": "c2j24v7j6b",
         "isVisible": true,
         "version": 1,
@@ -216,10 +214,10 @@
       {
         "isCompact": false,
         "widgetName": "MenuButton1",
-        "displayName": "Menu Button",
+        "displayName": "Menu button",
         "iconSVG": "/static/media/icon.0341d17d.svg",
         "topRow": 80,
-        "bottomRow": 84,
+        "bottomRow": 85,
         "parentRowSpace": 10,
         "type": "MENU_BUTTON_WIDGET",
         "hideCard": false,
@@ -230,40 +228,41 @@
         "rightColumn": 18,
         "menuVariant": "PRIMARY",
         "widgetId": "33f9n054tq",
+        "menuItemsSource": "STATIC",
         "menuItems": {
-            "menuItem1": {
-                "label": "First Menu Item",
-                "id": "menuItem1",
-                "widgetId": "",
-                "isVisible": true,
-                "isDisabled": false,
-                "index": 0
-            },
-            "menuItem2": {
-                "label": "Second Menu Item",
-                "id": "menuItem2",
-                "widgetId": "",
-                "isVisible": true,
-                "isDisabled": false,
-                "index": 1
-            },
-            "menuItem3": {
-                "label": "Third Menu Item",
-                "id": "menuItem3",
-                "widgetId": "",
-                "isVisible": true,
-                "isDisabled": false,
-                "index": 2
-            }
+          "menuItem1": {
+            "label": "First Menu Item",
+            "id": "menuItem1",
+            "widgetId": "",
+            "isVisible": true,
+            "isDisabled": false,
+            "index": 0
+          },
+          "menuItem2": {
+            "label": "Second Menu Item",
+            "id": "menuItem2",
+            "widgetId": "",
+            "isVisible": true,
+            "isDisabled": false,
+            "index": 1
+          },
+          "menuItem3": {
+            "label": "Third Menu Item",
+            "id": "menuItem3",
+            "widgetId": "",
+            "isVisible": true,
+            "isDisabled": false,
+            "index": 2
+          }
         },
         "isVisible": true,
-          "label": "Open Menu",
-          "version": 1,
-          "parentId": "0",
-          "renderMode": "CANVAS",
-          "isLoading": false,
-          "menuColor": "#03B365"
-        }
+        "label": "Open Menu",
+        "version": 1,
+        "parentId": "0",
+        "renderMode": "CANVAS",
+        "isLoading": false,
+        "menuColor": "#03B365"
+      }
     ]
   }
 }

@@ -5,14 +5,19 @@ import com.appsmith.external.models.ActionExecutionResult;
 import com.appsmith.external.models.DBAuth;
 import com.appsmith.external.models.DatasourceConfiguration;
 import com.appsmith.external.models.DatasourceStructure;
+import com.appsmith.external.models.DatasourceTestResult;
 import com.appsmith.external.models.Endpoint;
 import com.appsmith.external.models.RequestParamDTO;
-import lombok.extern.log4j.Log4j;
-import org.junit.BeforeClass;
-import org.junit.ClassRule;
-import org.junit.Test;
+import com.external.plugins.exceptions.DynamoPluginError;
+import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.test.StepVerifier;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
@@ -24,45 +29,56 @@ import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.CreateTableRequest;
 import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
 import software.amazon.awssdk.services.dynamodb.model.KeyType;
+import software.amazon.awssdk.services.dynamodb.model.ListTablesResponse;
 import software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughput;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
 import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
 
 import java.net.URI;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static com.appsmith.external.constants.ActionConstants.ACTION_CONFIGURATION_BODY;
 import static com.appsmith.external.constants.ActionConstants.ACTION_CONFIGURATION_PATH;
-import static org.junit.Assert.assertArrayEquals;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
-@Log4j
+@Slf4j
+@Testcontainers
 public class DynamoPluginTest {
 
-    private final static DynamoPlugin.DynamoPluginExecutor pluginExecutor = new DynamoPlugin.DynamoPluginExecutor();
+    private static final DynamoPlugin.DynamoPluginExecutor pluginExecutor = new DynamoPlugin.DynamoPluginExecutor();
 
     @SuppressWarnings("rawtypes")
-    @ClassRule
-    public static GenericContainer container = new GenericContainer(CompletableFuture.completedFuture("amazon/dynamodb-local"))
+    @Container
+    public static GenericContainer container = new GenericContainer(
+                    CompletableFuture.completedFuture("amazon/dynamodb-local:3.3.1"))
             .withExposedPorts(8000);
 
-    private final static DatasourceConfiguration dsConfig = new DatasourceConfiguration();
+    private static final DatasourceConfiguration dsConfig = new DatasourceConfiguration();
 
-    @BeforeClass
+    @BeforeAll
     public static void setUp() {
         final String host = "localhost";
         final Integer port = container.getMappedPort(8000);
 
-        final StaticCredentialsProvider credentialsProvider = StaticCredentialsProvider.create(
-                AwsBasicCredentials.create("dummy", "dummy")
-        );
+        final StaticCredentialsProvider credentialsProvider =
+                StaticCredentialsProvider.create(AwsBasicCredentials.create("dummy", "dummy"));
 
         DynamoDbClient ddb = DynamoDbClient.builder()
                 .region(Region.AP_SOUTH_1)
@@ -72,44 +88,48 @@ public class DynamoPluginTest {
 
         ddb.createTable(CreateTableRequest.builder()
                 .tableName("cities")
-                .attributeDefinitions(
-                        AttributeDefinition.builder().attributeName("Id").attributeType(ScalarAttributeType.S).build()
-                )
-                .keySchema(
-                        KeySchemaElement.builder().attributeName("Id").keyType(KeyType.HASH).build()
-                )
-                .provisionedThroughput(
-                        ProvisionedThroughput.builder().readCapacityUnits(5L).writeCapacityUnits(5L).build()
-                )
+                .attributeDefinitions(AttributeDefinition.builder()
+                        .attributeName("Id")
+                        .attributeType(ScalarAttributeType.S)
+                        .build())
+                .keySchema(KeySchemaElement.builder()
+                        .attributeName("Id")
+                        .keyType(KeyType.HASH)
+                        .build())
+                .provisionedThroughput(ProvisionedThroughput.builder()
+                        .readCapacityUnits(5L)
+                        .writeCapacityUnits(5L)
+                        .build())
                 .build());
 
         ddb.putItem(PutItemRequest.builder()
                 .tableName("cities")
                 .item(Map.of(
                         "Id", AttributeValue.builder().s("1").build(),
-                        "City", AttributeValue.builder().s("New Delhi").build()
-                ))
+                        "City", AttributeValue.builder().s("New Delhi").build()))
                 .build());
 
         ddb.putItem(PutItemRequest.builder()
                 .tableName("cities")
                 .item(Map.of(
                         "Id", AttributeValue.builder().s("2").build(),
-                        "City", AttributeValue.builder().s("Bangalore").build()
-                ))
+                        "City", AttributeValue.builder().s("Bangalore").build()))
                 .build());
 
         ddb.createTable(CreateTableRequest.builder()
                 .tableName("allTypes")
-                .attributeDefinitions(
-                        AttributeDefinition.builder().attributeName("Id").attributeType(ScalarAttributeType.N).build()
-                )
-                .keySchema(
-                        KeySchemaElement.builder().attributeName("Id").keyType(KeyType.HASH).build()
-                )
-                .provisionedThroughput(
-                        ProvisionedThroughput.builder().readCapacityUnits(5L).writeCapacityUnits(5L).build()
-                )
+                .attributeDefinitions(AttributeDefinition.builder()
+                        .attributeName("Id")
+                        .attributeType(ScalarAttributeType.N)
+                        .build())
+                .keySchema(KeySchemaElement.builder()
+                        .attributeName("Id")
+                        .keyType(KeyType.HASH)
+                        .build())
+                .provisionedThroughput(ProvisionedThroughput.builder()
+                        .readCapacityUnits(5L)
+                        .writeCapacityUnits(5L)
+                        .build())
                 .build());
 
         String testPayload1 = "payload1";
@@ -127,12 +147,21 @@ public class DynamoPluginTest {
                         "BooleanType", AttributeValue.builder().bool(true).build(),
                         "BinaryType", AttributeValue.builder().b(bytesValue1).build(),
                         "NullType", AttributeValue.builder().nul(true).build(),
-                        "StringSetType", AttributeValue.builder().ss("str1", "str2").build(),
+                        "StringSetType",
+                                AttributeValue.builder().ss("str1", "str2").build(),
                         "NumberSetType", AttributeValue.builder().ns("1", "2").build(),
-                        "BinarySetType", AttributeValue.builder().bs(bytesValue1, bytesValue2).build(),
-                        "MapType", AttributeValue.builder().m(Map.of("mapKey", mapValue)).build(),
-                        "ListType", AttributeValue.builder().l(listValue1, listValue2).build()
-                ))
+                        "BinarySetType",
+                                AttributeValue.builder()
+                                        .bs(bytesValue1, bytesValue2)
+                                        .build(),
+                        "MapType",
+                                AttributeValue.builder()
+                                        .m(Map.of("mapKey", mapValue))
+                                        .build(),
+                        "ListType",
+                                AttributeValue.builder()
+                                        .l(listValue1, listValue2)
+                                        .build()))
                 .build());
 
         Endpoint endpoint = new Endpoint();
@@ -164,31 +193,34 @@ public class DynamoPluginTest {
                     assertTrue(result.getIsExecutionSuccess());
                     assertNotNull(result.getBody());
 
-                   HashSet<String> expectedTables = new HashSet<>();
-                   expectedTables.add("cities");
-                   expectedTables.add("allTypes");
+                    HashSet<String> expectedTables = new HashSet<>();
+                    expectedTables.add("cities");
+                    expectedTables.add("allTypes");
 
-                   HashSet<String> actualTables = new HashSet<>();
-                   actualTables.add(((Map<String, ArrayList<String>>) result.getBody()).get("TableNames").get(0));
-                   actualTables.add(((Map<String, ArrayList<String>>) result.getBody()).get("TableNames").get(1));
+                    HashSet<String> actualTables = new HashSet<>();
+                    actualTables.add(((Map<String, ArrayList<String>>) result.getBody())
+                            .get("TableNames")
+                            .get(0));
+                    actualTables.add(((Map<String, ArrayList<String>>) result.getBody())
+                            .get("TableNames")
+                            .get(1));
 
-                   assertTrue(expectedTables.equals(actualTables));
+                    assertTrue(expectedTables.equals(actualTables));
                 })
                 .verifyComplete();
     }
 
     @Test
     public void testDescribeTable() {
-        final String body = "{\n" +
-                "  \"TableName\": \"cities\"\n" +
-                "}\n";
+        final String body = "{\n" + "  \"TableName\": \"cities\"\n" + "}\n";
 
         StepVerifier.create(execute("DescribeTable", body))
                 .assertNext(result -> {
                     assertNotNull(result);
                     assertTrue(result.getIsExecutionSuccess());
                     assertNotNull(result.getBody());
-                    final Map<String, Object> table =  ((Map<String, Map<String, Object>>) result.getBody()).get("Table");
+                    final Map<String, Object> table =
+                            ((Map<String, Map<String, Object>>) result.getBody()).get("Table");
                     assertEquals("cities", table.get("TableName"));
 
                     /*
@@ -198,9 +230,9 @@ public class DynamoPluginTest {
                      * - The other two RequestParamDTO attributes - label and type are null at this point.
                      */
                     List<RequestParamDTO> expectedRequestParams = new ArrayList<>();
-                    expectedRequestParams.add(new RequestParamDTO(ACTION_CONFIGURATION_PATH, "DescribeTable", null,
-                            null, null));
-                    expectedRequestParams.add(new RequestParamDTO(ACTION_CONFIGURATION_BODY,  body, null, null, null));
+                    expectedRequestParams.add(
+                            new RequestParamDTO(ACTION_CONFIGURATION_PATH, "DescribeTable", null, null, null));
+                    expectedRequestParams.add(new RequestParamDTO(ACTION_CONFIGURATION_BODY, body, null, null, null));
                     assertEquals(result.getRequest().getRequestParams().toString(), expectedRequestParams.toString());
                 })
                 .verifyComplete();
@@ -208,14 +240,13 @@ public class DynamoPluginTest {
 
     @Test
     public void testGetItem() {
-        final String body = "{\n" +
-                "  \"TableName\": \"cities\",\n" +
-                "  \"Key\": {\n" +
-                "    \"Id\": {\n" +
-                "      \"S\": \"1\"\n" +
-                "    }\n" +
-                "  }\n" +
-                "}\n";
+        final String body = "{\n" + "  \"TableName\": \"cities\",\n"
+                + "  \"Key\": {\n"
+                + "    \"Id\": {\n"
+                + "      \"S\": \"1\"\n"
+                + "    }\n"
+                + "  }\n"
+                + "}\n";
 
         StepVerifier.create(execute("GetItem", body))
                 .assertNext(result -> {
@@ -231,14 +262,13 @@ public class DynamoPluginTest {
 
     @Test
     public void testQuery() {
-        final String body = "{\n" +
-                "  \"TableName\": \"cities\", \n" +
-                "\t\"KeyConditionExpression\": \"Id=:v1\",\n" +
-                "\t\"ExpressionAttributeValues\": {\n" +
-                "        \":v1\": {\"S\": \"1\"}\n" +
-                "    },\n" +
-                "    \"ReturnConsumedCapacity\": \"TOTAL\"\n" +
-                "}";
+        final String body = "{\n" + "  \"TableName\": \"cities\", \n"
+                + "\t\"KeyConditionExpression\": \"Id=:v1\",\n"
+                + "\t\"ExpressionAttributeValues\": {\n"
+                + "        \":v1\": {\"S\": \"1\"}\n"
+                + "    },\n"
+                + "    \"ReturnConsumedCapacity\": \"TOTAL\"\n"
+                + "}";
 
         StepVerifier.create(execute("Query", body))
                 .assertNext(result -> {
@@ -254,17 +284,16 @@ public class DynamoPluginTest {
 
     @Test
     public void testPutItem() {
-        final String body = "{\n" +
-                "  \"TableName\": \"cities\",\n" +
-                "  \"Item\": {\n" +
-                "    \"Id\": {\n" +
-                "      \"S\": \"9\"\n" +
-                "    },\n" +
-                "    \"City\": {\n" +
-                "      \"S\": \"Mumbai\"\n" +
-                "    }\n" +
-                "  }\n" +
-                "}\n";
+        final String body = "{\n" + "  \"TableName\": \"cities\",\n"
+                + "  \"Item\": {\n"
+                + "    \"Id\": {\n"
+                + "      \"S\": \"9\"\n"
+                + "    },\n"
+                + "    \"City\": {\n"
+                + "      \"S\": \"Mumbai\"\n"
+                + "    }\n"
+                + "  }\n"
+                + "}\n";
 
         StepVerifier.create(execute("PutItem", body))
                 .assertNext(result -> {
@@ -278,21 +307,20 @@ public class DynamoPluginTest {
 
     @Test
     public void testUpdateItem() {
-        final String body = "{\n" +
-                "  \"TableName\": \"cities\",\n" +
-                "  \"Key\": {\n" +
-                "    \"Id\": {\n" +
-                "      \"S\": \"2\"\n" +
-                "    }\n" +
-                "  },\n" +
-                "  \"UpdateExpression\": \"set City = :new_city\",\n" +
-                "  \"ExpressionAttributeValues\": {\n" +
-                "    \":new_city\": {\n" +
-                "      \"S\": \"Bengaluru\"\n" +
-                "    }\n" +
-                "  },\n" +
-                "  \"ReturnValues\": \"ALL_NEW\"\n" +
-                "}\n";
+        final String body = "{\n" + "  \"TableName\": \"cities\",\n"
+                + "  \"Key\": {\n"
+                + "    \"Id\": {\n"
+                + "      \"S\": \"2\"\n"
+                + "    }\n"
+                + "  },\n"
+                + "  \"UpdateExpression\": \"set City = :new_city\",\n"
+                + "  \"ExpressionAttributeValues\": {\n"
+                + "    \":new_city\": {\n"
+                + "      \"S\": \"Bengaluru\"\n"
+                + "    }\n"
+                + "  },\n"
+                + "  \"ReturnValues\": \"ALL_NEW\"\n"
+                + "}\n";
 
         StepVerifier.create(execute("UpdateItem", body))
                 .assertNext(result -> {
@@ -308,9 +336,7 @@ public class DynamoPluginTest {
 
     @Test
     public void testScan() {
-        final String body = "{\n" +
-                "  \"TableName\": \"cities\"\n" +
-                "}\n";
+        final String body = "{\n" + "  \"TableName\": \"cities\"\n" + "}\n";
 
         StepVerifier.create(execute("Scan", body))
                 .assertNext(result -> {
@@ -327,40 +353,37 @@ public class DynamoPluginTest {
 
     @Test
     public void testBatchGetItem() {
-        final String body = "{\n" +
-                "    \"RequestItems\": {\n" +
-                "        \"cities\": {\n" +
-                "            \"Keys\": [\n" +
-                "                {\n" +
-                "                    \"Id\": {\n" +
-                "                       \"S\": \"1\"\n" +
-                "                    }\n" +
-                "                },\n" +
-                "                {\n" +
-                "                    \"Id\": {\n" +
-                "                       \"S\": \"2\"\n" +
-                "                    }\n" +
-                "                }\n" +
-                "            ],\n" +
-                "            \"ProjectionExpression\":\"City\"\n" +
-                "        }\n" +
-                "    },\n" +
-                "    \"ReturnConsumedCapacity\": \"TOTAL\"\n" +
-                "}";
+        final String body = "{\n" + "    \"RequestItems\": {\n"
+                + "        \"cities\": {\n"
+                + "            \"Keys\": [\n"
+                + "                {\n"
+                + "                    \"Id\": {\n"
+                + "                       \"S\": \"1\"\n"
+                + "                    }\n"
+                + "                },\n"
+                + "                {\n"
+                + "                    \"Id\": {\n"
+                + "                       \"S\": \"2\"\n"
+                + "                    }\n"
+                + "                }\n"
+                + "            ],\n"
+                + "            \"ProjectionExpression\":\"City\"\n"
+                + "        }\n"
+                + "    },\n"
+                + "    \"ReturnConsumedCapacity\": \"TOTAL\"\n"
+                + "}";
 
         StepVerifier.create(execute("BatchGetItem", body))
                 .assertNext(result -> {
                     assertNotNull(result);
                     assertTrue(result.getIsExecutionSuccess());
                     final Map<String, ?> response = (Map) result.getBody();
-                    assertEquals(
-                            Collections.emptyMap(),
-                            response.remove("UnprocessedKeys")
-                    );
+                    assertEquals(Collections.emptyMap(), response.remove("UnprocessedKeys"));
 
                     // Test transformed response
                     Map<String, Object> transformedResponse = (Map<String, Object>) response.get("Responses");
-                    ArrayList<Map<String, Object>> transformedCitiesList = (ArrayList<Map<String, Object>>) transformedResponse.get("cities");
+                    ArrayList<Map<String, Object>> transformedCitiesList =
+                            (ArrayList<Map<String, Object>>) transformedResponse.get("cities");
                     assertEquals("New Delhi", transformedCitiesList.get(0).get("City"));
                 })
                 .verifyComplete();
@@ -368,22 +391,20 @@ public class DynamoPluginTest {
 
     @Test
     public void testTransactGetItems() {
-        final String body =
-                "{\n" +
-                "  \"ReturnConsumedCapacity\": \"NONE\",\n" +
-                "  \"TransactItems\": [\n" +
-                "    {\n" +
-                "      \"Get\": {\n" +
-                "        \"Key\": {\n" +
-                "          \"Id\": {\n" +
-                "            \"S\": \"1\"\n" +
-                "          }\n" +
-                "        },\n" +
-                "        \"TableName\": \"cities\"\n" +
-                "      }\n" +
-                "    }\n" +
-                "  ]\n" +
-                "}";
+        final String body = "{\n" + "  \"ReturnConsumedCapacity\": \"NONE\",\n"
+                + "  \"TransactItems\": [\n"
+                + "    {\n"
+                + "      \"Get\": {\n"
+                + "        \"Key\": {\n"
+                + "          \"Id\": {\n"
+                + "            \"S\": \"1\"\n"
+                + "          }\n"
+                + "        },\n"
+                + "        \"TableName\": \"cities\"\n"
+                + "      }\n"
+                + "    }\n"
+                + "  ]\n"
+                + "}";
 
         StepVerifier.create(execute("TransactGetItems", body))
                 .assertNext(result -> {
@@ -393,19 +414,19 @@ public class DynamoPluginTest {
                     final Map<String, ?> response = (Map) result.getBody();
 
                     // Test transformed response
-                    ArrayList<Map<String, Object>> transformedResponse = (ArrayList<Map<String, Object>>) response.get("Responses");
-                    assertEquals("New Delhi",
-                            ((Map<String, Object>)transformedResponse.get(0).get("Item")).get("City"));
-
+                    ArrayList<Map<String, Object>> transformedResponse =
+                            (ArrayList<Map<String, Object>>) response.get("Responses");
+                    assertEquals(
+                            "New Delhi",
+                            ((Map<String, Object>) transformedResponse.get(0).get("Item")).get("City"));
                 })
                 .verifyComplete();
     }
 
     @Test
     public void testStructure() {
-        final Mono<DatasourceStructure> structureMono = pluginExecutor
-                .datasourceCreate(dsConfig)
-                .flatMap(conn -> pluginExecutor.getStructure(conn, dsConfig));
+        final Mono<DatasourceStructure> structureMono =
+                pluginExecutor.datasourceCreate(dsConfig).flatMap(conn -> pluginExecutor.getStructure(conn, dsConfig));
 
         StepVerifier.create(structureMono)
                 .assertNext(structure -> {
@@ -431,9 +452,7 @@ public class DynamoPluginTest {
      */
     @Test
     public void testParsingCapabilityForAllTypes() {
-        final String body = "{\n" +
-                "  \"TableName\": \"allTypes\"\n" +
-                "}\n";
+        final String body = "{\n" + "  \"TableName\": \"allTypes\"\n" + "}\n";
 
         StepVerifier.create(execute("Scan", body))
                 .assertNext(result -> {
@@ -447,23 +466,30 @@ public class DynamoPluginTest {
                     /*
                      * - Check if the transformed data is correct.
                      */
-                    ArrayList<Map<String, Object>> transformedItems = (ArrayList<Map<String, Object>>) resultBody.get("Items");
+                    ArrayList<Map<String, Object>> transformedItems =
+                            (ArrayList<Map<String, Object>>) resultBody.get("Items");
                     Map<String, Object> transformedItemMap = transformedItems.get(0);
                     assertEquals("1", transformedItemMap.get("Id"));
                     assertEquals("str", transformedItemMap.get("StringType"));
                     assertEquals("true", transformedItemMap.get("BooleanType").toString());
                     assertEquals("payload1", transformedItemMap.get("BinaryType"));
                     assertEquals("true", transformedItemMap.get("NullType").toString());
-                    assertArrayEquals(new String[]{"str1", "str2"},
-                            ((ArrayList<String>)transformedItemMap.get("StringSetType")).toArray());
-                    assertArrayEquals(new String[]{"payload1", "payload2"},
-                            ((ArrayList<String>)transformedItemMap.get("BinarySetType")).toArray());
-                    assertArrayEquals(new String[]{"1", "2"},
-                            ((ArrayList<String>)transformedItemMap.get("NumberSetType")).toArray());
-                    assertEquals("mapValue",
-                            ((Map<String, Object>)transformedItemMap.get("MapType")).get("mapKey").toString());
-                    assertEquals("listValue1", ((ArrayList<String>)transformedItemMap.get("ListType")).get(0));
-                    assertEquals("listValue2", ((ArrayList<String>)transformedItemMap.get("ListType")).get(1));
+                    assertArrayEquals(
+                            new String[] {"str1", "str2"},
+                            ((ArrayList<String>) transformedItemMap.get("StringSetType")).toArray());
+                    assertArrayEquals(
+                            new String[] {"payload1", "payload2"},
+                            ((ArrayList<String>) transformedItemMap.get("BinarySetType")).toArray());
+                    assertArrayEquals(
+                            new String[] {"1", "2"},
+                            ((ArrayList<String>) transformedItemMap.get("NumberSetType")).toArray());
+                    assertEquals(
+                            "mapValue",
+                            ((Map<String, Object>) transformedItemMap.get("MapType"))
+                                    .get("mapKey")
+                                    .toString());
+                    assertEquals("listValue1", ((ArrayList<String>) transformedItemMap.get("ListType")).get(0));
+                    assertEquals("listValue2", ((ArrayList<String>) transformedItemMap.get("ListType")).get(1));
                 })
                 .verifyComplete();
     }
@@ -486,5 +512,79 @@ public class DynamoPluginTest {
                     assertTrue(errorList.get(0).contains("The security token included in the request is invalid."));
                 })
                 .verifyComplete();
+    }
+
+    @Test
+    public void testTestDatasource_withCorrectCredentials_returnsWithoutInvalids() {
+        final Mono<DatasourceTestResult> testDatasourceMono = pluginExecutor.testDatasource(dsConfig);
+
+        StepVerifier.create(testDatasourceMono)
+                .assertNext(datasourceTestResult -> {
+                    assertNotNull(datasourceTestResult);
+                    assertTrue(datasourceTestResult.isSuccess());
+                    assertTrue(datasourceTestResult.getInvalids().isEmpty());
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    public void verifyUniquenessOfDynamoDBPluginErrorCode() {
+        assert (Arrays.stream(DynamoPluginError.values())
+                        .map(DynamoPluginError::getAppErrorCode)
+                        .distinct()
+                        .count()
+                == DynamoPluginError.values().length);
+
+        assert (Arrays.stream(DynamoPluginError.values())
+                        .map(DynamoPluginError::getAppErrorCode)
+                        .filter(appErrorCode -> appErrorCode.length() != 11 || !appErrorCode.startsWith("PE-DYN"))
+                        .collect(Collectors.toList())
+                        .size()
+                == 0);
+    }
+
+    @Test
+    public void testDatasource_connection_doesNotRunOnTheSubscribingThread() {
+        DynamoDbClient mockClient = mock(DynamoDbClient.class);
+        AtomicReference<String> sdkThread = new AtomicReference<>();
+        when(mockClient.listTables()).thenAnswer(invocation -> {
+            sdkThread.set(Thread.currentThread().getName());
+            return ListTablesResponse.builder().build();
+        });
+
+        Scheduler caller = Schedulers.newSingle("caller-event-loop");
+        try {
+            StepVerifier.create(pluginExecutor.testDatasource(mockClient).subscribeOn(caller))
+                    .assertNext(result -> assertTrue(result.isSuccess()))
+                    .verifyComplete();
+        } finally {
+            caller.dispose();
+        }
+        assertNotNull(sdkThread.get(), "listTables was never called");
+        assertFalse(
+                sdkThread.get().startsWith("caller-event-loop"),
+                "listTables ran on the subscribing thread: " + sdkThread.get());
+    }
+
+    @Test
+    public void datasourceDestroy_doesNotRunOnTheCallerThread() throws Exception {
+        DynamoDbClient mockClient = mock(DynamoDbClient.class);
+        AtomicReference<String> closeThread = new AtomicReference<>();
+        CountDownLatch closed = new CountDownLatch(1);
+        doAnswer(invocation -> {
+                    closeThread.set(Thread.currentThread().getName());
+                    closed.countDown();
+                    return null;
+                })
+                .when(mockClient)
+                .close();
+
+        Thread caller = new Thread(() -> pluginExecutor.datasourceDestroy(mockClient), "caller-event-loop-destroy");
+        caller.start();
+        caller.join(5_000);
+        assertTrue(closed.await(5, TimeUnit.SECONDS), "close was never called");
+        assertFalse(
+                closeThread.get().startsWith("caller-event-loop-destroy"),
+                "client close ran on the caller thread: " + closeThread.get());
     }
 }

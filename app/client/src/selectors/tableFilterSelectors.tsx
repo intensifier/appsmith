@@ -1,20 +1,20 @@
-import { AppState } from "reducers";
+import type { DefaultRootState } from "react-redux";
 import { createSelector } from "reselect";
 
-import { TableFilterPaneReduxState } from "reducers/uiReducers/tableFilterPaneReducer";
-import { getSelectedWidget, getSelectedWidgets } from "./ui";
+import type { TableFilterPaneReduxState } from "reducers/uiReducers/tableFilterPaneReducer";
+import { getLastSelectedWidget, getSelectedWidgets } from "./ui";
 
 export const getTableFilterState = (
-  state: AppState,
+  state: DefaultRootState,
 ): TableFilterPaneReduxState => state.ui.tableFilterPane;
 
-const isResizingorDragging = (state: AppState) =>
+const isResizingorDragging = (state: DefaultRootState) =>
   state.ui.widgetDragResize.isResizing || state.ui.widgetDragResize.isDragging;
 
 export const getIsTableFilterPaneVisible = createSelector(
   getTableFilterState,
   isResizingorDragging,
-  getSelectedWidget,
+  getLastSelectedWidget,
   getSelectedWidgets,
   (
     pane: TableFilterPaneReduxState,
@@ -26,6 +26,7 @@ export const getIsTableFilterPaneVisible = createSelector(
       ? lastSelectedWidget === pane.widgetId || widgets.includes(pane.widgetId)
       : false;
     const multipleWidgetsSelected = !!(widgets && widgets.length >= 2);
+
     return !!(
       isWidgetSelected &&
       !multipleWidgetsSelected &&

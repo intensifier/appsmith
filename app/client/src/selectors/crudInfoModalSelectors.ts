@@ -1,17 +1,18 @@
-import { AppState } from "reducers";
+import type { DefaultRootState } from "react-redux";
 import { createSelector } from "reselect";
-import {
+import type {
   CrudInfoModalReduxState,
   GenerateCRUDSuccessInfoData,
 } from "reducers/uiReducers/crudInfoModalReducer";
 
-export type CrudInfoModalData = {
+export interface CrudInfoModalData {
   crudInfoModalOpen: boolean;
   generateCRUDSuccessInfo: GenerateCRUDSuccessInfoData | null;
-};
+}
 
-const getCrudInfoModalState = (state: AppState): CrudInfoModalReduxState =>
-  state.ui.crudInfoModal;
+const getCrudInfoModalState = (
+  state: DefaultRootState,
+): CrudInfoModalReduxState => state.ui.crudInfoModal;
 
 export const getCrudInfoModalData = createSelector(
   getCrudInfoModalState,

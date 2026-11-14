@@ -1,0 +1,728 @@
+import { z } from "zod";
+import {
+  bindingExprProblem,
+  bindingExprQueries,
+  bindingExprReads,
+  bindingExprSchema,
+  compileBindingExprBody,
+} from "./bindingExpr.js";
+import { jsCollectionName, jsFunctionName } from "./jsObject.js";
+import type { WidgetNode } from "./layout.js";
+import {
+  entityPropertyPath,
+  pageNameSchema,
+  PROTOTYPE_PROPERTY_NAMES,
+  responseFieldPath,
+  storeKeySchema,
+  RAW_EXPRESSION,
+} from "./schema.js";
+
+// M-F event wiring. A CLOSED event vocabulary: the agent supplies a structured action reference (run a query,
+// navigate to a page, show/close a modal), and the compiler emits the trigger binding. The agent never authors raw
+// `{{ }}` or JS. Names are strict identifiers / safe page names, so the single-quoted arguments the compiler emits
+// (e.g. navigateTo('Page')) cannot be broken out of.
+
+const queryName = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9_]+$/, "must be a query name (alphanumeric/underscore)");
+const widgetName = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9_]+$/, "must be a widget name (alphanumeric/underscore)");
+// Shared with the JS-object grammar's `navigate` step (schema.ts).
+const pageName = pageNameSchema;
+
+// Alert text is emitted inside a single-quoted argument, so the charset excludes quotes, backslashes, braces, and
+// backticks — nothing in it can terminate the string or open an expression.
+const alertMessage = z
+  .string()
+  .min(1)
+  .max(200)
+  .regex(
+    /^[A-Za-z0-9_ .,:!?()-]+$/,
+    "alert messages allow letters, numbers, spaces, and . , : ! ? ( ) -",
+  );
+
+const alertStyle = z.enum(["info", "success", "warning", "error"]);
+
+// Call one function of a JS object (`Obj.fn()`). Both halves use the JS-object identifier grammar (the same schemas
+// create_js_object validates, so any function that can be created can be referenced), so the emitted member call
+// cannot carry arguments, property chains, or any caller-authored syntax; the tool additionally checks that the
+// object and function exist among the application's JS collections before writing (dangling guard). The object may
+// be MCP-compiled or editor-authored: like `run` on an existing query, the verb only wires an event to code that
+// already exists in the application, executing in the end user's browser under the end user's permissions.
+// Optional arguments: scalar literals (JSON-encoded at emission), widget-property references (identifier + dotted
+// path, emitted bare), or (APP-16381) a binding expression `{ expr }` from the closed grammar (bindingExpr.ts), such
+// as the selected row's end date plus a year. A string argument may not hold a `{` or `}`, for the same reason as a
+// navigate literal (see navigateText). A `'` in a string argument is emitted as the escape \u0027, so the stored
+// trigger text never holds a quote character: the modal-graph scan reads that text, and a quoted `closeModal('X')`
+// inside a string would otherwise read as a real edge (as M6 refused for store paths). An expression argument's
+// strings cannot use that escape (compileExpr's output is shared with JS objects), so they refuse `'`.
+const callArg = z.union([
+  z
+    .string()
+    .max(200)
+    .refine((value) => !RAW_EXPRESSION.test(value), "must not contain bindings")
+    .refine(
+      (value) => !/[{}]/.test(value),
+      "must not contain { or } (the binding would not run)",
+    ),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+  z.object({ widget: widgetName, property: entityPropertyPath }).strict(),
+  bindingExprSchema.superRefine((value, ctx) => {
+    // zod still runs this after the tree failed to parse (it carries the issue already).
+    if (typeof value !== "object" || value === null) return;
+
+    const problem = bindingExprProblem(value.expr, { trigger: true });
+
+    if (problem)
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem });
+  }),
+]);
+const callAction = z
+  .object({
+    call: z
+      .object({
+        object: jsCollectionName,
+        function: jsFunctionName,
+        args: z.array(callArg).max(5).optional(),
+      })
+      .strict(),
+  })
+  .strict();
+
+// Reset (clear) one or more widgets to their default state — e.g. a Clear button that empties an input and resets a
+// table. Each name is a strict widget identifier, so the emitted resetWidget('Name', true) cannot be broken out of.
+const resetAction = z
+  .object({
+    reset: z.union([widgetName, z.array(widgetName).min(1).max(10)]),
+  })
+  .strict();
+
+// M5 fields projection — one bracket-access path element into the query's response: a string key or a non-negative
+// integer array index. Each element is emitted through JSON.stringify into `?.[...]` bracket access, so quotes and
+// backslashes in a key cannot terminate the emitted string literal. Defense-in-depth ON TOP of that escaping: the
+// binding-syntax charsets are still rejected, because Appsmith's `{{ }}` extraction is text-level (not JS-aware) —
+// a `}}` inside a JSON-escaped string would still terminate the outer binding and let a following `{{ ... }}` in the
+// same key become a second, evaluated expression. Same rejection set as schema.ts safeText (incl. U+2028/U+2029).
+const storePathElement = z.union([
+  z
+    .string()
+    .min(1)
+    .max(100)
+    .refine((value) => !RAW_EXPRESSION.test(value), {
+      message:
+        "path elements must not contain binding/template syntax ({{ }}, ${ }, or backticks)",
+    })
+    // M6 hardening: a single quote in a path element would let an agent embed the literal text
+    // closeModal('Host') / showModal('X') inside the compiled binding's JSON string. The wiring being made is
+    // judged structurally, but LATER text scans of the persisted binding would misread those as edges —
+    // closeModal poisoning could reclassify a real stacking edge as a wizard transition and skip the depth
+    // gate. JSON keys with apostrophes are vanishingly rare; reject the quote outright.
+    .refine((value) => !value.includes("'"), {
+      message: "path elements must not contain single quotes",
+    }),
+  z.number().int().min(0).max(100_000),
+]);
+
+// One projected row field: `as` names the property on the appended row (a store key — identifier-shaped and
+// prototype-denylisted, because it is emitted as an UNQUOTED object-literal key where `__proto__:` would rewrite
+// the row's prototype); `path` is the bracket-access path into the query's response. The projection exists because
+// real APIs return space-keyed and array-indexed values ("post code", places[0].state) that the dotted `field`
+// identifier path cannot reach.
+const storeFieldProjection = z
+  .object({
+    as: storeKeySchema,
+    path: z.array(storePathElement).min(1).max(5),
+  })
+  .strict();
+
+// M5 appendToStore — accumulate a query's response under a store key (the ZIP-lookup "results table that grows with
+// each lookup" pattern). `field` keeps the existing responseFieldPath rules; `fields` projects named paths into ONE
+// appended row; the two are mutually exclusive. `query` resolves through the same dangling-reference guard as `run`.
+const appendToStoreSpec = z
+  .object({
+    key: storeKeySchema,
+    query: queryName,
+    field: responseFieldPath.optional(),
+    fields: z.array(storeFieldProjection).min(1).max(20).optional(),
+  })
+  .strict()
+  .refine((spec) => !(spec.field !== undefined && spec.fields !== undefined), {
+    message: "'field' and 'fields' are mutually exclusive",
+  });
+
+const appendToStoreAction = z
+  .object({ appendToStore: appendToStoreSpec })
+  .strict();
+
+// M5 clearStoreKey — empty ONE store key (storeValue('<key>', [])), keeping the `?? []` table binding stable.
+// Deliberately NOT named clearStore: the platform global clearStore() wipes the entire store.
+const clearStoreKeyAction = z
+  .object({ clearStoreKey: z.object({ key: storeKeySchema }).strict() })
+  .strict();
+
+// A value passed to navigate as a URL query parameter. Each is emitted as a JSON literal or a validated identifier
+// path, never as caller text:
+// - `{ literal }`: a string, number or boolean, JSON-encoded. A string may not hold binding syntax or a single quote
+//   (later text scans of the persisted binding look for quoted page and modal names), or a `{` or `}`: Appsmith
+//   splits a binding by counting braces, even inside a string, so an unbalanced one would turn the whole handler into
+//   plain text that never runs.
+// - `{ widget, property }`: a widget property path.
+// - `{ table, column }`: a column of the table's selected row, emitted as `Table.selectedRow?.["column"]`, so a
+//   column name with spaces works.
+const navigateText = z
+  .string()
+  .max(200)
+  .refine((value) => !RAW_EXPRESSION.test(value), "must not contain bindings")
+  .refine((value) => !value.includes("'"), "must not contain single quotes")
+  .refine(
+    (value) => !/[{}]/.test(value),
+    "must not contain { or } (the binding would not run)",
+  );
+const navigateParamValue = z.union([
+  z
+    .object({
+      literal: z.union([navigateText, z.number().finite(), z.boolean()]),
+    })
+    .strict(),
+  z.object({ widget: widgetName, property: entityPropertyPath }).strict(),
+  // The column is read as T.selectedRow?.["col"], so it may not be an Object.prototype name.
+  z
+    .object({
+      table: widgetName,
+      column: navigateText
+        .pipe(z.string().min(1))
+        .refine(
+          (column) =>
+            !PROTOTYPE_PROPERTY_NAMES.has(column) && column !== "prototype",
+          "a column name cannot be an Object.prototype name",
+        ),
+    })
+    .strict(),
+]);
+
+type NavigateParamValue = z.infer<typeof navigateParamValue>;
+
+// navigate opens a page, optionally with URL query parameters (`?id=...`). Keys use the store-key rule: an
+// identifier that is not an Object.prototype name, because each is emitted as an unquoted object-literal key.
+const navigateAction = z
+  .object({
+    navigate: pageName,
+    params: z
+      .record(storeKeySchema, navigateParamValue)
+      .refine(
+        (params) => Object.keys(params).length <= 10,
+        "at most 10 navigate params",
+      )
+      .optional(),
+  })
+  .strict();
+
+function compileNavigateParam(value: NavigateParamValue): string {
+  if ("literal" in value) return JSON.stringify(value.literal);
+
+  if ("widget" in value) return `${value.widget}.${value.property}`;
+
+  return `${value.table}.selectedRow?.[${JSON.stringify(value.column)}]`;
+}
+
+// A follow-up step inside a run's onSuccess/onError callback: the same closed kinds plus showAlert and reset.
+// Follow-ups can never nest further (no callbacks on callbacks), so the compiled binding stays one bounded chain.
+const followUpActionSchema = z.union([
+  z.object({ run: queryName }).strict(),
+  navigateAction,
+  z.object({ showModal: widgetName }).strict(),
+  z.object({ closeModal: widgetName }).strict(),
+  z.object({ showAlert: alertMessage, style: alertStyle.optional() }).strict(),
+  resetAction,
+  appendToStoreAction,
+  clearStoreKeyAction,
+  callAction,
+]);
+
+export type FollowUpAction = z.infer<typeof followUpActionSchema>;
+
+// One primary action per event. `run` may chain follow-ups: onSuccess runs after the query resolves (refresh a
+// table by re-running its query, close the modal, confirm with an alert) and onError after it rejects.
+export const eventActionSchema = z.union([
+  z
+    .object({
+      run: queryName,
+      onSuccess: z.array(followUpActionSchema).min(1).max(5).optional(),
+      onError: z.array(followUpActionSchema).min(1).max(5).optional(),
+    })
+    .strict(),
+  navigateAction,
+  z.object({ showModal: widgetName }).strict(),
+  z.object({ closeModal: widgetName }).strict(),
+  z.object({ showAlert: alertMessage, style: alertStyle.optional() }).strict(),
+  resetAction,
+  appendToStoreAction,
+  clearStoreKeyAction,
+  callAction,
+]);
+
+export type EventAction = z.infer<typeof eventActionSchema>;
+
+// M5: the primary action may also be a LIST of 2–5 statements executed in order — required so a Clear button can
+// clearStoreKey AND reset the input in one click. Only `run` carries onSuccess/onError, and at most one run per
+// list keeps the emission a single bounded chain; the statements join the same fixed templates with ';', so the
+// security profile is unchanged.
+export const eventActionListSchema = z
+  .array(eventActionSchema)
+  .min(2)
+  .max(5)
+  .refine((actions) => actions.filter((step) => "run" in step).length <= 1, {
+    message: "a statement list may contain at most one 'run'",
+  })
+  // The list is STARTED in order but `run` is asynchronous: a sibling appendToStore of the same query would
+  // execute before the run resolves and read the PREVIOUS response — the exact stale-table confusion this
+  // vocabulary exists to eliminate. Data-dependent verbs belong in that run's onSuccess.
+  .refine(
+    (actions) => {
+      const runs = new Set(
+        actions.flatMap((step) => ("run" in step ? [step.run] : [])),
+      );
+
+      return !actions.some(
+        (step) => "appendToStore" in step && runs.has(step.appendToStore.query),
+      );
+    },
+    {
+      message:
+        "appendToStore of a query that a sibling 'run' starts would read the previous response ('run' is asynchronous); put the appendToStore in that run's onSuccess instead",
+    },
+  );
+
+export type EventActionInput = EventAction | EventAction[];
+
+// The event property allowed on each widget type (closed). form submit is wired via the form's button onClick.
+// Change/submit events let controls drive queries directly ("re-run when the dropdown changes") — the page-load
+// case needs no event at all: the server auto-derives on-page-load execution from widget bindings when the
+// layout is saved, so a query bound to any widget already runs on load.
+const EVENTS_BY_TYPE: Record<string, readonly string[]> = {
+  BUTTON_WIDGET: ["onClick"],
+  TABLE_WIDGET_V2: ["onRowSelected"],
+  MODAL_WIDGET: ["onClose"],
+  TABS_WIDGET: ["onTabSelected"],
+  SELECT_WIDGET: ["onOptionChange"],
+  INPUT_WIDGET_V2: ["onSubmit"],
+  CHECKBOX_WIDGET: ["onCheckChange"],
+  SWITCH_WIDGET: ["onChange"],
+  DATE_PICKER_WIDGET2: ["onDateSelected"],
+  // APP-16381: choosing a radio option (for example, resetting a date picker when the request kind changes), a
+  // checkbox group's selection, and a multiselect's options.
+  RADIO_GROUP_WIDGET: ["onSelectionChange"],
+  CHECKBOX_GROUP_WIDGET: ["onSelectionChange"],
+  MULTI_SELECT_WIDGET_V2: ["onOptionChange"],
+};
+
+// A table column id for a column's onClick (`primaryColumns.<id>.onClick`): an identifier that is never a prototype
+// name, so the nested write cannot reach Object.prototype.
+const columnId = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "must be a column id (an identifier)")
+  .refine(
+    (id) => !PROTOTYPE_PROPERTY_NAMES.has(id),
+    "collides with an Object.prototype property name",
+  );
+
+// The column types whose cells are buttons, and so have an onClick.
+const CLICKABLE_COLUMN_TYPES: ReadonlySet<string> = new Set([
+  "button",
+  "iconButton",
+]);
+
+export const wireEventSpecSchema = z
+  .object({
+    widget: widgetName,
+    event: z.enum([
+      "onClick",
+      "onRowSelected",
+      "onClose",
+      "onTabSelected",
+      "onOptionChange",
+      "onSubmit",
+      "onCheckChange",
+      "onChange",
+      "onDateSelected",
+      "onSelectionChange",
+    ]),
+    // APP-16381: a button or icon-button column of a table (its id from read_semantic_page `columns`). Only with
+    // event onClick; the trigger lands on `primaryColumns.<column>.onClick`, where `{ table, column, row:
+    // "triggered" }` reads the clicked row.
+    column: columnId.optional(),
+    // A single action, or (M5) an ordered list of 2–5 statements.
+    action: z.union([eventActionSchema, eventActionListSchema]),
+  })
+  .strict();
+
+export type WireEventSpec = z.infer<typeof wireEventSpecSchema>;
+
+// The bracket-access path into a query's response for one projected field: `Q.data?.["post code"]`,
+// `Q.data?.["places"]?.[0]?.["state"]`. Every element passes through JSON.stringify, so a key's quotes/backslashes
+// cannot terminate the emitted string literal (binding syntax is additionally rejected by storePathElement).
+function compileStorePath(query: string, path: (string | number)[]): string {
+  return path.reduce<string>(
+    (expression, element) => `${expression}?.[${JSON.stringify(element)}]`,
+    `${query}.data`,
+  );
+}
+
+// One statement of the closed vocabulary, without the outer `{{ }}`. Every interpolated value is a validated
+// identifier / safe charset, so no argument can escape its single-quoted position.
+function compileStatement(action: FollowUpAction): string {
+  if ("run" in action) return `${action.run}.run()`;
+
+  if ("navigate" in action) {
+    const params = Object.entries(action.params ?? {});
+    const query =
+      params.length === 0
+        ? "{}"
+        : `{ ${params
+            .map(([key, value]) => `${key}: ${compileNavigateParam(value)}`)
+            .join(", ")} }`;
+
+    return `navigateTo('${action.navigate}', ${query}, 'SAME_WINDOW')`;
+  }
+
+  if ("showModal" in action) return `showModal('${action.showModal}')`;
+
+  if ("closeModal" in action) return `closeModal('${action.closeModal}')`;
+
+  if ("reset" in action) {
+    const names = Array.isArray(action.reset) ? action.reset : [action.reset];
+
+    return names.map((name) => `resetWidget('${name}', true)`).join("; ");
+  }
+
+  // M5 appendToStore: accumulate under a store key. `[].concat` (not spread) flattens an array-returning query
+  // (one row per record) and appends an object response — or the fields-projected row — as a single row.
+  // `persist=false` (third arg) is deliberate: the Appsmith store persists to localStorage keyed per APP, not per
+  // user, so persisted accumulation would leak one user's rows to the next user of a shared browser and outlive
+  // logout. Session-only means results reset on reload — by design.
+  if ("appendToStore" in action) {
+    const { field, fields, key, query } = action.appendToStore;
+    const expression = fields
+      ? `{ ${fields
+          .map(({ as, path }) => `${as}: ${compileStorePath(query, path)}`)
+          .join(", ")} }`
+      : field
+        ? `${query}.data?.${field}`
+        : `${query}.data`;
+
+    return `storeValue('${key}', [].concat(appsmith.store.${key} ?? [], ${expression} ?? []), false)`;
+  }
+
+  // M5 clearStoreKey: empty ONE key (never the platform clearStore(), which wipes the whole store). Writing []
+  // rather than removing the value keeps the table's `?? []` binding stable.
+  if ("clearStoreKey" in action) {
+    return `storeValue('${action.clearStoreKey.key}', [], false)`;
+  }
+
+  // JS-object function call: `Obj.fn(...)` from two validated identifiers; each argument is a JSON-encoded scalar
+  // literal or a validated `Widget.path` reference.
+  if ("call" in action) {
+    const args = (action.call.args ?? []).map((arg) =>
+      typeof arg === "object" && arg !== null
+        ? "expr" in arg
+          ? compileBindingExprBody(arg.expr)
+          : `${arg.widget}.${arg.property}`
+        : JSON.stringify(arg).replace(/'/g, "\\u0027"),
+    );
+
+    return `${action.call.object}.${action.call.function}(${args.join(", ")})`;
+  }
+
+  return `showAlert('${action.showAlert}', '${action.style ?? "info"}')`;
+}
+
+// One primary statement's full expression: a chained run compiles to one bounded promise expression
+// (`Q.run().then(() => { ...; }).catch(() => { ...; })`), every other verb to its fixed template.
+function compilePrimaryExpression(action: EventAction): string {
+  if (!("run" in action)) return compileStatement(action);
+
+  let expression = `${action.run}.run()`;
+
+  if (action.onSuccess !== undefined) {
+    const steps = action.onSuccess.map(compileStatement).join("; ");
+
+    expression += `.then(() => { ${steps}; })`;
+  }
+
+  if (action.onError !== undefined) {
+    const steps = action.onError.map(compileStatement).join("; ");
+
+    expression += `.catch(() => { ${steps}; })`;
+  }
+
+  return expression;
+}
+
+// The single binding emitter. A statement list (M5) joins the same fixed per-statement templates with ';' — the
+// schema caps it at 5 statements with at most one run, so the emission stays one bounded expression.
+export function compileEventBinding(action: EventActionInput): string {
+  const actions = Array.isArray(action) ? action : [action];
+
+  return `{{ ${actions.map(compilePrimaryExpression).join("; ")} }}`;
+}
+
+// Every entity an event references — each primary statement plus all follow-ups — so the caller can verify each
+// exists before writing (dangling-reference guard). showAlert and clearStoreKey reference nothing;
+// appendToStore references its source query.
+export type EventReference =
+  | { kind: "query" | "page" | "widget"; name: string }
+  | { kind: "widget"; name: string; table: true }
+  // A query an expression argument only reads (APP-16381): checked to exist, but not run.
+  | { kind: "query"; name: string; readOnly: true }
+  // A JS-object function reference: `name` is the object, `member` the function (both checked by the tool).
+  | { kind: "jsFunction"; name: string; member: string };
+
+export function eventReferences(action: EventActionInput): EventReference[] {
+  const single = (step: FollowUpAction): EventReference[] => {
+    if ("run" in step) return [{ kind: "query" as const, name: step.run }];
+
+    if ("call" in step) {
+      return [
+        {
+          kind: "jsFunction" as const,
+          name: step.call.object,
+          member: step.call.function,
+        },
+        // Widget-property arguments, and the widgets and queries an expression argument reads, are references too
+        // (dangling guard).
+        ...(step.call.args ?? []).flatMap((arg): EventReference[] =>
+          typeof arg === "object" && arg !== null
+            ? "expr" in arg
+              ? [
+                  ...bindingExprReads(arg.expr).map((read) => ({
+                    kind: "widget" as const,
+                    name: read.widget,
+                    ...(read.table ? { table: true as const } : {}),
+                  })),
+                  ...bindingExprQueries(arg.expr).map((name) => ({
+                    kind: "query" as const,
+                    name,
+                    readOnly: true as const,
+                  })),
+                ]
+              : [{ kind: "widget" as const, name: arg.widget }]
+            : [],
+        ),
+      ];
+    }
+
+    if ("navigate" in step) {
+      return [
+        { kind: "page" as const, name: step.navigate },
+        // Parameter widgets and tables are widget references too (dangling guard).
+        ...Object.values(step.params ?? {}).flatMap((value) =>
+          "widget" in value
+            ? [{ kind: "widget" as const, name: value.widget }]
+            : "table" in value
+              ? [
+                  {
+                    kind: "widget" as const,
+                    name: value.table,
+                    table: true as const,
+                  },
+                ]
+              : [],
+        ),
+      ];
+    }
+
+    if ("showModal" in step) {
+      return [{ kind: "widget" as const, name: step.showModal }];
+    }
+
+    if ("closeModal" in step) {
+      return [{ kind: "widget" as const, name: step.closeModal }];
+    }
+
+    if ("reset" in step) {
+      const names = Array.isArray(step.reset) ? step.reset : [step.reset];
+
+      return names.map((name) => ({ kind: "widget" as const, name }));
+    }
+
+    if ("appendToStore" in step) {
+      return [{ kind: "query" as const, name: step.appendToStore.query }];
+    }
+
+    return [];
+  };
+  const primary = (step: EventAction): EventReference[] => {
+    if (!("run" in step)) return single(step);
+
+    return [
+      { kind: "query" as const, name: step.run },
+      ...(step.onSuccess ?? []).flatMap(single),
+      ...(step.onError ?? []).flatMap(single),
+    ];
+  };
+  const actions = Array.isArray(action) ? action : [action];
+
+  return actions.flatMap(primary);
+}
+
+// The statement verb kinds an action uses (each primary statement plus its follow-ups), deduped in encounter
+// order — recorded in wire_event's audit/telemetry payload so verb adoption (e.g. appendToStore) is measurable.
+export function eventActionKinds(action: EventActionInput): string[] {
+  const kindOf = (step: FollowUpAction | EventAction): string => {
+    if ("run" in step) return "run";
+
+    if ("navigate" in step) return "navigate";
+
+    if ("showModal" in step) return "showModal";
+
+    if ("closeModal" in step) return "closeModal";
+
+    if ("reset" in step) return "reset";
+
+    if ("appendToStore" in step) return "appendToStore";
+
+    if ("clearStoreKey" in step) return "clearStoreKey";
+
+    if ("call" in step) return "call";
+
+    return "showAlert";
+  };
+  const kinds: string[] = [];
+  const add = (kind: string): void => {
+    if (!kinds.includes(kind)) kinds.push(kind);
+  };
+
+  for (const step of Array.isArray(action) ? action : [action]) {
+    add(kindOf(step));
+
+    if ("run" in step) {
+      for (const followUp of step.onSuccess ?? []) add(kindOf(followUp));
+
+      for (const followUp of step.onError ?? []) add(kindOf(followUp));
+    }
+  }
+
+  return kinds;
+}
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function locateWidgetNamed(
+  node: WidgetNode,
+  name: string,
+): WidgetNode | undefined {
+  if (node.widgetName === name) return node;
+
+  for (const child of node.children ?? []) {
+    const found = locateWidgetNamed(child, name);
+
+    if (found) return found;
+  }
+
+  return undefined;
+}
+
+// The trigger path a wiring writes: the event prop, or a table column's `primaryColumns.<id>.onClick`.
+export function eventTriggerKey(spec: WireEventSpec): string {
+  return spec.column === undefined
+    ? spec.event
+    : `primaryColumns.${spec.column}.onClick`;
+}
+
+// The column a column wiring targets: a table, event onClick, and an existing button or icon-button column (own
+// property only).
+function columnOf(
+  widget: WidgetNode,
+  spec: WireEventSpec,
+): Record<string, unknown> {
+  if (widget.type !== "TABLE_WIDGET_V2") {
+    throw new Error(
+      `'column' can only be wired on a TABLE_WIDGET_V2 ("${spec.widget}" is ${widget.type})`,
+    );
+  }
+
+  if (spec.event !== "onClick") {
+    throw new Error(`a table column is wired with event "onClick"`);
+  }
+
+  const columns = widget.primaryColumns as Record<string, unknown> | undefined;
+  const column =
+    typeof columns === "object" &&
+    columns !== null &&
+    Object.prototype.hasOwnProperty.call(columns, spec.column as string)
+      ? (columns[spec.column as string] as Record<string, unknown> | null)
+      : undefined;
+
+  if (typeof column !== "object" || column === null) {
+    throw new Error(
+      `column "${spec.column}" was not found on table "${spec.widget}"`,
+    );
+  }
+
+  if (!CLICKABLE_COLUMN_TYPES.has(String(column.columnType))) {
+    throw new Error(
+      `column "${spec.column}" is a ${String(column.columnType)} column; only button and iconButton columns have onClick (add one with patch_widgets addColumn)`,
+    );
+  }
+
+  return column;
+}
+
+// Set the event's trigger binding on the named widget and register the trigger path. Returns a new DSL (the caller's
+// DSL is never mutated) plus a small change summary. Throws on unknown widget or an event invalid for the type.
+export function applyEvent(
+  dsl: WidgetNode,
+  spec: WireEventSpec,
+): { dsl: WidgetNode; widgetType: string; binding: string } {
+  const next = cloneJson(dsl);
+  const widget = locateWidgetNamed(next, spec.widget);
+
+  if (!widget) {
+    throw new Error(`widget "${spec.widget}" was not found on this page`);
+  }
+
+  const binding = compileEventBinding(spec.action);
+
+  if (spec.column !== undefined) {
+    columnOf(widget, spec).onClick = binding;
+  } else {
+    const allowed = EVENTS_BY_TYPE[widget.type];
+
+    if (!allowed || !allowed.includes(spec.event)) {
+      throw new Error(
+        `event "${spec.event}" is not supported on ${widget.type} (${spec.widget})`,
+      );
+    }
+
+    widget[spec.event] = binding;
+  }
+
+  const key = eventTriggerKey(spec);
+  const triggerPaths = Array.isArray(widget.dynamicTriggerPathList)
+    ? (widget.dynamicTriggerPathList as { key: string }[])
+    : [];
+
+  if (!triggerPaths.some((entry) => entry.key === key)) {
+    triggerPaths.push({ key });
+  }
+
+  widget.dynamicTriggerPathList = triggerPaths;
+
+  return { dsl: next, widgetType: widget.type, binding };
+}
+
+// Whether a modal/widget referenced by show/closeModal exists on the page (widget-scoped reference check).
+export function widgetExists(dsl: WidgetNode, name: string): boolean {
+  return locateWidgetNamed(dsl, name) !== undefined;
+}

@@ -1,8 +1,8 @@
 import { createSelector } from "reselect";
 import { get, set } from "lodash";
-import { AppState } from "reducers";
+import type { DefaultRootState } from "react-redux";
 
-import { CanvasWidgetsReduxState } from "reducers/entityReducers/canvasWidgetsReducer";
+import type { CanvasWidgetsReduxState } from "ee/reducers/entityReducers/canvasWidgetsReducer";
 import {
   getParentWithEnhancementFn,
   getWidgetEnhancementFn,
@@ -10,7 +10,7 @@ import {
 } from "sagas/WidgetEnhancementHelpers";
 import { getWidgets } from "sagas/selectors";
 
-const getEvaluationTree = (state: AppState) => state.evaluations.tree;
+const getEvaluationTree = (state: DefaultRootState) => state.evaluations.tree;
 
 const getPropsFromTree = (tree: unknown, widgetName?: string): unknown => {
   // Get the evaluated data of this widget from the evaluations tree.
@@ -19,18 +19,33 @@ const getPropsFromTree = (tree: unknown, widgetName?: string): unknown => {
   return get(tree, widgetName, undefined);
 };
 
-export type EnhancementFns = {
+export interface EnhancementFns {
   enhancementFns: {
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     updateDataTreePathFn: any;
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     propertyPaneEnhancementFn: any;
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     autoCompleteEnhancementFn: any;
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     customJSControlEnhancementFn: any;
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     hideEvaluatedValueEnhancementFn: any;
+    // TODO: Fix this the next time the file is edited
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    shouldHidePropertyFn: any;
   };
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   parentIdWithEnhancementFn: any;
-};
+}
 
-export const getWidgetEnhancementSelector = (widgetId: string) => {
+export const getWidgetEnhancementSelector = (widgetId: string | undefined) => {
   return createSelector(
     getWidgets,
     getEvaluationTree,
@@ -41,6 +56,7 @@ export const getWidgetEnhancementSelector = (widgetId: string) => {
         autoCompleteEnhancementFn: undefined,
         customJSControlEnhancementFn: undefined,
         hideEvaluatedValueEnhancementFn: undefined,
+        shouldHidePropertyFn: undefined,
       };
 
       // Get the parent which wants to enhance this widget
@@ -78,6 +94,10 @@ export const getWidgetEnhancementSelector = (widgetId: string) => {
           hideEvaluatedValueEnhancementFn: getWidgetEnhancementFn(
             parentWithEnhancementFn.type,
             WidgetEnhancementType.HIDE_EVALUATED_VALUE,
+          ),
+          shouldHidePropertyFn: getWidgetEnhancementFn(
+            parentWithEnhancementFn.type,
+            WidgetEnhancementType.SHOULD_HIDE_PROPERTY,
           ),
         };
 

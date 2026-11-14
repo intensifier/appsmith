@@ -1,43 +1,35 @@
 import React from "react";
-import copy from "copy-to-clipboard";
-import styled from "styled-components";
-import { Classes as BPClasses, Position } from "@blueprintjs/core";
-import { Popover2, IPopover2Props } from "@blueprintjs/popover2";
-import { Dispatch } from "redux";
-import { useDispatch } from "react-redux";
-import Text, { FontWeight, TextType } from "components/ads/Text";
-import { Message, SourceEntity } from "entities/AppsmithConsole";
+import { Classes as BPClasses } from "@blueprintjs/core";
+import type { Dispatch } from "redux";
+import { useDispatch, useSelector } from "react-redux";
+import type { Message, SourceEntity } from "entities/AppsmithConsole";
 import { PropertyEvaluationErrorType } from "utils/DynamicBindingUtils";
-import AnalyticsUtil from "utils/AnalyticsUtil";
-import {
-  setGlobalSearchQuery,
-  toggleShowGlobalSearchModal,
-} from "actions/globalSearchActions";
-import { filterCategories, SEARCH_CATEGORY_ID } from "../GlobalSearch/utils";
-import { getAppsmithConfigs } from "configs";
+import AnalyticsUtil from "ee/utils/AnalyticsUtil";
+import { isPylonChatAvailable } from "utils/bootPylon";
+import { getAppsmithConfigs } from "ee/configs";
+import { getCurrentUser } from "selectors/usersSelectors";
 import {
   createMessage,
   DEBUGGER_APPSMITH_SUPPORT,
-  DEBUGGER_COPY_MESSAGE,
   DEBUGGER_INTERCOM_TEXT,
   DEBUGGER_OPEN_DOCUMENTATION,
-  DEBUGGER_SEARCH_GOOGLE,
-  DEBUGGER_SEARCH_SNIPPET,
-} from "constants/messages";
-import Icon, { IconName, IconSize } from "components/ads/Icon";
-import { Classes } from "components/ads/common";
-import { Colors } from "constants/Colors";
-import { executeCommandAction } from "actions/apiPaneActions";
-import { SlashCommand } from "entities/Action";
-import { FieldEntityInformation } from "../CodeEditor/EditorConfig";
-const { intercomAppID } = getAppsmithConfigs();
+  TROUBLESHOOT_ISSUE,
+} from "ee/constants/messages";
+import {
+  Menu,
+  MenuContent,
+  MenuItem,
+  MenuTrigger,
+  Tooltip,
+} from "@appsmith/ads";
+import type { FieldEntityInformation } from "../CodeEditor/EditorConfig";
+import { DocsLink, openDoc } from "../../../constants/DocumentationLinks";
+
+const { cloudHosting } = getAppsmithConfigs();
 
 enum CONTEXT_MENU_ACTIONS {
-  COPY = "COPY",
   DOCS = "DOCS",
-  SNIPPET = "SNIPPET",
-  GOOGLE = "GOOGLE",
-  INTERCOM = "INTERCOM",
+  CHAT_WIDGET = "CHAT_WIDGET",
 }
 
 enum PLUGIN_EXECUTION_ERRORS {
@@ -49,101 +41,47 @@ enum PLUGIN_EXECUTION_ERRORS {
 
 const getOptions = (type?: string, subType?: string) => {
   const defaultOptions = [
-    CONTEXT_MENU_ACTIONS.COPY,
     CONTEXT_MENU_ACTIONS.DOCS,
-    CONTEXT_MENU_ACTIONS.SNIPPET,
-    CONTEXT_MENU_ACTIONS.GOOGLE,
-    CONTEXT_MENU_ACTIONS.INTERCOM,
+    CONTEXT_MENU_ACTIONS.CHAT_WIDGET,
   ];
 
   if (subType) {
     switch (subType) {
       // These types are sent by the server
       case PLUGIN_EXECUTION_ERRORS.DATASOURCE_CONFIGURATION_ERROR:
-        return [
-          CONTEXT_MENU_ACTIONS.COPY,
-          CONTEXT_MENU_ACTIONS.GOOGLE,
-          CONTEXT_MENU_ACTIONS.INTERCOM,
-        ];
+        return [CONTEXT_MENU_ACTIONS.CHAT_WIDGET];
       case PLUGIN_EXECUTION_ERRORS.PLUGIN_ERROR:
-        return [
-          CONTEXT_MENU_ACTIONS.COPY,
-          CONTEXT_MENU_ACTIONS.GOOGLE,
-          CONTEXT_MENU_ACTIONS.INTERCOM,
-        ];
+        return [CONTEXT_MENU_ACTIONS.CHAT_WIDGET];
       case PLUGIN_EXECUTION_ERRORS.CONNECTIVITY_ERROR:
-        return [CONTEXT_MENU_ACTIONS.COPY, CONTEXT_MENU_ACTIONS.DOCS];
+        return [CONTEXT_MENU_ACTIONS.DOCS];
       case PLUGIN_EXECUTION_ERRORS.ACTION_CONFIGURATION_ERROR:
-        return [
-          CONTEXT_MENU_ACTIONS.COPY,
-          CONTEXT_MENU_ACTIONS.DOCS,
-          CONTEXT_MENU_ACTIONS.INTERCOM,
-        ];
+        return [CONTEXT_MENU_ACTIONS.DOCS, CONTEXT_MENU_ACTIONS.CHAT_WIDGET];
       default:
         return defaultOptions;
     }
   } else {
     switch (type) {
       case PropertyEvaluationErrorType.VALIDATION:
-        return [
-          CONTEXT_MENU_ACTIONS.COPY,
-          CONTEXT_MENU_ACTIONS.DOCS,
-          CONTEXT_MENU_ACTIONS.SNIPPET,
-          CONTEXT_MENU_ACTIONS.INTERCOM,
-        ];
+        return [CONTEXT_MENU_ACTIONS.DOCS, CONTEXT_MENU_ACTIONS.CHAT_WIDGET];
       case PropertyEvaluationErrorType.PARSE:
-        return [
-          CONTEXT_MENU_ACTIONS.COPY,
-          CONTEXT_MENU_ACTIONS.SNIPPET,
-          CONTEXT_MENU_ACTIONS.GOOGLE,
-        ];
-      case PropertyEvaluationErrorType.LINT:
-        return [
-          CONTEXT_MENU_ACTIONS.COPY,
-          CONTEXT_MENU_ACTIONS.SNIPPET,
-          CONTEXT_MENU_ACTIONS.GOOGLE,
-        ];
+        return [CONTEXT_MENU_ACTIONS.DOCS];
       default:
         return defaultOptions;
     }
   }
 };
 
-const isFieldEntityInformation = (
-  entity: FieldEntityInformation | SourceEntity,
-): entity is FieldEntityInformation => {
-  return entity.hasOwnProperty("entityType");
-};
-
-const getSnippetArgs = function(
-  entity?: FieldEntityInformation | SourceEntity,
-) {
-  if (!entity) return {};
-  if (isFieldEntityInformation(entity)) {
-    return {
-      entityId: entity.entityId,
-      entityType: entity.entityType,
-    };
-  } else {
-    return {
-      entityId: entity.id,
-      entityType: entity.type,
-    };
-  }
-};
-
-type ContextualMenuProps = {
+interface ContextualMenuProps {
   error: Message;
   children: JSX.Element;
-  position?: Position;
-  modifiers?: IPopover2Props["modifiers"];
   entity?: FieldEntityInformation | SourceEntity;
-};
+  enableTooltip?: boolean;
+}
 
 const searchAction: Record<
   CONTEXT_MENU_ACTIONS,
   {
-    icon: IconName;
+    icon: string;
     text: string;
     onSelect: (
       error: Message,
@@ -152,191 +90,88 @@ const searchAction: Record<
     ) => void;
   }
 > = {
-  [CONTEXT_MENU_ACTIONS.COPY]: {
-    icon: "duplicate",
-    text: createMessage(DEBUGGER_COPY_MESSAGE),
-    onSelect: (error: Message) => {
-      AnalyticsUtil.logEvent("DEBUGGER_CONTEXT_MENU_CLICK", {
-        menuItem: CONTEXT_MENU_ACTIONS.COPY,
-      });
-      copy(error.message);
-    },
-  },
-  [CONTEXT_MENU_ACTIONS.GOOGLE]: {
-    icon: "share-2",
-    text: createMessage(DEBUGGER_SEARCH_GOOGLE),
-    onSelect: (error: Message) => {
-      AnalyticsUtil.logEvent("DEBUGGER_CONTEXT_MENU_CLICK", {
-        menuItem: CONTEXT_MENU_ACTIONS.GOOGLE,
-      });
-      window.open("http://google.com/search?q=" + error.message);
-    },
-  },
   [CONTEXT_MENU_ACTIONS.DOCS]: {
     icon: "book-line",
     text: createMessage(DEBUGGER_OPEN_DOCUMENTATION),
-    onSelect: (error: Message, dispatch: Dispatch) => {
+    onSelect: () => {
       AnalyticsUtil.logEvent("DEBUGGER_CONTEXT_MENU_CLICK", {
         menuItem: CONTEXT_MENU_ACTIONS.DOCS,
       });
-      // Search through the omnibar
-      AnalyticsUtil.logEvent("OPEN_OMNIBAR", {
-        source: "DEBUGGER",
-        searchTerm: error.message,
-        errorType: error.type,
-      });
-      dispatch(setGlobalSearchQuery(error.message || ""));
-      dispatch(
-        toggleShowGlobalSearchModal(filterCategories[SEARCH_CATEGORY_ID.INIT]),
-      );
+      openDoc(DocsLink.TROUBLESHOOT_ERROR);
     },
   },
-  [CONTEXT_MENU_ACTIONS.INTERCOM]: {
+  [CONTEXT_MENU_ACTIONS.CHAT_WIDGET]: {
     icon: "support",
     text: createMessage(DEBUGGER_APPSMITH_SUPPORT),
     onSelect: (error: Message) => {
       AnalyticsUtil.logEvent("DEBUGGER_CONTEXT_MENU_CLICK", {
-        menuItem: CONTEXT_MENU_ACTIONS.INTERCOM,
+        menuItem: CONTEXT_MENU_ACTIONS.CHAT_WIDGET,
       });
+
       // Search through the omnibar
-      if (intercomAppID && window.Intercom) {
-        window.Intercom(
+      if (isPylonChatAvailable()) {
+        window.Pylon(
           "showNewMessage",
-          createMessage(DEBUGGER_INTERCOM_TEXT, error.message),
+          createMessage(DEBUGGER_INTERCOM_TEXT, error.message.message),
         );
+        window.Pylon("show");
       }
-    },
-  },
-  [CONTEXT_MENU_ACTIONS.SNIPPET]: {
-    icon: "play",
-    text: createMessage(DEBUGGER_SEARCH_SNIPPET),
-    onSelect: (error: Message, dispatch: Dispatch, entity) => {
-      AnalyticsUtil.logEvent("DEBUGGER_CONTEXT_MENU_CLICK", {
-        menuItem: CONTEXT_MENU_ACTIONS.SNIPPET,
-      });
-      /// Search through the omnibar
-      AnalyticsUtil.logEvent("OPEN_OMNIBAR", {
-        source: "DEBUGGER",
-        searchTerm: error.message,
-        errorType: error.type,
-      });
-      dispatch(setGlobalSearchQuery(""));
-      dispatch(
-        executeCommandAction({
-          actionType: SlashCommand.NEW_SNIPPET,
-          args: getSnippetArgs(entity),
-        }),
-      );
     },
   },
 };
 
-const IconContainer = styled.span`
-  display: flex;
-  align-items: center;
-
-  .${Classes.ICON} {
-    margin-right: ${(props) => props.theme.spaces[4]}px;
-  }
-`;
-
-const MenuItem = styled.a`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  text-decoration: none;
-  padding: 0px ${(props) => props.theme.spaces[6]}px;
-  height: 28px;
-
-  .${Classes.TEXT} {
-    color: ${Colors.CODE_GRAY};
-  }
-
-  .${Classes.ICON} {
-    path {
-      fill: ${Colors.CODE_GRAY};
-    }
-  }
-
-  &:hover {
-    text-decoration: none;
-    cursor: pointer;
-    background-color: ${(props) => props.theme.colors.menuItem.hoverBg};
-
-    .${Classes.TEXT} {
-      color: ${(props) => props.theme.colors.menuItem.hoverText};
-    }
-    .${Classes.ICON} {
-      path {
-        fill: ${(props) => props.theme.colors.menuItem.hoverIcon};
-      }
-    }
-  }
-`;
-
-const MenuWrapper = styled.div<{ width: string }>`
-  width: ${(props) => props.width};
-  background: ${(props) => props.theme.colors.menu.background};
-  box-shadow: ${(props) =>
-    `${props.theme.spaces[0]}px ${props.theme.spaces[5]}px ${props.theme
-      .spaces[12] - 2}px ${props.theme.colors.menu.shadow}`};
-`;
-
-export default function ContextualMenu(props: ContextualMenuProps) {
-  const options = getOptions(props.error.type, props.error.subType);
+const ContextualMenu = ({
+  enableTooltip = true,
+  ...props
+}: ContextualMenuProps) => {
   const dispatch = useDispatch();
+  const user = useSelector(getCurrentUser);
+  const isPylonConsentSatisfied =
+    cloudHosting || Boolean(user?.isIntercomConsentGiven);
+  const visibleOptions = getOptions(
+    props.error.type,
+    props.error.subType,
+  ).filter(
+    (e) =>
+      e !== CONTEXT_MENU_ACTIONS.CHAT_WIDGET ||
+      (isPylonChatAvailable() && isPylonConsentSatisfied),
+  );
+
+  if (!visibleOptions.length) {
+    return props.children;
+  }
 
   return (
-    <Popover2
-      className="t--debugger-contextual-error-menu"
-      content={
-        <MenuWrapper width={"175px"}>
-          {options.map((e) => {
-            const menuProps = searchAction[e];
-            const onSelect = () => {
-              menuProps.onSelect(props.error, dispatch, props.entity);
-            };
+    <Menu className="t--debugger-contextual-error-menu">
+      <Tooltip
+        content={createMessage(TROUBLESHOOT_ISSUE)}
+        isDisabled={!enableTooltip}
+        placement="bottom"
+      >
+        <MenuTrigger>{props.children}</MenuTrigger>
+      </Tooltip>
 
-            if (
-              e === CONTEXT_MENU_ACTIONS.INTERCOM &&
-              !(intercomAppID && window.Intercom)
-            ) {
-              return null;
-            }
+      <MenuContent align="end">
+        {visibleOptions.map((e) => {
+          const menuProps = searchAction[e];
+          const onSelect = () => {
+            menuProps.onSelect(props.error, dispatch, props.entity);
+          };
 
-            return (
-              <MenuItem
-                className={`${BPClasses.POPOVER_DISMISS} t--debugger-contextual-menuitem`}
-                key={e}
-                onClick={onSelect}
-              >
-                <IconContainer>
-                  <Icon name={menuProps.icon} size={IconSize.XS} />
-                  <Text type={TextType.P3} weight={FontWeight.NORMAL}>
-                    {menuProps.text}
-                  </Text>
-                </IconContainer>
-              </MenuItem>
-            );
-          })}
-        </MenuWrapper>
-      }
-      modifiers={
-        props.modifiers || {
-          offset: {
-            enabled: true,
-            options: {
-              offset: [25, 5],
-            },
-          },
-          arrow: {
-            enabled: false,
-          },
-        }
-      }
-      position={props.position || Position.RIGHT}
-    >
-      {props.children}
-    </Popover2>
+          return (
+            <MenuItem
+              className={`${BPClasses.POPOVER_DISMISS} t--debugger-contextual-menuitem`}
+              key={e}
+              onClick={onSelect}
+              startIcon={menuProps.icon}
+            >
+              {menuProps.text}
+            </MenuItem>
+          );
+        })}
+      </MenuContent>
+    </Menu>
   );
-}
+};
+
+export default ContextualMenu;

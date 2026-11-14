@@ -1,11 +1,11 @@
 import React from "react";
-import BaseControl, { ControlProps } from "./BaseControl";
-import { ControlType } from "constants/PropertyControlConstants";
-import FormLabel from "components/editorComponents/FormLabel";
+import type { ControlProps } from "./BaseControl";
+import BaseControl from "./BaseControl";
+import type { ControlType } from "constants/PropertyControlConstants";
 import DynamicTextField from "components/editorComponents/form/fields/DynamicTextField";
-import { AppState } from "reducers";
+import type { DefaultRootState } from "react-redux";
 import { formValueSelector } from "redux-form";
-import { QUERY_EDITOR_FORM_NAME } from "constants/forms";
+import { QUERY_EDITOR_FORM_NAME } from "ee/constants/forms";
 import { connect } from "react-redux";
 import { actionPathFromName } from "components/formControls/utils";
 import {
@@ -13,25 +13,31 @@ import {
   EditorSize,
 } from "components/editorComponents/CodeEditor/EditorConfig";
 import styled from "styled-components";
-import _ from "lodash";
-import { Colors } from "constants/Colors";
 
 // Enum for the different types of input fields
 export enum INPUT_TEXT_INPUT_TYPES {
   TEXT = "TEXT",
   PASSWORD = "PASSWORD",
   JSON = "JSON",
+  TEXT_WITH_BINDING = "TEXT_WITH_BINDING",
 }
 
 const StyledDynamicTextField = styled(DynamicTextField)`
   .CodeEditorTarget .CodeMirror.CodeMirror-wrap {
-    background-color: ${Colors.WHITE};
+    background-color: var(--ads-v2-color-bg);
   }
+
   .CodeEditorTarget .CodeMirror.CodeMirror-wrap:hover {
-    background-color: ${Colors.ALABASTER_ALT};
+    background-color: var(--ads-v2-color-bg);
+    border-color: var(--ads-v2-color-border-emphasis);
   }
+
   &&& .t--code-editor-wrapper {
     border: none;
+  }
+
+  .CodeEditorTarget {
+    border-radius: var(--ads-v2-border-radius);
   }
 `;
 
@@ -43,9 +49,13 @@ export function InputText(props: {
   name: string;
   actionName: string;
   inputType?: INPUT_TEXT_INPUT_TYPES;
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   customStyles?: any;
+  disabled?: boolean;
+  showLineNumbers?: boolean;
 }) {
-  const { actionName, inputType, isRequired, label, name, placeholder } = props;
+  const { actionName, inputType, name, placeholder } = props;
   const dataTreePath = actionPathFromName(actionName, name);
   let editorProps = {};
 
@@ -57,20 +67,25 @@ export function InputText(props: {
     };
   }
 
-  let customStyle = { width: "50vh", minHeight: "55px" };
-  if (!!props.customStyles && _.isEmpty(props.customStyles) === false) {
-    customStyle = props.customStyles;
+  // Set the editor props to enable JSON editing experience
+  if (!!inputType && inputType === INPUT_TEXT_INPUT_TYPES.TEXT_WITH_BINDING) {
+    editorProps = {
+      mode: EditorModes.TEXT_WITH_BINDING,
+      size: EditorSize.EXTENDED,
+    };
   }
+
   return (
-    <div style={customStyle}>
-      <FormLabel>
-        {label} {isRequired && "*"}
-      </FormLabel>
+    <div className={`t--${props?.name} uqi-dynamic-input-text`}>
+      {/* <div style={customStyle}> */}
       <StyledDynamicTextField
         dataTreePath={dataTreePath}
+        disabled={props.disabled}
+        evaluatedPopUpLabel={props?.label || ""}
         name={name}
         placeholder={placeholder}
         showLightningMenu={false}
+        showLineNumbers={props.showLineNumbers}
         {...editorProps}
       />
     </div>
@@ -84,12 +99,15 @@ class DynamicInputTextControl extends BaseControl<DynamicInputControlProps> {
       actionName,
       configProperty,
       customStyles,
+      disabled,
       inputType,
       label,
       placeholderText,
+      showLineNumbers,
     } = this.props;
 
     let inputTypeProp = inputType;
+
     if (!inputType) {
       inputTypeProp = INPUT_TEXT_INPUT_TYPES.TEXT;
     }
@@ -98,10 +116,12 @@ class DynamicInputTextControl extends BaseControl<DynamicInputControlProps> {
       <InputText
         actionName={actionName}
         customStyles={customStyles}
+        disabled={disabled}
         inputType={inputTypeProp}
         label={label}
         name={configProperty}
         placeholder={placeholderText}
+        showLineNumbers={showLineNumbers}
       />
     );
   }
@@ -117,11 +137,15 @@ export interface DynamicInputControlProps extends ControlProps {
   inputType?: INPUT_TEXT_INPUT_TYPES;
 }
 
-const mapStateToProps = (state: AppState, props: DynamicInputControlProps) => {
+const mapStateToProps = (
+  state: DefaultRootState,
+  props: DynamicInputControlProps,
+) => {
   const valueSelector = formValueSelector(
     props.formName || QUERY_EDITOR_FORM_NAME,
   );
   const actionName = valueSelector(state, "name");
+
   return {
     actionName: actionName,
   };

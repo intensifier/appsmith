@@ -1,42 +1,33 @@
 import React from "react";
-import { formValueSelector, change } from "redux-form";
+import { formValueSelector } from "redux-form";
 import { connect } from "react-redux";
-import BaseControl, { ControlProps } from "./BaseControl";
-import { ControlType } from "constants/PropertyControlConstants";
-import FormLabel from "components/editorComponents/FormLabel";
+import type { ControlProps } from "./BaseControl";
+import BaseControl from "./BaseControl";
+import type { ControlType } from "constants/PropertyControlConstants";
 import DynamicTextField from "components/editorComponents/form/fields/DynamicTextField";
 import {
   EditorSize,
   EditorModes,
   TabBehaviour,
 } from "components/editorComponents/CodeEditor/EditorConfig";
-import { QUERY_EDITOR_FORM_NAME } from "constants/forms";
-import { AppState } from "reducers";
+import { QUERY_EDITOR_FORM_NAME } from "ee/constants/forms";
+import type { DefaultRootState } from "react-redux";
 import styled from "styled-components";
-import TemplateMenu from "pages/Editor/QueryEditor/TemplateMenu";
-import { QUERY_BODY_FIELD } from "constants/QueryEditorConstants";
-import { getPluginResponseTypes } from "selectors/entitiesSelector";
-import history from "utils/history";
 import {
-  convertObjectToQueryParams,
-  getQueryParams,
-} from "utils/AppsmithUtils";
+  getPluginResponseTypes,
+  getPluginNameFromId,
+} from "ee/selectors/entitiesSelector";
 import { actionPathFromName } from "components/formControls/utils";
-import { EvaluationSubstitutionType } from "entities/DataTree/dataTreeFactory";
+import { getSqlEditorModeFromPluginName } from "components/editorComponents/CodeEditor/sql/config";
+import { Flex } from "@appsmith/ads";
+import type { EvaluationSubstitutionType } from "constants/EvaluationConstants";
 
 const Wrapper = styled.div`
-  width: 75%;
-  .dynamic-text-field {
-    border-radius: 4px;
-    font-size: 14px;
-    min-height: calc(100vh / 4);
-  }
-
-  && {
-    .CodeMirror-lines {
-      padding: 10px;
-    }
-  }
+  min-width: 260px;
+  width: 100%;
+  min-height: 200px;
+  height: 100%;
+  display: flex;
 `;
 
 interface DynamicTextControlState {
@@ -64,52 +55,33 @@ class DynamicTextControl extends BaseControl<
       actionName,
       configProperty,
       evaluationSubstitutionType,
-      label,
       placeholderText,
+      pluginName,
       responseType,
     } = this.props;
     const dataTreePath = actionPathFromName(actionName, configProperty);
-    const isNewQuery =
-      new URLSearchParams(window.location.search).get("showTemplate") ===
-      "true";
-    const showTemplate =
-      isNewQuery && this.state.showTemplateMenu && this.props.pluginId;
     const mode =
       responseType === "TABLE"
-        ? EditorModes.SQL_WITH_BINDING
+        ? getSqlEditorModeFromPluginName(pluginName)
         : EditorModes.JSON_WITH_BINDING;
 
     return (
-      <Wrapper>
-        <FormLabel>{label}</FormLabel>
-        {showTemplate ? (
-          <TemplateMenu
-            createTemplate={(templateString) => {
-              this.setState(
-                {
-                  showTemplateMenu: false,
-                },
-                () =>
-                  this.props.createTemplate(
-                    templateString,
-                    this.props.formName,
-                  ),
-              );
-            }}
-            pluginId={this.props.pluginId}
-          />
-        ) : (
+      <Wrapper className={`t--${configProperty} dynamic-text-field-control`}>
+        <Flex flex="1">
           <DynamicTextField
-            className="dynamic-text-field"
             dataTreePath={dataTreePath}
+            disabled={this.props.disabled}
+            evaluatedPopUpLabel={this?.props?.label}
             evaluationSubstitutionType={evaluationSubstitutionType}
+            height="100%"
             mode={mode}
             name={this.props.configProperty}
             placeholder={placeholderText}
+            showLineNumbers
             size={EditorSize.EXTENDED}
             tabBehaviour={TabBehaviour.INDENT}
           />
-        )}
+        </Flex>
       </Wrapper>
     );
   }
@@ -117,43 +89,32 @@ class DynamicTextControl extends BaseControl<
 
 export interface DynamicTextFieldProps extends ControlProps {
   actionName: string;
-  createTemplate: (template: any, formName: string) => any;
   pluginId: string;
   responseType: string;
   placeholderText?: string;
   evaluationSubstitutionType: EvaluationSubstitutionType;
   mutedHinting?: boolean;
+  pluginName: string;
 }
 
-const mapStateToProps = (state: AppState, props: DynamicTextFieldProps) => {
+const mapStateToProps = (
+  state: DefaultRootState,
+  props: DynamicTextFieldProps,
+) => {
   const valueSelector = formValueSelector(
     props.formName || QUERY_EDITOR_FORM_NAME,
   );
   const actionName = valueSelector(state, "name");
   const pluginId = valueSelector(state, "datasource.pluginId");
   const responseTypes = getPluginResponseTypes(state);
+  const pluginName = getPluginNameFromId(state, pluginId);
 
   return {
     actionName,
     pluginId,
     responseType: responseTypes[pluginId],
+    pluginName,
   };
 };
 
-const mapDispatchToProps = (dispatch: any) => ({
-  createTemplate: (template: any, formName: string) => {
-    const params = getQueryParams();
-    if (params.showTemplate) {
-      params.showTemplate = "false";
-    }
-    history.replace({
-      ...window.location,
-      search: convertObjectToQueryParams(params),
-    });
-    dispatch(
-      change(formName || QUERY_EDITOR_FORM_NAME, QUERY_BODY_FIELD, template),
-    );
-  },
-});
-
-export default connect(mapStateToProps, mapDispatchToProps)(DynamicTextControl);
+export default connect(mapStateToProps)(DynamicTextControl);

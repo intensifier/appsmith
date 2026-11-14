@@ -3,19 +3,21 @@ package com.external.utils;
 import com.appsmith.external.models.DBAuth;
 import com.appsmith.external.models.DatasourceConfiguration;
 import com.appsmith.external.models.Endpoint;
-import org.apache.commons.lang.ObjectUtils;
+import org.apache.commons.lang3.ObjectUtils;
 import org.pf4j.util.StringUtils;
 
 import java.net.URI;
 import java.net.URISyntaxException;
 
 public class RedisURIUtils {
-    private static final Long DEFAULT_PORT = 6379L;
+    public static final Long DEFAULT_PORT = 6379L;
     private static final String REDIS_SCHEME = "redis://";
+    private static final String REDISS_SCHEME = "rediss://";
 
-    public static URI getURI(DatasourceConfiguration datasourceConfiguration) throws URISyntaxException {
+    public static URI getURI(DatasourceConfiguration datasourceConfiguration, boolean isTlsEnabled)
+            throws URISyntaxException {
         StringBuilder builder = new StringBuilder();
-        builder.append(REDIS_SCHEME);
+        builder.append(isTlsEnabled ? REDISS_SCHEME : REDIS_SCHEME);
 
         String uriAuth = getUriAuth(datasourceConfiguration);
         builder.append(uriAuth);

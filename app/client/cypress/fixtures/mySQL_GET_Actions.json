@@ -6,7 +6,7 @@
 	"data": [
 		{
 			"id": "616532b5b58fda6558e56bb9",
-			"organizationId": "6156b8c6c7e12534da9c5a1d",
+			"workspaceId": "6156b8c6c7e12534da9c5a1d",
 			"pluginType": "DB",
 			"pluginId": "6156b849c7e12534da9c5998",
 			"name": "DeleteQuery",
@@ -29,7 +29,7 @@
 				"encodeParamsToggle": true,
 				"body": "DELETE FROM CC\n  WHERE rating = {{Table1.triggeredRow.rating}};"
 			},
-			"executeOnLoad": false,
+			"runBehaviour": "MANUAL",
 			"isValid": true,
 			"invalids": [
 
@@ -47,7 +47,7 @@
 		},
 		{
 			"id": "616532b5b58fda6558e56bbc",
-			"organizationId": "6156b8c6c7e12534da9c5a1d",
+			"workspaceId": "6156b8c6c7e12534da9c5a1d",
 			"pluginType": "DB",
 			"pluginId": "6156b849c7e12534da9c5998",
 			"name": "UpdateQuery",
@@ -75,7 +75,7 @@
 					}
 				]
 			},
-			"executeOnLoad": false,
+			"runBehaviour": "MANUAL",
 			"isValid": true,
 			"invalids": [
 
@@ -96,7 +96,7 @@
 		},
 		{
 			"id": "616532b5b58fda6558e56bbb",
-			"organizationId": "6156b8c6c7e12534da9c5a1d",
+			"workspaceId": "6156b8c6c7e12534da9c5a1d",
 			"pluginType": "DB",
 			"pluginId": "6156b849c7e12534da9c5998",
 			"name": "InsertQuery",
@@ -124,7 +124,7 @@
 					}
 				]
 			},
-			"executeOnLoad": false,
+			"runBehaviour": "MANUAL",
 			"isValid": true,
 			"invalids": [
 
@@ -145,7 +145,7 @@
 		},
 		{
 			"id": "616532b5b58fda6558e56bba",
-			"organizationId": "6156b8c6c7e12534da9c5a1d",
+			"workspaceId": "6156b8c6c7e12534da9c5a1d",
 			"pluginType": "DB",
 			"pluginId": "6156b849c7e12534da9c5998",
 			"name": "SelectQuery",
@@ -173,7 +173,7 @@
 					}
 				]
 			},
-			"executeOnLoad": true,
+			"runBehaviour": "ON_PAGE_LOAD",
 			"isValid": true,
 			"invalids": [
 

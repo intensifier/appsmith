@@ -1,90 +1,130 @@
-import React, { RefObject, useRef } from "react";
-import styled from "styled-components";
-import Icon, { IconSize } from "components/ads/Icon";
+import React, { useCallback, useMemo } from "react";
 import DebuggerLogs from "./DebuggerLogs";
-import { useDispatch } from "react-redux";
-import { showDebugger } from "actions/debuggerActions";
+import { useDispatch, useSelector } from "react-redux";
+import {
+  setDebuggerSelectedTab,
+  setResponsePaneHeight,
+  showDebugger,
+} from "actions/debuggerActions";
+import {
+  getDebuggerSelectedTab,
+  getErrorCount,
+  getResponsePaneHeight,
+} from "selectors/debuggerSelectors";
+import AnalyticsUtil from "ee/utils/AnalyticsUtil";
 import Errors from "./Errors";
-import Resizer, { ResizerCSS } from "./Resizer";
-import EntityDeps from "./EntityDependecies";
 import {
   createMessage,
   DEBUGGER_ERRORS,
   DEBUGGER_LOGS,
-  INSPECT_ENTITY,
-} from "constants/messages";
-import { stopEventPropagation } from "utils/AppsmithUtils";
-import { DEBUGGER_TAB_KEYS } from "./helpers";
-import { Colors } from "constants/Colors";
+  DEBUGGER_STATE,
+} from "ee/constants/messages";
+import { DEBUGGER_TAB_KEYS } from "./constants";
 import EntityBottomTabs from "../EntityBottomTabs";
+import { ActionExecutionResizerHeight } from "PluginActionEditor/components/PluginActionResponse/constants";
+import { IDEBottomView, ViewHideBehaviour, ViewDisplayMode } from "IDE";
+import { StateInspector } from "./StateInspector";
+import { getIDETypeByUrl } from "ee/entities/IDE/utils";
+import { useLocation } from "react-router";
+import { IDE_TYPE } from "ee/IDE/Interfaces/IDETypes";
+import { RunHistoryTab } from "ee/pages/WorkflowIDE/layouts/components/BottomBar/WorkflowRunHistory/RunHistoryTab";
+import { getIsAiAgentApp } from "ee/selectors/aiAgentSelectors";
 
-const TABS_HEADER_HEIGHT = 36;
-
-const Container = styled.div`
-  ${ResizerCSS}
-  position: absolute;
-  bottom: 0;
-  height: 25%;
-  min-height: ${TABS_HEADER_HEIGHT}px;
-  background-color: ${(props) => props.theme.colors.debugger.background};
-  border-top: 1px solid ${Colors.ALTO};
-
-  ul.react-tabs__tab-list {
-    padding: 0px ${(props) => props.theme.spaces[12]}px;
-  }
-  .react-tabs__tab-panel {
-    height: calc(100% - ${TABS_HEADER_HEIGHT}px);
-  }
-
-  .close-debugger {
-    position: absolute;
-    top: 0px;
-    right: 0px;
-    padding: 12px 15px;
-  }
-`;
-
-type DebuggerTabsProps = {
-  defaultIndex: number;
-};
-
-const DEBUGGER_TABS = [
-  {
-    key: DEBUGGER_TAB_KEYS.ERROR_TAB,
-    title: createMessage(DEBUGGER_ERRORS),
-    panelComponent: <Errors hasShortCut />,
-  },
-  {
-    key: DEBUGGER_TAB_KEYS.LOGS_TAB,
-    title: createMessage(DEBUGGER_LOGS),
-    panelComponent: <DebuggerLogs hasShortCut />,
-  },
-  {
-    key: DEBUGGER_TAB_KEYS.INSPECT_TAB,
-    title: createMessage(INSPECT_ENTITY),
-    panelComponent: <EntityDeps />,
-  },
-];
-
-function DebuggerTabs(props: DebuggerTabsProps) {
+function DebuggerTabs() {
   const dispatch = useDispatch();
-  const panelRef: RefObject<HTMLDivElement> = useRef(null);
-  const onClose = () => dispatch(showDebugger(false));
+  const selectedTab = useSelector(getDebuggerSelectedTab);
+  // fetch the error count from the store.
+  const errorCount = useSelector(getErrorCount);
+  // get the height of the response pane.
+  const responsePaneHeight = useSelector(getResponsePaneHeight);
+  // set the height of the response pane.
+  const updateResponsePaneHeight = useCallback(
+    (height: number) => {
+      dispatch(setResponsePaneHeight(height));
+    },
+    [dispatch],
+  );
+  const isAiAgentApp = useSelector(getIsAiAgentApp);
+
+  const setSelectedTab = useCallback(
+    (tabKey: string) => {
+      if (tabKey === DEBUGGER_TAB_KEYS.ERROR_TAB) {
+        AnalyticsUtil.logEvent("OPEN_DEBUGGER", {
+          source: "WIDGET_EDITOR",
+        });
+      }
+
+      dispatch(setDebuggerSelectedTab(tabKey));
+    },
+    [dispatch],
+  );
+
+  const onClose = useCallback(() => {
+    dispatch(showDebugger(false));
+  }, [dispatch]);
+
+  const location = useLocation();
+
+  const ideType = getIDETypeByUrl(location.pathname);
+
+  const DEBUGGER_TABS = useMemo(() => {
+    const tabs = [
+      {
+        key: DEBUGGER_TAB_KEYS.LOGS_TAB,
+        title: createMessage(DEBUGGER_LOGS),
+        panelComponent: <DebuggerLogs hasShortCut />,
+      },
+      {
+        key: DEBUGGER_TAB_KEYS.ERROR_TAB,
+        title: createMessage(DEBUGGER_ERRORS),
+        count: errorCount,
+        panelComponent: <Errors hasShortCut />,
+      },
+    ];
+
+    if (ideType === IDE_TYPE.App) {
+      tabs.push({
+        key: DEBUGGER_TAB_KEYS.STATE_TAB,
+        title: createMessage(DEBUGGER_STATE),
+        panelComponent: <StateInspector />,
+      });
+    }
+
+    if (isAiAgentApp) {
+      tabs.push({
+        key: DEBUGGER_TAB_KEYS.RUN_HISTORY_TAB,
+        title: "Run History",
+        panelComponent: <RunHistoryTab />,
+      });
+    }
+
+    return tabs;
+  }, [errorCount, ideType, isAiAgentApp]);
+
+  // Do not render if response, header or schema tab is selected in the bottom bar.
+  const shouldRender = !(
+    selectedTab === DEBUGGER_TAB_KEYS.RESPONSE_TAB ||
+    selectedTab === DEBUGGER_TAB_KEYS.HEADER_TAB ||
+    selectedTab === DEBUGGER_TAB_KEYS.DATASOURCE_TAB
+  );
 
   return (
-    <Container onClick={stopEventPropagation} ref={panelRef}>
-      <Resizer panelRef={panelRef} />
+    <IDEBottomView
+      behaviour={ViewHideBehaviour.CLOSE}
+      className="t--debugger-tabs-container"
+      displayMode={ViewDisplayMode.OVERLAY}
+      height={responsePaneHeight}
+      hidden={!shouldRender}
+      onHideClick={onClose}
+      setHeight={updateResponsePaneHeight}
+    >
       <EntityBottomTabs
-        defaultIndex={props.defaultIndex}
+        expandedHeight={`${ActionExecutionResizerHeight}px`}
+        onSelect={setSelectedTab}
+        selectedTabKey={selectedTab}
         tabs={DEBUGGER_TABS}
       />
-      <Icon
-        className="close-debugger t--close-debugger"
-        name="cross"
-        onClick={onClose}
-        size={IconSize.SMALL}
-      />
-    </Container>
+    </IDEBottomView>
   );
 }
 

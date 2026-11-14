@@ -1,33 +1,63 @@
 package com.appsmith.server.services;
 
+import com.appsmith.git.constants.CommonConstants;
 import com.appsmith.server.acl.AclPermission;
+import com.appsmith.server.applications.base.ApplicationService;
+import com.appsmith.server.constants.FieldName;
 import com.appsmith.server.domains.Application;
-import com.appsmith.server.domains.Comment;
-import com.appsmith.server.domains.CommentMode;
-import com.appsmith.server.domains.CommentThread;
-import com.appsmith.server.domains.Organization;
-import com.appsmith.server.dtos.CommentThreadFilterDTO;
+import com.appsmith.server.domains.ApplicationMode;
+import com.appsmith.server.domains.GitArtifactMetadata;
+import com.appsmith.server.domains.Layout;
+import com.appsmith.server.domains.NewPage;
+import com.appsmith.server.domains.PermissionGroup;
+import com.appsmith.server.domains.User;
+import com.appsmith.server.domains.Workspace;
+import com.appsmith.server.dtos.ApplicationAccessDTO;
+import com.appsmith.server.dtos.InviteUsersDTO;
 import com.appsmith.server.dtos.PageDTO;
+import com.appsmith.server.exceptions.AppsmithError;
+import com.appsmith.server.exceptions.AppsmithException;
+import com.appsmith.server.helpers.DSLMigrationUtils;
+import com.appsmith.server.newpages.base.NewPageService;
 import com.appsmith.server.repositories.ApplicationRepository;
+import com.appsmith.server.repositories.PermissionGroupRepository;
+import com.appsmith.server.repositories.UserRepository;
+import com.appsmith.server.solutions.ApplicationPermission;
+import com.appsmith.server.solutions.UserAndAccessManagementService;
 import lombok.extern.slf4j.Slf4j;
-import org.junit.Test;
-import org.junit.runner.RunWith;
+import net.minidev.json.JSONObject;
+import net.minidev.json.parser.JSONParser;
+import net.minidev.json.parser.ParseException;
+import org.apache.commons.io.FileUtils;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.ReactiveSecurityContextHolder;
+import org.springframework.security.core.context.SecurityContext;
+import org.springframework.security.core.context.SecurityContextImpl;
 import org.springframework.security.test.context.support.WithUserDetails;
 import org.springframework.test.annotation.DirtiesContext;
-import org.springframework.test.context.junit4.SpringRunner;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
+import java.io.File;
+import java.io.IOException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 
-@RunWith(SpringRunner.class)
 @SpringBootTest
 @Slf4j
 @DirtiesContext
@@ -36,98 +66,73 @@ public class ApplicationPageServiceTest {
     ApplicationPageService applicationPageService;
 
     @Autowired
-    OrganizationService organizationService;
-
-    @Autowired
-    CommentService commentService;
+    WorkspaceService workspaceService;
 
     @Autowired
     ApplicationRepository applicationRepository;
 
-    private CommentThread createCommentThread(CommentMode commentMode, PageDTO pageDTO) {
-        CommentThread commentThread = new CommentThread();
-        commentThread.setPageId(pageDTO.getId());
-        commentThread.setApplicationId(pageDTO.getApplicationId());
-        commentThread.setMode(commentMode);
-        Comment comment = new Comment();
-        commentThread.setComments(List.of(comment));
-        return commentThread;
+    @Autowired
+    UserRepository userRepository;
+
+    @Autowired
+    NewPageService newPageService;
+
+    @MockBean
+    DSLMigrationUtils dslMigrationUtils;
+
+    @Autowired
+    ApplicationService applicationService;
+
+    @Autowired
+    ApplicationPermission applicationPermission;
+
+    @Autowired
+    PermissionGroupRepository permissionGroupRepository;
+
+    @Autowired
+    UserAndAccessManagementService userAndAccessManagementService;
+
+    @Autowired
+    UserService userService;
+
+    Workspace workspace;
+
+    @BeforeEach
+    public void setup() {
+        Workspace unsavedWorkspace = new Workspace();
+        unsavedWorkspace.setName("ApplicationPageServiceTest Workspace");
+        workspace = workspaceService.create(unsavedWorkspace).block();
+    }
+
+    @AfterEach
+    public void cleanup() {
+        List<Application> deletedApplications = applicationPermission
+                .getDeletePermission()
+                .flatMapMany(permission -> applicationService.findByWorkspaceId(workspace.getId(), permission))
+                .flatMap(remainingApplication -> applicationPageService.deleteApplication(remainingApplication.getId()))
+                .collectList()
+                .block();
+        Workspace deletedWorkspace =
+                workspaceService.archiveById(workspace.getId()).block();
     }
 
     /**
-     * Creates an organization, an application and a page under that application
+     * Creates an workspace, an application and a page under that application
+     *
      * @param uniquePrefix unique string that'll be added as prefix to org and app names to avoid name collision
      * @return publisher of PageDTO
      */
     private Mono<PageDTO> createPageMono(String uniquePrefix) {
-        Organization unsavedOrg = new Organization();
-        unsavedOrg.setName(uniquePrefix + "_org");
-        return organizationService.create(unsavedOrg)
-                .flatMap(organization -> {
-                    Application application = new Application();
-                    application.setName(uniquePrefix + "_app");
-                    return applicationPageService.createApplication(application, organization.getId());
-                })
-                .flatMap(application -> {
+        Application application = new Application();
+        application.setName(uniquePrefix + "_app");
+        return applicationPageService
+                .createApplication(application, workspace.getId())
+                .flatMap(application1 -> {
                     PageDTO page = new PageDTO();
                     page.setName("Test page");
-                    page.setApplicationId(application.getId());
+                    page.setApplicationId(application1.getId());
                     return applicationPageService.createPage(page);
                 });
-    }
-
-    @Test
-    @WithUserDetails("api_user")
-    public void deleteUnpublishedPage_WhenPageDeleted_EditModeCommentsDeleted() {
-        Mono<List<CommentThread>> getThreadMono = createPageMono(UUID.randomUUID().toString())
-                .flatMap(pageDTO -> {
-                    CommentThread editModeCommentThread = createCommentThread(CommentMode.EDIT, pageDTO);
-                    CommentThread piublishedModeCommentThread = createCommentThread(CommentMode.PUBLISHED, pageDTO);
-
-                    return commentService.createThread(editModeCommentThread, "app.appsmith.com")
-                            .then(commentService.createThread(piublishedModeCommentThread, "app.appsmith.com"))
-                            .then(applicationPageService.deleteUnpublishedPage(pageDTO.getId()))
-                            .thenReturn(pageDTO);
-                }).flatMap(pageDTO -> {
-                    CommentThreadFilterDTO filterDTO = new CommentThreadFilterDTO();
-                    filterDTO.setApplicationId(pageDTO.getApplicationId());
-                    return commentService.getThreadsByApplicationId(filterDTO);
-                });
-
-        StepVerifier.create(getThreadMono).assertNext(commentThreads -> {
-            assertThat(commentThreads.size()).isEqualTo(1);
-            assertThat(commentThreads.get(0).getMode()).isEqualTo(CommentMode.PUBLISHED);
-        }).verifyComplete();
-    }
-
-    @Test
-    @WithUserDetails("api_user")
-    public void deleteUnpublishedPage_WhenPageDeletedAndAppRePublished_PublishModeCommentsDeleted() {
-        Mono<List<CommentThread>> getThreadMono = createPageMono(UUID.randomUUID().toString())
-                .flatMap(pageDTO -> {
-                    CommentThread editModeCommentThread = createCommentThread(CommentMode.EDIT, pageDTO);
-                    CommentThread piublishedModeCommentThread = createCommentThread(CommentMode.PUBLISHED, pageDTO);
-
-                    // add a comment thread in edit mode
-                    return commentService.createThread(editModeCommentThread, "app.appsmith.com")
-                            // publish the app
-                            .then(applicationPageService.publish(pageDTO.getApplicationId(), true))
-                            // add a comment in published mode
-                            .then(commentService.createThread(piublishedModeCommentThread, "app.appsmith.com"))
-                            // delete the unpublised page, published page is still available
-                            .then(applicationPageService.deleteUnpublishedPage(pageDTO.getId()))
-                            // publish the page again, this should delete the published page and comment
-                            .then(applicationPageService.publish(pageDTO.getApplicationId(), true))
-                            .thenReturn(pageDTO);
-                }).flatMap(pageDTO -> {
-                    CommentThreadFilterDTO filterDTO = new CommentThreadFilterDTO();
-                    filterDTO.setApplicationId(pageDTO.getApplicationId());
-                    return commentService.getThreadsByApplicationId(filterDTO);
-                });
-
-        StepVerifier.create(getThreadMono).assertNext(commentThreads -> {
-            assertThat(commentThreads.size()).isEqualTo(0);
-        }).verifyComplete();
     }
 
     @Test
@@ -137,15 +142,601 @@ public class ApplicationPageServiceTest {
                 .flatMap(pageDTO -> {
                     Application application = new Application();
                     application.setLastEditedAt(Instant.now().minus(10, ChronoUnit.DAYS));
-                    return applicationRepository.updateById(pageDTO.getApplicationId(), application, AclPermission.MANAGE_APPLICATIONS)
+                    return applicationRepository
+                            .updateById(pageDTO.getApplicationId(), application, AclPermission.MANAGE_APPLICATIONS)
                             .then(applicationPageService.deleteUnpublishedPage(pageDTO.getId()))
                             .then(applicationRepository.findById(pageDTO.getApplicationId()));
                 });
 
-        StepVerifier.create(applicationMono).assertNext(application -> {
-            assertThat(application.getLastEditedAt()).isNotNull();
-            Instant yesterday = Instant.now().minus(1, ChronoUnit.DAYS);
-            assertThat(application.getLastEditedAt()).isAfter(yesterday);
-        }).verifyComplete();
+        StepVerifier.create(applicationMono)
+                .assertNext(application -> {
+                    assertThat(application.getLastEditedAt()).isNotNull();
+                    Instant yesterday = Instant.now().minus(1, ChronoUnit.DAYS);
+                    assertThat(application.getLastEditedAt()).isAfter(yesterday);
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    public void cloneApplication_WhenClonedSuccessfully_ApplicationIsPublished() {
+        Mono<Application> applicationMono = createPageMono(UUID.randomUUID().toString())
+                .flatMap(pageDTO -> applicationPageService.cloneApplication(pageDTO.getApplicationId()));
+
+        StepVerifier.create(applicationMono)
+                .assertNext(application -> {
+                    assertThat(application.getPages())
+                            .hasSize(application.getPublishedPages().size());
+                })
+                .verifyComplete();
+    }
+
+    Mono<Application> createApplication(String uniquePrefix) {
+        Application application = new Application();
+        application.setName(uniquePrefix + "_app");
+        return applicationPageService.createApplication(application, workspace.getId());
+    }
+
+    JSONObject getOlderDSL() {
+        ClassLoader classLoader = getClass().getClassLoader();
+        File file = new File(classLoader
+                .getResource("test_assets/DSLMigration/PageDSLv83.json")
+                .getFile());
+        String data = CommonConstants.EMPTY_STRING;
+        try {
+            data = FileUtils.readFileToString(file, "UTF-8");
+        } catch (IOException ignored) {
+
+        }
+        JSONParser jsonParser = new JSONParser();
+        JSONObject parsedData = new JSONObject();
+        try {
+            parsedData = (JSONObject) jsonParser.parse(data);
+        } catch (ParseException e) {
+            log.error("Error parsing the page dsl for page: {}", e);
+        }
+        return parsedData;
+    }
+
+    /**
+     * This test is to ensure that the DSL migration is not going to happen when RTS responds
+     * current DSL version as the latest DSL version.
+     */
+    @Test
+    @WithUserDetails("api_user")
+    public void getPageAndMigrateDslByBranchAndDefaultPageId_WhenDslIsLatest_MigrationNotTriggered() {
+        String uuid = UUID.randomUUID().toString();
+
+        NewPage newPage = createApplication("App_" + uuid)
+                .flatMap(application -> newPageService.getByIdWithoutPermissionCheck(
+                        application.getPages().get(0).getId()))
+                .block();
+
+        // mock the dsMigrationUtils to return the current DSL version as the latest DSL version
+        PageDTO unPublishedPageDTO = newPage.getUnpublishedPage();
+        Layout layout = unPublishedPageDTO.getLayouts().get(0);
+        int currentDslVersion = layout.getDsl().getAsNumber("version").intValue();
+        Mockito.when(dslMigrationUtils.getLatestDslVersion()).thenReturn(Mono.just(currentDslVersion));
+
+        StepVerifier.create(applicationPageService.getPageAndMigrateDslByBranchAndBasePageId(
+                        newPage.getId(), null, false, true))
+                .assertNext(pageDTO -> {
+                    Layout layout2 = pageDTO.getLayouts().get(0);
+                    assertThat(layout2.getDsl().getAsNumber("version").intValue())
+                            .isEqualTo(currentDslVersion);
+                })
+                .verifyComplete();
+    }
+
+    /**
+     * This test is to ensure that the DSL migration is triggered when RTS responds
+     * older DSL version as the latest DSL version in edit mode.
+     * In view mode, the DSL should be in view mode.
+     */
+    @Test
+    @WithUserDetails("api_user")
+    public void getPageAndMigrateDslByBranchAndDefaultPageId_WhenEditModeDslIsNotLatest_EditModeDslMigrated() {
+        String uuid = UUID.randomUUID().toString();
+        NewPage newPage = createApplication("App_" + uuid)
+                .flatMap(application -> newPageService.getByIdWithoutPermissionCheck(
+                        application.getPages().get(0).getId()))
+                .block();
+
+        // mock the dsMigrationUtils to return the (current DSL version-1) as the latest DSL version
+        PageDTO unPublishedPageDTO = newPage.getUnpublishedPage();
+        Layout layout = unPublishedPageDTO.getLayouts().get(0);
+        JSONObject unpublishedDsl = layout.getDsl();
+        int currentDslVersion = unpublishedDsl.getAsNumber("version").intValue();
+        int olderDslVersion = currentDslVersion - 1;
+        unpublishedDsl.put("version", olderDslVersion);
+
+        // update the page to set older version dsl in edit mode
+        newPageService.save(newPage).block();
+
+        Mockito.when(dslMigrationUtils.getLatestDslVersion()).thenReturn(Mono.just(olderDslVersion + 1));
+
+        // create a dsl after migration
+        JSONObject dslAfterMigration = new JSONObject();
+        dslAfterMigration.put("version", olderDslVersion + 1);
+        dslAfterMigration.put("testKey", "testValue");
+
+        Mockito.when(dslMigrationUtils.migratePageDsl(any(JSONObject.class))).thenReturn(Mono.just(dslAfterMigration));
+
+        Mono<NewPage> newPageMono = applicationPageService
+                .getPageAndMigrateDslByBranchAndBasePageId(newPage.getId(), null, false, true)
+                .then(newPageService.getByIdWithoutPermissionCheck(newPage.getId()));
+
+        StepVerifier.create(newPageMono)
+                .assertNext(newpage -> {
+                    // the edit mode dsl should be same as the dslAfterMigration
+                    JSONObject unpublishedDslAfterMigration =
+                            newpage.getUnpublishedPage().getLayouts().get(0).getDsl();
+                    assertThat(unpublishedDslAfterMigration
+                                    .getAsNumber("version")
+                                    .intValue())
+                            .isEqualTo(currentDslVersion);
+                    assertThat(unpublishedDslAfterMigration.getAsString("testKey"))
+                            .isEqualTo("testValue");
+
+                    JSONObject publishedDslAfterMigration =
+                            newpage.getPublishedPage().getLayouts().get(0).getDsl();
+                    assertThat(publishedDslAfterMigration.getAsNumber("version").intValue())
+                            .isEqualTo(currentDslVersion);
+                    // testKey should not be found in the published dsl
+                    assertThat(publishedDslAfterMigration.getAsString("testKey"))
+                            .isNull();
+                })
+                .verifyComplete();
+    }
+
+    /**
+     * This test is to ensure that the DSL migration is triggered when DSL does not have version
+     */
+    @Test
+    @WithUserDetails("api_user")
+    public void getPageAndMigrateDslByBranchAndDefaultPageId_WhenDSLHasNotVersion_DslMigratedToLatest() {
+        String uuid = UUID.randomUUID().toString();
+        NewPage newPage = createApplication("App_" + uuid)
+                .flatMap(application -> newPageService.getByIdWithoutPermissionCheck(
+                        application.getPages().get(0).getId()))
+                .flatMap(page -> {
+                    Layout layout = page.getUnpublishedPage().getLayouts().get(0);
+                    JSONObject unpublishedDsl = layout.getDsl();
+                    unpublishedDsl.remove("version"); // removing version from DSL
+                    return newPageService.save(page);
+                })
+                .block();
+
+        // update the page to set older version dsl in edit mode
+        newPageService.save(newPage).block();
+
+        int latestDslVersion = 999;
+
+        // mock the dsMigrationUtils to return the latestDslVersion
+        Mockito.when(dslMigrationUtils.getLatestDslVersion()).thenReturn(Mono.just(latestDslVersion));
+
+        // the dsl that'll be returned by RTS after migration
+        JSONObject dslAfterMigration = new JSONObject();
+        dslAfterMigration.put("version", latestDslVersion);
+        dslAfterMigration.put("testKey", "testValue");
+
+        Mockito.when(dslMigrationUtils.migratePageDsl(any(JSONObject.class))).thenReturn(Mono.just(dslAfterMigration));
+
+        Mono<NewPage> newPageMono = applicationPageService
+                .getPageAndMigrateDslByBranchAndBasePageId(newPage.getId(), null, false, true)
+                .then(newPageService.getByIdWithoutPermissionCheck(newPage.getId()));
+
+        StepVerifier.create(newPageMono)
+                .assertNext(newpage -> {
+                    // the edit mode dsl should be same as the dslAfterMigration
+                    JSONObject unpublishedDslAfterMigration =
+                            newpage.getUnpublishedPage().getLayouts().get(0).getDsl();
+                    assertThat(unpublishedDslAfterMigration
+                                    .getAsNumber("version")
+                                    .intValue())
+                            .isEqualTo(latestDslVersion);
+                    assertThat(unpublishedDslAfterMigration.getAsString("testKey"))
+                            .isEqualTo("testValue");
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    public void getPageAndMigrateDslByBranchAndDefaultPageId_WhenViewModeDslIsNotLatest_ViewModeDslMigrated() {
+        String uuid = UUID.randomUUID().toString();
+        NewPage newPage = createApplication("App_" + uuid)
+                .flatMap(application -> newPageService.getByIdWithoutPermissionCheck(
+                        application.getPages().get(0).getId()))
+                .block();
+
+        // mock the dsMigrationUtils to return the (current DSL version-1) as the latest DSL version
+        PageDTO publishedPageDTO = newPage.getPublishedPage();
+        Layout layout = publishedPageDTO.getLayouts().get(0);
+        JSONObject publishedDsl = layout.getDsl();
+        int currentDslVersion = publishedDsl.getAsNumber("version").intValue();
+        int olderDslVersion = currentDslVersion - 1;
+        publishedDsl.put("version", olderDslVersion);
+
+        // update the page to set older version dsl in view mode
+        newPageService.save(newPage).block();
+
+        Mockito.when(dslMigrationUtils.getLatestDslVersion()).thenReturn(Mono.just(olderDslVersion + 1));
+
+        // create a dsl after migration
+        JSONObject dslAfterMigration = new JSONObject();
+        dslAfterMigration.put("version", olderDslVersion + 1);
+        dslAfterMigration.put("testKey", "testValue");
+
+        Mockito.when(dslMigrationUtils.migratePageDsl(any(JSONObject.class))).thenReturn(Mono.just(dslAfterMigration));
+
+        Mono<NewPage> newPageMono = applicationPageService
+                .getPageAndMigrateDslByBranchAndBasePageId(newPage.getId(), null, true, true)
+                .then(newPageService.getByIdWithoutPermissionCheck(newPage.getId()));
+
+        StepVerifier.create(newPageMono)
+                .assertNext(newpage -> {
+                    // testKey should not be found in the unpublished dsl
+                    JSONObject unpublishedDslAfterMigration =
+                            newpage.getUnpublishedPage().getLayouts().get(0).getDsl();
+                    assertThat(unpublishedDslAfterMigration
+                                    .getAsNumber("version")
+                                    .intValue())
+                            .isEqualTo(currentDslVersion);
+                    assertThat(unpublishedDslAfterMigration.getAsString("testKey"))
+                            .isNull();
+
+                    // the view mode dsl should be same as the dslAfterMigration
+                    JSONObject publishedDslAfterMigration =
+                            newpage.getPublishedPage().getLayouts().get(0).getDsl();
+                    assertThat(publishedDslAfterMigration.getAsNumber("version").intValue())
+                            .isEqualTo(currentDslVersion);
+                    assertThat(publishedDslAfterMigration.getAsString("testKey"))
+                            .isEqualTo("testValue");
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    public void createOrUpdateSuffixedApplication_GitConnectedAppExistsWithSameName_AppCreatedWithSuffixedName() {
+        // create a Git connected application with two branches
+        final String appName = "app" + UUID.randomUUID();
+        Application application = new Application();
+        application.setName(appName);
+        GitArtifactMetadata gitArtifactMetadata = new GitArtifactMetadata();
+        gitArtifactMetadata.setRefName("branch1");
+        application.setGitApplicationMetadata(gitArtifactMetadata);
+
+        Mono<Application> importAppMono = applicationPageService
+                .createApplication(application, workspace.getId())
+                .flatMap(createdApp -> {
+                    createdApp.getGitApplicationMetadata().setDefaultApplicationId(createdApp.getId());
+                    return applicationService.save(createdApp);
+                })
+                .flatMap(createdApp -> {
+                    createdApp.setId(null);
+                    createdApp.getGitApplicationMetadata().setRefName("branch2");
+                    // just duplicate the app, we're not considering the pages, they remain same in both apps
+                    return applicationRepository.save(createdApp);
+                })
+                .flatMap(createdApp -> {
+                    Application newApplication = new Application();
+                    newApplication.setName(appName);
+                    newApplication.setWorkspaceId(workspace.getId());
+                    return applicationPageService.createOrUpdateSuffixedApplication(
+                            newApplication, newApplication.getName(), 0);
+                });
+
+        StepVerifier.create(importAppMono)
+                .assertNext(application1 -> {
+                    assertThat(application1.getName()).isEqualTo(appName + " (1)");
+                })
+                .verifyComplete();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    public void createApplicationWithId_throwsException() {
+        final String appName = "app" + UUID.randomUUID();
+        Application application = new Application();
+        application.setName(appName);
+        String id = "anyIdHere";
+        application.setId(id);
+
+        Mono<Application> createApplicationMono =
+                applicationPageService.createApplication(application, workspace.getId());
+
+        StepVerifier.create(createApplicationMono)
+                .expectErrorMatches(throwable -> throwable instanceof AppsmithException
+                        && throwable.getMessage().equals(AppsmithError.INVALID_PARAMETER.getMessage(FieldName.ID, id)))
+                .verify();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    public void verifyGetPagesBasedOnApplicationMode_ReturnsRigthNumberOfPages_BasedOnApplicationMode() {
+        final String appName = "app" + UUID.randomUUID();
+        Application application = new Application();
+        application.setName(appName);
+
+        Application createdApplication = applicationPageService
+                .createApplication(application, workspace.getId())
+                .block();
+
+        String applicationId = createdApplication.getId();
+
+        PageDTO pageDTO = new PageDTO();
+        pageDTO.setApplicationId(applicationId);
+        final String pageName = "app" + UUID.randomUUID();
+        pageDTO.setName(pageName);
+        applicationPageService.createPage(pageDTO).block();
+
+        applicationPageService.publish(applicationId, true).block();
+
+        PageDTO pageDTO1 = new PageDTO();
+        pageDTO1.setApplicationId(applicationId);
+        final String unpublishedPageName = "app" + UUID.randomUUID();
+        pageDTO1.setName(unpublishedPageName);
+        applicationPageService.createPage(pageDTO1).block();
+
+        Application updatedApplication =
+                applicationService.findById(createdApplication.getId()).block();
+
+        Mono<List<NewPage>> unpublishedPagesMono =
+                applicationPageService.getPagesBasedOnApplicationMode(updatedApplication, ApplicationMode.EDIT);
+
+        Mono<List<NewPage>> publishedPagesMono =
+                applicationPageService.getPagesBasedOnApplicationMode(updatedApplication, ApplicationMode.PUBLISHED);
+
+        StepVerifier.create(publishedPagesMono)
+                .assertNext(pages -> {
+                    assertThat(pages.size()).isEqualTo(2);
+                    Set<String> pageNames = pages.stream()
+                            .map(page -> page.getPublishedPage().getName())
+                            .collect(Collectors.toSet());
+                    assertThat(pageNames).contains(pageName);
+                    assertThat(pageNames).doesNotContain(unpublishedPageName);
+                })
+                .verifyComplete();
+
+        StepVerifier.create(unpublishedPagesMono)
+                .assertNext(pages -> {
+                    assertThat(pages.size()).isEqualTo(3);
+                    Set<String> pageNames = pages.stream()
+                            .map(page -> page.getUnpublishedPage().getName())
+                            .collect(Collectors.toSet());
+                    assertThat(pageNames).contains(pageName);
+                    assertThat(pageNames).contains(unpublishedPageName);
+                })
+                .verifyComplete();
+    }
+
+    /**
+     * A page whose published copy and draft copy carry different names, so a test can tell which copy a read returned.
+     */
+    record PublishedPageWithDraft(String applicationId, String pageId, String publishedName, String draftName) {}
+
+    PublishedPageWithDraft createPublishedPageWithDraftChanges(String uniquePrefix) {
+        Application application = createApplication(uniquePrefix).block();
+        assertThat(application).isNotNull();
+        String pageId = application.getPages().get(0).getId();
+        applicationPageService.publish(application.getId(), true).block();
+        NewPage publishedPage =
+                newPageService.getByIdWithoutPermissionCheck(pageId).block();
+        assertThat(publishedPage).isNotNull();
+        String publishedName = publishedPage.getPublishedPage().getName();
+
+        String draftName = uniquePrefix + "_draft";
+        PageDTO rename = new PageDTO();
+        rename.setName(draftName);
+        newPageService.updatePage(pageId, rename).block();
+        assertThat(draftName).isNotEqualTo(publishedName);
+        return new PublishedPageWithDraft(application.getId(), pageId, publishedName, draftName);
+    }
+
+    void makeApplicationPublic(String applicationId) {
+        ApplicationAccessDTO access = new ApplicationAccessDTO();
+        access.setPublicAccess(true);
+        Application application = applicationService
+                .changeViewAccessForSingleBranchByBranchedApplicationId(applicationId, access)
+                .block();
+        assertThat(application).isNotNull();
+        assertThat(application.getIsPublic()).isTrue();
+    }
+
+    SecurityContext securityContextOf(User user) {
+        return new SecurityContextImpl(new UsernamePasswordAuthenticationToken(user, null, user.getAuthorities()));
+    }
+
+    SecurityContext anonymousSecurityContext() {
+        User anonymousUser = new User();
+        anonymousUser.setEmail(FieldName.ANONYMOUS_USER);
+        anonymousUser.setName(FieldName.ANONYMOUS_USER);
+        anonymousUser.setIsAnonymous(true);
+        return securityContextOf(anonymousUser);
+    }
+
+    SecurityContext workspaceViewerSecurityContext() {
+        Workspace currentWorkspace = workspaceService
+                .findById(workspace.getId(), AclPermission.READ_WORKSPACES)
+                .block();
+        assertThat(currentWorkspace).isNotNull();
+        List<PermissionGroup> defaultGroups = permissionGroupRepository
+                .findAllById(currentWorkspace.getDefaultPermissionGroups())
+                .collectList()
+                .block();
+        assertThat(defaultGroups).isNotNull();
+        PermissionGroup viewerGroup = defaultGroups.stream()
+                .filter(group -> group.getName().startsWith(FieldName.VIEWER))
+                .findFirst()
+                .orElseThrow();
+
+        InviteUsersDTO invite = new InviteUsersDTO();
+        invite.setPermissionGroupId(viewerGroup.getId());
+        invite.setUsernames(List.of("usertest@usertest.com"));
+        userAndAccessManagementService.inviteUsers(invite, "test").block();
+
+        User viewer = userService.findByEmail("usertest@usertest.com").block();
+        assertThat(viewer).isNotNull();
+        return securityContextOf(viewer);
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    @DisplayName("GHSA-j564-5cm6-xjgj")
+    void should_rejectEditorModePageRead_when_callerIsAnonymousOnPublicApplication() {
+        // Given
+        PublishedPageWithDraft fixture = createPublishedPageWithDraftChanges("anonEditorRead_" + UUID.randomUUID());
+        makeApplicationPublic(fixture.applicationId());
+
+        // When
+        Mono<PageDTO> editorRead = applicationPageService
+                .getPageAndMigrateDslByBranchedPageId(fixture.pageId(), false, false)
+                .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(Mono.just(anonymousSecurityContext())));
+
+        // Then
+        StepVerifier.create(editorRead)
+                .expectErrorSatisfies(error -> assertThat(error)
+                        .isInstanceOf(AppsmithException.class)
+                        .hasMessage(AppsmithError.ACL_NO_RESOURCE_FOUND.getMessage(FieldName.PAGE, fixture.pageId())))
+                .verify();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    @DisplayName("GHSA-j564-5cm6-xjgj")
+    void should_returnPublishedPage_when_callerIsAnonymousOnPublicApplicationInViewMode() {
+        // Given
+        PublishedPageWithDraft fixture = createPublishedPageWithDraftChanges("anonViewRead_" + UUID.randomUUID());
+        makeApplicationPublic(fixture.applicationId());
+
+        // When
+        Mono<PageDTO> viewRead = applicationPageService
+                .getPageAndMigrateDslByBranchedPageId(fixture.pageId(), true, false)
+                .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(Mono.just(anonymousSecurityContext())));
+
+        // Then
+        StepVerifier.create(viewRead)
+                .assertNext(page -> assertThat(page.getName()).isEqualTo(fixture.publishedName()))
+                .verifyComplete();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    @DisplayName("GHSA-j564-5cm6-xjgj")
+    void should_rejectEditorModePageRead_when_callerIsWorkspaceViewer() {
+        // Given
+        PublishedPageWithDraft fixture = createPublishedPageWithDraftChanges("viewerEditorRead_" + UUID.randomUUID());
+        SecurityContext viewer = workspaceViewerSecurityContext();
+
+        // When
+        Mono<PageDTO> editorRead = applicationPageService
+                .getPageAndMigrateDslByBranchedPageId(fixture.pageId(), false, false)
+                .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(Mono.just(viewer)));
+
+        // Then
+        StepVerifier.create(editorRead)
+                .expectErrorSatisfies(error -> assertThat(error)
+                        .isInstanceOf(AppsmithException.class)
+                        .hasMessage(AppsmithError.ACL_NO_RESOURCE_FOUND.getMessage(FieldName.PAGE, fixture.pageId())))
+                .verify();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    @DisplayName("GHSA-j564-5cm6-xjgj")
+    void should_returnPublishedPage_when_workspaceViewerReadsInViewMode() {
+        // Given
+        PublishedPageWithDraft fixture = createPublishedPageWithDraftChanges("viewerViewRead_" + UUID.randomUUID());
+        SecurityContext viewer = workspaceViewerSecurityContext();
+
+        // When
+        Mono<PageDTO> viewRead = applicationPageService
+                .getPageAndMigrateDslByBranchedPageId(fixture.pageId(), true, false)
+                .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(Mono.just(viewer)));
+
+        // Then
+        StepVerifier.create(viewRead)
+                .assertNext(page -> assertThat(page.getName()).isEqualTo(fixture.publishedName()))
+                .verifyComplete();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    @DisplayName("GHSA-j564-5cm6-xjgj")
+    void should_returnDraftPage_when_editorReadsInEditorMode() {
+        // Given
+        PublishedPageWithDraft fixture = createPublishedPageWithDraftChanges("editorEditorRead_" + UUID.randomUUID());
+
+        // When
+        Mono<PageDTO> editorRead =
+                applicationPageService.getPageAndMigrateDslByBranchedPageId(fixture.pageId(), false, false);
+
+        // Then
+        StepVerifier.create(editorRead)
+                .assertNext(page -> assertThat(page.getName()).isEqualTo(fixture.draftName()))
+                .verifyComplete();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    @DisplayName("GHSA-j564-5cm6-xjgj")
+    void should_rejectEditorModePageReadByBasePageId_when_callerIsWorkspaceViewer() {
+        // Given
+        PublishedPageWithDraft fixture = createPublishedPageWithDraftChanges("viewerBaseRead_" + UUID.randomUUID());
+        SecurityContext viewer = workspaceViewerSecurityContext();
+
+        // When
+        Mono<PageDTO> editorRead = applicationPageService
+                .getPageAndMigrateDslByBranchAndBasePageId(fixture.pageId(), null, false, false)
+                .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(Mono.just(viewer)));
+
+        // Then
+        StepVerifier.create(editorRead)
+                .expectErrorSatisfies(error -> assertThat(error)
+                        .isInstanceOf(AppsmithException.class)
+                        .hasMessage(AppsmithError.NO_RESOURCE_FOUND.getMessage(FieldName.PAGE, fixture.pageId())))
+                .verify();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    @DisplayName("GHSA-j564-5cm6-xjgj")
+    void should_rejectEditorModeGetPage_when_callerIsWorkspaceViewer() {
+        // Given
+        PublishedPageWithDraft fixture = createPublishedPageWithDraftChanges("viewerGetPage_" + UUID.randomUUID());
+        SecurityContext viewer = workspaceViewerSecurityContext();
+
+        // When
+        Mono<PageDTO> editorRead = applicationPageService
+                .getPage(fixture.pageId(), false)
+                .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(Mono.just(viewer)));
+
+        // Then
+        StepVerifier.create(editorRead)
+                .expectErrorSatisfies(error -> assertThat(error)
+                        .isInstanceOf(AppsmithException.class)
+                        .hasMessage(AppsmithError.ACL_NO_RESOURCE_FOUND.getMessage(FieldName.PAGE, fixture.pageId())))
+                .verify();
+    }
+
+    @Test
+    @WithUserDetails("api_user")
+    @DisplayName("GHSA-j564-5cm6-xjgj")
+    void should_returnPublishedPage_when_workspaceViewerCallsGetPageInViewMode() {
+        // Given
+        PublishedPageWithDraft fixture = createPublishedPageWithDraftChanges("viewerGetPageView_" + UUID.randomUUID());
+        SecurityContext viewer = workspaceViewerSecurityContext();
+
+        // When
+        Mono<PageDTO> viewRead = applicationPageService
+                .getPage(fixture.pageId(), true)
+                .contextWrite(ReactiveSecurityContextHolder.withSecurityContext(Mono.just(viewer)));
+
+        // Then
+        StepVerifier.create(viewRead)
+                .assertNext(page -> assertThat(page.getName()).isEqualTo(fixture.publishedName()))
+                .verifyComplete();
     }
 }

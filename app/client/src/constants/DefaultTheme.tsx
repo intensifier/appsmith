@@ -1,41 +1,42 @@
-import * as styledComponents from "styled-components";
-import { Colors, Color } from "./Colors";
+import { css } from "styled-components";
+import type { Color } from "./Colors";
+import { Colors } from "./Colors";
 import * as FontFamilies from "./Fonts";
 import tinycolor from "tinycolor2";
-import { Classes } from "@blueprintjs/core";
-import { AlertIcons } from "icons/AlertIcons";
-import { IconProps } from "constants/IconConstants";
-import { JSXElementConstructor } from "react";
-import { typography, Typography, TypographyKeys } from "./typography";
-export type FontFamily = typeof FontFamilies[keyof typeof FontFamilies];
+import { Alignment, Classes } from "@blueprintjs/core";
+import type { Typography, TypographyKeys } from "./typography";
+import { typography } from "./typography";
 
-const {
-  createGlobalStyle,
-  css,
-  default: styled,
-  keyframes,
-  ThemeProvider,
-} = styledComponents as styledComponents.ThemedStyledComponentsModule<Theme>;
+import type { LabelPosition } from "components/constants";
+import { Icon } from "@appsmith/ads";
+import React from "react";
+export type FontFamily = (typeof FontFamilies)[keyof typeof FontFamilies];
 
 export const IntentColors: Record<string, Color> = {
-  primary: Colors.GREEN,
-  success: Colors.PURPLE,
-  secondary: Colors.BLACK_PEARL,
-  danger: Colors.ERROR_RED,
-  none: Colors.GEYSER_LIGHT,
-  warning: Colors.JAFFA,
-  successLight: Colors.GREEN,
+  primary: "var(--ads-v2-color-fg-success)",
+  success: "var(--ads-v2-color-fg-success)",
+  secondary: "var(--ads-v2-color-fg-information)",
+  danger: "var(--ads-v2-color-fg-error)",
+  none: "var(--ads-v2-color-fg-information)",
+  warning: "var(--ads-v2-color-fg-error)",
+  successLight: "var(--ads-v2-color-fg-success)",
 };
 
-export type Intent = typeof IntentColors[keyof typeof IntentColors];
+export type Intent = (typeof IntentColors)[keyof typeof IntentColors];
 
-export const IntentIcons: Record<Intent, JSXElementConstructor<IconProps>> = {
-  primary: AlertIcons.SUCCESS,
-  success: AlertIcons.SUCCESS,
-  secondary: AlertIcons.INFO,
-  danger: AlertIcons.ERROR,
-  none: AlertIcons.INFO,
-  warning: AlertIcons.WARNING,
+export const IntentIcons: Record<Intent, React.ReactNode> = {
+  primary: <Icon color="var(--ads-v2-color-fg-success)" name="close-circle" />,
+  success: <Icon color="var(--ads-v2-color-fg-success)" name="close-circle" />,
+  secondary: (
+    <Icon color="var(--ads-v2-color-fg-information)" name="information-fill" />
+  ),
+  danger: (
+    <Icon color="var(--ads-v2-color-fg-error)" name="close-circle-fill" />
+  ),
+  none: (
+    <Icon color="var(--ads-v2-color-fg-information)" name="information-fill" />
+  ),
+  warning: <Icon color="var(--ads-v2-color-fg-warning)" name="alert-fill" />,
 };
 
 export enum Skin {
@@ -51,6 +52,8 @@ export const truncateTextUsingEllipsis = css`
 `;
 
 export const getTypographyByKey = (
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   props: Record<string, any>,
   key: TypographyKeys,
 ) => `
@@ -71,18 +74,41 @@ export const BlueprintControlTransform = css`
         box-shadow: none;
         border: 1px solid ${(props) => props.theme.colors.primaryOld};
       }
-      input:disabled ~ .${Classes.CONTROL_INDICATOR} {
-        opacity: 0.5;
+
+      &
+        input:invalid:not(:disabled):not(:checked)
+        ~ .${Classes.CONTROL_INDICATOR} {
+        border: 1px solid var(--wds-color-border-danger);
       }
+
+      &:hover
+        input:invalid:not(:disabled):not(:checked)
+        ~ .${Classes.CONTROL_INDICATOR} {
+        border: 1px solid var(--wds-color-border-danger-hover) !important;
+      }
+
       & input:disabled:not(:checked) ~ .${Classes.CONTROL_INDICATOR} {
-        border: 1px solid ${Colors.GREY_5};
+        background-color: var(--wds-color-bg-disabled) !important;
+        border: 1px solid var(--wds-color-border-disabled) !important;
+      }
+
+      & input:disabled:checked ~ .${Classes.CONTROL_INDICATOR} {
+        background-color: var(--wds-color-bg-disabled) !important;
+        border: 1px solid var(--wds-color-border-disabled) !important;
+      }
+
+      &:hover input:not(:checked):not(:disabled) ~ .bp3-control-indicator,
+      & input:not(:checked):not(:disabled):focus ~ .bp3-control-indicator {
+        border: 1px solid var(--wds-color-bg-disabled-strong) !important;
       }
     }
 
     .${Classes.SWITCH} {
-      & .${Classes.CONTROL_INDICATOR} {
+      & input ~ .${Classes.CONTROL_INDICATOR} {
+        transition: none;
+
         &::before {
-          box-shadow: -2px 2px 5px rgba(67, 86, 100, 0.1);
+          box-shadow: none;
         }
       }
       input:checked ~ .${Classes.CONTROL_INDICATOR} {
@@ -91,8 +117,21 @@ export const BlueprintControlTransform = css`
         }
       }
       input:not(:checked) ~ .${Classes.CONTROL_INDICATOR} {
-        background: ${Colors.GREY_3};
-        border: 1px solid ${Colors.GREY_5};
+        background: var(--wds-color-bg-strong);
+        border: 1px solid var(--wds-color-border);
+      }
+
+      input:disabled ~ .${Classes.CONTROL_INDICATOR} {
+        background: var(--wds-color-bg-disabled) !important;
+        &::before {
+          background: var(--wds-color-bg-disabled-strong);
+        }
+      }
+
+      &:hover input:not(:checked):not(:disabled) ~ .bp3-control-indicator,
+      input:not(:checked):not(:disabled):focus ~ .bp3-control-indicator {
+        background: var(--wds-color-bg-strong-hover);
+        border: 1px solid var(--wds-color-border-hover) !important;
       }
     }
 
@@ -263,6 +302,59 @@ export const BlueprintInputTransform = css`
   }
 `;
 
+export const BlueprintRadioSwitchGroupTransform = css<{
+  alignment: Alignment;
+  height?: number;
+  inline: boolean;
+  labelPosition?: LabelPosition;
+  optionCount: number;
+}>`
+  width: 100%;
+  height: 100%;
+
+  ${({ inline, optionCount }) => `
+  display: ${inline ? "inline-flex" : "flex"};
+    flex-direction: ${inline ? "row" : "column"};
+    align-items: ${inline ? "center" : "flex-start"};
+    ${inline && "flex-wrap: wrap"};
+    justify-content: ${
+      optionCount > 1 ? `space-between` : inline ? `flex-start` : `center`
+    };
+    gap: 10px;
+    flex-grow: 1;
+  `}
+
+  ${BlueprintControlTransform};
+  .${Classes.CONTROL} {
+    display: ${({ alignment, inline }) => {
+      if (alignment === Alignment.RIGHT) {
+        return inline ? "inline-block" : "block";
+      }
+
+      return "flex";
+    }};
+    width: ${({ alignment, inline }) => {
+      if (alignment === Alignment.RIGHT) {
+        return inline ? "auto" : "100%";
+      }
+
+      return "auto";
+    }};
+    align-items: center;
+    border: 1px solid transparent;
+    color: ${Colors.GREY_10};
+    line-height: 16px;
+
+    .bp3-control-indicator {
+      margin-top: 0;
+      border: 1px solid ${Colors.GREY_5};
+      box-shadow: none;
+      background-image: none;
+      background-color: white;
+    }
+  }
+`;
+
 const iconSizes = {
   XXS: 8,
   XS: 10,
@@ -277,30 +369,32 @@ const iconSizes = {
 
 type IconSizeType = typeof iconSizes;
 
-export type ThemeBorder = {
+export interface ThemeBorder {
   thickness: number;
   style: "dashed" | "solid";
   color: Color;
-};
+}
 
-type PropertyPaneTheme = {
+interface PropertyPaneTheme {
   width: number;
   height: number;
   dividerColor: Color;
   titleHeight: number;
   connectionsHeight: number;
-};
+}
 
 export type NestedObjectOrArray<T> =
   | Record<string, T | T[] | Record<string, T | T[]>>
   | T
   | T[];
-export type Theme = {
+export interface Theme {
   radii: Array<number>;
   fontSizes: Array<number>;
   drawerWidth: string;
   spaces: Array<number>;
   fontWeights: Array<number>;
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   colors: any;
   typography: Typography;
   lineHeights: Array<number>;
@@ -317,14 +411,16 @@ export type Theme = {
   headerHeight: string;
   smallHeaderHeight: string;
   bottomBarHeight: string;
+  pageTabsHeight: string;
   integrationsPageUnusableHeight: string;
   backBanner: string;
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   homePage: any;
   sidebarWidth: string;
   canvasBottomPadding: number;
   navbarMenuHeight: string;
   navbarMenuLineHeight: string;
-  actionsBottomTabInitialHeight: string;
   sideNav: {
     minWidth: number;
     maxWidth: number;
@@ -421,7 +517,7 @@ export type Theme = {
     footerShadow: string;
     linkBg: string;
   };
-};
+}
 
 export const getColorWithOpacity = (color: Color, opacity: number) => {
   color = color.slice(1);
@@ -429,16 +525,19 @@ export const getColorWithOpacity = (color: Color, opacity: number) => {
   const r = (val >> 16) & 255;
   const g = (val >> 8) & 255;
   const b = val & 255;
+
   return `rgba(${r},${g},${b},${opacity})`;
 };
 
 export const getBorderCSSShorthand = (border?: ThemeBorder): string => {
   const values: string[] = [];
+
   if (border) {
     for (const [key, value] of Object.entries(border)) {
       values.push(key === "thickness" ? value + "px" : value.toString());
     }
   }
+
   return values.join(" ");
 };
 
@@ -455,33 +554,7 @@ export const hideScrollbar = css`
   }
 `;
 
-export const thinScrollbar = css`
-  ::-webkit-scrollbar {
-    width: 4px;
-  }
-
-  /* Track */
-  ::-webkit-scrollbar-track {
-    border-radius: 10px;
-  }
-
-  /* Handle */
-  ::-webkit-scrollbar-thumb {
-    background: transparent;
-    border-radius: 10px;
-  }
-  &:hover {
-    ::-webkit-scrollbar-thumb {
-      background: ${getColorWithOpacity(Colors.CHARCOAL, 0.5)};
-      border-radius: 10px;
-    }
-  }
-
-  /* Handle on hover */
-  ::-webkit-scrollbar-thumb:hover {
-    background: ${getColorWithOpacity(Colors.CHARCOAL, 0.5)};
-  }
-`;
+export const thinScrollbar = css``;
 // export const adsTheme: any = {
 //   space: [0, 3, 14, 7, 16, 11, 26, 10, 4, 26, 30, 36, 4, 6, 11],
 // };
@@ -530,7 +603,7 @@ export const appColors = [
   "#FFEBFB",
 ] as const;
 
-export type AppColorCode = typeof appColors[number];
+export type AppColorCode = (typeof appColors)[number];
 
 const darkShades = [
   "#1A191C",
@@ -568,19 +641,22 @@ const lightShades = [
   "#000000",
   "#F86A2B",
   "#FFDEDE",
+  "#575757",
+  "#191919",
+  "#E7E7E7",
 ] as const;
 
-type ShadeColor = typeof darkShades[number] | typeof lightShades[number];
+type ShadeColor = (typeof darkShades)[number] | (typeof lightShades)[number];
 
-type buttonVariant = {
+interface buttonVariant {
   main: string;
   light: string;
   dark: string;
   darker: string;
   darkest: string;
-};
+}
 
-type ButtonVariantColor = {
+interface ButtonVariantColor {
   primary: {
     bgColor?: Color;
     borderColor?: Color;
@@ -599,9 +675,9 @@ type ButtonVariantColor = {
     hoverColor: Color;
     textColor?: Color;
   };
-};
+}
 
-type ColorType = {
+interface ColorType {
   overlayColor: string;
   button: {
     disabledText: ShadeColor;
@@ -848,12 +924,12 @@ type ColorType = {
   applications: {
     bg: ShadeColor;
     textColor: ShadeColor;
-    orgColor: ShadeColor;
+    workspaceColor: ShadeColor;
     iconColor: ShadeColor;
     hover: {
       bg: ShadeColor;
       textColor: ShadeColor;
-      orgColor: ShadeColor;
+      workspaceColor: ShadeColor;
     };
     cardMenuIcon: ShadeColor;
   };
@@ -953,6 +1029,7 @@ type ColorType = {
   apiPane: {
     bg: ShadeColor;
     text: ShadeColor;
+    keyValueText?: ShadeColor;
     dividerBg: ShadeColor;
     iconHoverBg: ShadeColor;
     tabBg: ShadeColor;
@@ -1002,7 +1079,11 @@ type ColorType = {
       fullForm: string;
     };
   };
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   floatingBtn: any;
+  // TODO: Fix this the next time the file is edited
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   auth: any;
   formMessage: Record<string, Record<Intent, string>>;
   header: {
@@ -1017,6 +1098,28 @@ type ColorType = {
     tabText: string;
     activeTabBorderBottom: string;
     activeTabText: string;
+  };
+  guidedTour: {
+    runButton: string;
+    cancelButton: {
+      color: string;
+      borderColor: string;
+      hoverBackgroundColor: string;
+    };
+    endButton: {
+      backgroundColor: string;
+      borderColor: string;
+      hoverBackgroundColor: string;
+    };
+    endTourButton: {
+      color: string;
+      hoverColor: string;
+    };
+    card: {
+      borderBottom: string;
+      background: string;
+    };
+    stepCountBackground: string;
   };
   globalSearch: {
     containerBackground: string;
@@ -1063,53 +1166,11 @@ type ColorType = {
     iconPath: string;
     iconCircle: string;
   };
-  comments: {
-    profileUserName: string;
-    threadTitle: string;
-    commentBody: string;
-    profileImageBorder: string;
-    mention: string;
-    threadContainerBorder: string;
-    addCommentInputBorder: string;
-    sendButton: string;
-    addCommentInputBackground: string;
-    pin: string;
+  toggleMode: {
     activeModeBackground: string;
     activeModeIcon: string;
     modeIcon: string;
-    emojiPicker: string;
-    resolved: string;
-    unresolved: string;
-    resolvedFill: string;
-    unresolvedFill: string;
-    resolvedPath: string;
-    childCommentsIndent: string;
-    commentBackground: string;
-    contextMenuTrigger: string;
-    contextMenuItemHover: ShadeColor;
-    contextMenuIcon: ShadeColor;
-    contextMenuIconHover: ShadeColor;
-    contextMenuIconStroke: ShadeColor;
-    contextMenuIconStrokeHover: ShadeColor;
-    contextMenuTitle: ShadeColor;
-    contextMenuTitleHover: ShadeColor;
-    appCommentsHeaderTitle: ShadeColor;
-    appCommentsClose: ShadeColor;
-    viewLatest: string;
-    commentTime: string;
-    pinId: string;
-    commentsFilter: string;
-    appCommentsHeaderBorder: string;
     unreadIndicator: string;
-    unreadIndicatorCommentCard: string;
-    pinnedByText: string;
-    pinnedThreadBackground: string;
-    visibleThreadBackground: string;
-    cardOptionsIcon: string;
-    appCommentsPlaceholderText: string;
-    cardHoverBackground: string;
-    introTitle: string;
-    introContent: string;
     modeIconCircleStroke: string;
     activeModeIconCircleStroke: string;
   };
@@ -1172,7 +1233,6 @@ type ColorType = {
   debugger: {
     background: string;
     messageTextColor: string;
-    time: string;
     label: string;
     entity: string;
     entityLink: string;
@@ -1196,31 +1256,34 @@ type ColorType = {
       color: string;
     };
     info: {
+      time: string;
       borderBottom: string;
     };
     warning: {
+      time: string;
       borderBottom: string;
       backgroundColor: string;
       iconColor: string;
       hoverIconColor: string;
     };
     error: {
+      time: string;
+      type: string;
       borderBottom: string;
       backgroundColor: string;
       iconColor: string;
       hoverIconColor: string;
     };
     jsonIcon: string;
+    collapseIcon: string;
     message: string;
   };
   helpModal: {
     itemHighlight: string;
     background: string;
   };
-  mentionsInput: Record<string, string>;
   showcaseCarousel: Record<string, string>;
   displayImageUpload: Record<string, string>;
-  notifications: Record<string, string>;
   widgetGroupingContextMenu: {
     border: string;
     actionActiveBg: string;
@@ -1236,9 +1299,6 @@ type ColorType = {
     highlightBackground: string;
     highlightTextColor: string;
     textColor: string;
-  };
-  pagesEditor: {
-    iconColor: string;
   };
   numberedStep: {
     line: string;
@@ -1256,7 +1316,7 @@ type ColorType = {
   settings: {
     link: string;
   };
-};
+}
 
 const editorBottomBar = {
   background: Colors.WHITE,
@@ -1267,24 +1327,16 @@ const editorBottomBar = {
 const gitSyncModal = {
   menuBackgroundColor: Colors.ALABASTER_ALT,
   separator: Colors.ALTO2,
-  closeIcon: "rgba(29, 28, 29, 0.7);",
+  closeIcon: Colors.SCORPION,
+  closeIconHover: Colors.GREY_900,
 };
+
 type GitSyncModalColors = typeof gitSyncModal;
 
 const tabItemBackgroundFill = {
   highlightBackground: Colors.Gallery,
-  highlightTextColor: Colors.CODE_GRAY,
+  highlightTextColor: Colors.COD_GRAY,
   textColor: Colors.CHARCOAL,
-};
-
-const notifications = {
-  time: "#858282",
-  listHeaderTitle: "#090707",
-  markAllAsReadButtonBackground: "#f0f0f0",
-  markAllAsReadButtonText: "#716E6E",
-  unreadIndicator: "#F86A2B",
-  bellIndicator: "#E22C2C",
-  label: "#858282",
 };
 
 const displayImageUpload = {
@@ -1311,59 +1363,13 @@ const mentionSuggestion = {
   hover: "#EBEBEB",
 };
 
-const pagesEditor = {
-  iconColor: "#A2A6A8",
-};
-
-const comments = {
-  introTitle: "#090707",
-  introContent: "#716E6E",
-  commentsFilter: "#6A86CE",
-  profileUserName: darkShades[11],
-  threadTitle: darkShades[8],
-  commentBody: darkShades[8],
-  profileImageBorder: Colors.JAFFA_DARK,
-  mention: "#F86A2B",
-  threadContainerBorder: lightShades[5],
-  addCommentInputBorder: lightShades[13],
-  sendButton: "#6A86CE",
-  addCommentInputBackground: "#FAFAFA",
-  pin: "#EF4141",
-  activeModeBackground: "#090707",
-  emojiPicker: lightShades[5],
-  resolved: Colors.BLACK,
-  unresolved: lightShades[5],
-  resolvedFill: Colors.BLACK,
-  unresolvedFill: "transparent",
-  resolvedPath: Colors.WHITE,
-  childCommentsIndent: lightShades[13],
-  commentBackground: lightShades[2],
-  contextMenuTrigger: darkShades[6],
-  contextMenuItemHover: lightShades[2],
-  contextMenuIcon: darkShades[6],
-  contextMenuIconHover: darkShades[11],
-  contextMenuIconStroke: darkShades[6],
-  contextMenuIconStrokeHover: darkShades[11],
-  contextMenuTitle: lightShades[8],
-  contextMenuTitleHover: darkShades[11],
-  appCommentsHeaderTitle: darkShades[11],
-  appCommentsClose: lightShades[15],
-  viewLatest: "#F86A2B",
-  commentTime: lightShades[7],
-  pinId: lightShades[8],
-  appCommentsHeaderBorder: lightShades[3],
+const toggleMode = {
+  activeModeBackground: "#EBEBEB",
+  activeModeIcon: "#4B4848",
+  modeIcon: "#858282",
+  modeIconCircleStroke: "#fff",
+  activeModeIconCircleStroke: "#EBEBEB",
   unreadIndicator: "#E00D0D",
-  unreadIndicatorCommentCard: "#F86A2B",
-  pinnedByText: lightShades[7],
-  pinnedThreadBackground: "#FFFAE9",
-  visibleThreadBackground: "#FBEED0",
-  cardOptionsIcon: "#777272",
-  appCommentsPlaceholderText: lightShades[8],
-  activeModeIcon: "#F0F0F0",
-  modeIcon: "#6D6D6D",
-  cardHoverBackground: "#FBEED0",
-  modeIconCircleStroke: "#222222",
-  activeModeIconCircleStroke: "#090707",
 };
 
 const auth = {
@@ -1442,15 +1448,6 @@ const globalSearch = {
   },
 };
 
-const mentionsInput = {
-  suggestionsListBackground: "#fff",
-  suggestionsListBorder: "rgba(0,0,0,0.15)",
-  focusedItemBackground: "#cee4e5",
-  itemBorderBottom: "#cee4e5",
-  mentionBackground: "#cee4e5",
-  mentionsInviteBtnPlusIcon: "#6A86CE",
-};
-
 const actionSidePane = {
   noConnections: "#f0f0f0",
   noConnectionsText: "#e0dede",
@@ -1468,6 +1465,29 @@ const navigationMenu = {
   warningBackground: "#3A3628",
 };
 
+const guidedTour = {
+  runButton: "#f86a2b",
+  cancelButton: {
+    color: "#716e6e",
+    borderColor: "#716e6e",
+    hoverBackgroundColor: "#f1f1f1",
+  },
+  endButton: {
+    backgroundColor: "#f22b2b",
+    borderColor: "#f22b2b",
+    hoverBackgroundColor: "#f34040",
+  },
+  endTourButton: {
+    color: "#4b4848",
+    hoverColor: "#928f8f",
+  },
+  card: {
+    borderBottom: "#eeeeee",
+    background: "#ffefdb",
+  },
+  stepCountBackground: "#090707",
+};
+
 const numberedStep = {
   line: Colors.ALTO2,
   number: Colors.BLACK,
@@ -1479,15 +1499,13 @@ export const dark: ColorType = {
   numberedStep,
   tabItemBackgroundFill,
   overlayColor: "#090707cc",
-  notifications,
   displayImageUpload,
   showcaseCarousel,
   mentionSuggestion,
   reactionsComponent,
-  mentionsInput,
   helpModal,
   globalSearch,
-  comments,
+  toggleMode,
   navigationMenu,
   selected: darkShades[10],
   header: {
@@ -1815,12 +1833,12 @@ export const dark: ColorType = {
   applications: {
     bg: darkShades[4],
     textColor: darkShades[7],
-    orgColor: darkShades[7],
+    workspaceColor: darkShades[7],
     iconColor: darkShades[7],
     hover: {
       bg: darkShades[5],
       textColor: darkShades[8],
-      orgColor: darkShades[9],
+      workspaceColor: darkShades[9],
     },
     cardMenuIcon: darkShades[7],
   },
@@ -1921,6 +1939,7 @@ export const dark: ColorType = {
     bg: darkShades[0],
     tabBg: lightShades[10],
     text: darkShades[6],
+    keyValueText: lightShades[8],
     dividerBg: darkShades[4],
     iconHoverBg: darkShades[1],
     requestTree: {
@@ -2031,11 +2050,11 @@ export const dark: ColorType = {
   debugger: {
     background: darkShades[11],
     messageTextColor: "#D4D4D4",
-    time: "#D4D4D4",
     label: "#D4D4D4",
     entity: "rgba(212, 212, 212, 0.5)",
     entityLink: "#D4D4D4",
     jsonIcon: "#9F9F9F",
+    collapseIcon: lightShades[20],
     message: "#D4D4D4",
     evalDebugButton: {
       hover: "#fafafaaa",
@@ -2057,27 +2076,31 @@ export const dark: ColorType = {
       shortcut: "#D4D4D4",
     },
     info: {
+      time: Colors.GRAY_500,
       borderBottom: "black",
     },
     warning: {
+      time: Colors.GRAY_500,
       iconColor: "#f3cc3e",
       hoverIconColor: "#e0b30e",
       borderBottom: "black",
       backgroundColor: "#29251A",
     },
     error: {
+      time: Colors.GRAY_500,
+      type: "#393939",
       iconColor: "#f56060",
       hoverIconColor: "#F22B2B",
       borderBottom: "black",
       backgroundColor: "#291B1D",
     },
   },
+  guidedTour,
   widgetGroupingContextMenu: {
     border: "#69b5ff",
     actionActiveBg: "#e1e1e1",
   },
   actionSidePane,
-  pagesEditor,
   link: "#f86a2b",
   welcomePage: {
     text: lightShades[5],
@@ -2093,12 +2116,11 @@ export const light: ColorType = {
   numberedStep,
   tabItemBackgroundFill,
   overlayColor: "#090707cc",
-  notifications,
   displayImageUpload,
   showcaseCarousel,
   mentionSuggestion,
   reactionsComponent,
-  mentionsInput,
+  toggleMode,
   helpModal: {
     itemHighlight: "#EBEBEB",
     background: "#FFFFFF",
@@ -2106,17 +2128,9 @@ export const light: ColorType = {
   globalSearch: {
     ...globalSearch,
     helpBarBackground: "#F0F0F0",
-    helpBarText: "#A9A7A7",
+    helpBarText: Colors.GRAY_400,
     helpButtonBackground: "#F0F0F0",
-    helpIcon: "#939090",
-  },
-  comments: {
-    ...comments,
-    activeModeBackground: "#EBEBEB",
-    activeModeIcon: "#4B4848",
-    modeIcon: "#858282",
-    modeIconCircleStroke: "#fff",
-    activeModeIconCircleStroke: "#EBEBEB",
+    helpIcon: Colors.GRAY_700,
   },
   navigationMenu: {
     contentActive: "#090707",
@@ -2131,7 +2145,7 @@ export const light: ColorType = {
   header: {
     separator: "#E0DEDE",
     appName: lightShades[8],
-    background: lightShades[0],
+    background: lightShades[11],
     deployToolTipText: lightShades[8],
     deployToolTipBackground: "#FFF",
     shareBtnHighlight: "#F86A2B",
@@ -2154,7 +2168,7 @@ export const light: ColorType = {
     },
     disabled: {
       bgColor: Colors.GREY_1,
-      textColor: Colors.GREY_4,
+      textColor: Colors.GREY_8,
     },
     primary: {
       primary: {
@@ -2340,9 +2354,9 @@ export const light: ColorType = {
     },
     menu: {
       border: lightShades[13],
-      bg: lightShades[0],
+      bg: lightShades[11],
       text: lightShades[8],
-      hover: lightShades[2],
+      hover: lightShades[21],
       hoverText: lightShades[10],
       subText: lightShades[15],
     },
@@ -2454,12 +2468,12 @@ export const light: ColorType = {
   applications: {
     bg: lightShades[3],
     textColor: lightShades[7],
-    orgColor: lightShades[7],
+    workspaceColor: lightShades[7],
     iconColor: lightShades[7],
     hover: {
       bg: lightShades[5],
       textColor: lightShades[8],
-      orgColor: lightShades[9],
+      workspaceColor: lightShades[9],
     },
     cardMenuIcon: lightShades[17],
   },
@@ -2482,7 +2496,7 @@ export const light: ColorType = {
   },
   modal: {
     bg: lightShades[11],
-    headerText: lightShades[10],
+    headerText: lightShades[20],
     iconColor: lightShades[5],
     iconBg: lightShades[18],
     user: {
@@ -2492,7 +2506,7 @@ export const light: ColorType = {
       message: lightShades[9],
       desc: lightShades[7],
     },
-    manageUser: lightShades[6],
+    manageUser: lightShades[19],
     scrollbar: lightShades[5],
     separator: lightShades[4],
     title: lightShades[8],
@@ -2560,7 +2574,8 @@ export const light: ColorType = {
     bg: lightShades[11],
     tabBg: lightShades[11],
     text: lightShades[16],
-    dividerBg: lightShades[13],
+    keyValueText: lightShades[8],
+    dividerBg: lightShades[3],
     iconHoverBg: lightShades[1],
     requestTree: {
       bg: lightShades[11],
@@ -2600,7 +2615,7 @@ export const light: ColorType = {
   codeMirror: {
     background: {
       defaultState: lightShades[0],
-      hoverState: lightShades[12],
+      hoverState: lightShades[21],
     },
     text: "#090707",
     dataType: {
@@ -2671,12 +2686,12 @@ export const light: ColorType = {
   debugger: {
     background: "#FFFFFF",
     messageTextColor: "#716e6e",
-    time: "#4b4848",
-    label: "#4b4848",
+    label: "#575757",
     entity: "rgba(75, 72, 72, 0.7)",
-    entityLink: "#6d6d6d",
+    entityLink: "#575757",
     jsonIcon: "#a9a7a7",
     message: "#4b4848",
+    collapseIcon: lightShades[20],
     evalDebugButton: {
       hover: "#fafafaaa",
       active: "#fafafaff",
@@ -2697,27 +2712,31 @@ export const light: ColorType = {
       shortcut: "black",
     },
     info: {
-      borderBottom: "rgba(0, 0, 0, 0.05)",
+      time: Colors.GRAY_500,
+      borderBottom: "#E8E8E8",
     },
     warning: {
+      time: Colors.GRAY_500,
       iconColor: "#f3cc3e",
       hoverIconColor: "#e0b30e",
-      borderBottom: "white",
-      backgroundColor: "rgba(254, 184, 17, 0.1)",
+      borderBottom: "#E8E8E8",
+      backgroundColor: "#FFF8E2",
     },
     error: {
+      time: Colors.GRAY_500,
+      type: "#393939",
       iconColor: "#f56060",
       hoverIconColor: "#F22B2B",
-      borderBottom: "white",
-      backgroundColor: "rgba(242, 43, 43, 0.08)",
+      borderBottom: "#E8E8E8",
+      backgroundColor: "#F9E9E9",
     },
   },
+  guidedTour,
   widgetGroupingContextMenu: {
     border: "#69b5ff",
     actionActiveBg: "#e1e1e1",
   },
   actionSidePane,
-  pagesEditor,
   link: "#f86a2b",
   welcomePage: {
     text: lightShades[5],
@@ -2754,7 +2773,7 @@ export const theme: Theme = {
       darkText: lightShades[0],
     },
     appBackground: "#EDEDED",
-    artboard: "#F6F6F6",
+    artboard: "#F8FAFC",
     primaryOld: Colors.GREEN,
     primaryDarker: Colors.JUNGLE_GREEN,
     primaryDarkest: Colors.JUNGLE_GREEN_DARKER,
@@ -2793,7 +2812,6 @@ export const theme: Theme = {
     widgetSecondaryBorder: Colors.MERCURY,
     messageBG: Colors.CONCRETE,
     paneIcon: Colors.TROUT,
-    notification: Colors.JAFFA,
     bindingTextDark: Colors.BINDING_COLOR,
     bindingText: Colors.BINDING_COLOR_LT,
     cmBacground: Colors.BLUE_CHARCOAL,
@@ -2850,23 +2868,27 @@ export const theme: Theme = {
       color: Colors.MYSTIC,
     },
   ],
-  sidebarWidth: "250px",
+  sidebarWidth: "256px",
   homePage: {
     header: 48,
     leftPane: {
-      width: 240,
+      width: 256,
       leftPadding: 16,
       rightMargin: 12,
     },
+    main: {
+      marginLeft: 112,
+    },
     search: {
-      height: 68,
+      height: 81,
       paddingTop: 30,
     },
     sidebar: 256,
   },
   headerHeight: "48px",
-  smallHeaderHeight: "34px",
-  bottomBarHeight: "34px",
+  smallHeaderHeight: "40px",
+  bottomBarHeight: "37px",
+  pageTabsHeight: "32px",
   integrationsPageUnusableHeight: "182px",
   backBanner: "30px",
   canvasBottomPadding: 200,
@@ -2928,7 +2950,6 @@ export const theme: Theme = {
   },
   pageContentWidth: 1224,
   tabPanelHeight: 34,
-  actionsBottomTabInitialHeight: "40%",
   alert: {
     info: {
       color: Colors.AZURE_RADIANCE,
@@ -2982,10 +3003,10 @@ export const theme: Theme = {
     },
   },
   actionSidePane: {
-    width: 265,
+    width: 280,
   },
   onboarding: {
-    statusBarHeight: 83,
+    statusBarHeight: 92,
   },
   settings: {
     footerHeight: 84,
@@ -2993,7 +3014,3 @@ export const theme: Theme = {
     linkBg: lightShades[2],
   },
 };
-
-export { css, createGlobalStyle, keyframes, ThemeProvider };
-
-export default styled;
